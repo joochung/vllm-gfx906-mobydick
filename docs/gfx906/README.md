@@ -5,6 +5,14 @@ This fork optimizes vLLM for AMD **gfx906 (Vega 20)** — MI50/MI60, 60 CUs,
 measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 `pp=2048`/`tg=256`, `cudagraph_mode=FULL_DECODE_ONLY`.
 
+## Release snapshots
+
+- **[`0.29.0-final`](RELEASE-0.29.0-final.md)** (2026-09-18) — the last snapshot of
+  the 0.29.0 line: the V2 mamba `align` fix, `SKINNY_M16` and C4 default-on, the
+  0.30.0 conflict review, and the merge-prep sweep rule. The Qwen3.8-Flash-Next /
+  QSA work continues on `gfx906/qsa-fn` *(since merged to `main`; the QSA-FN
+  entries in [`CHANGELOG.md`](CHANGELOG.md) are the record)*.
+
 ## Fork heritage
 
 - This repository is the gfx906 vLLM port
