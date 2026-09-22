@@ -106,9 +106,7 @@ class MmapShardedNGramEmbedding(nn.Module):
             raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
         original_shape = ids.shape
         flat_ids = ids.reshape(-1).long()
-        shard_idx = torch.div(
-            flat_ids, self.shard_row_capacity, rounding_mode="floor"
-        )
+        shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
         local_idx = flat_ids - shard_idx * self.shard_row_capacity
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype

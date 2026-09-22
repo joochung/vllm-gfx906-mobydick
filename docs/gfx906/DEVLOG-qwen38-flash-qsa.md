@@ -109,7 +109,7 @@ their win and drops the gfx906 regression.
 to <1 %):
 
 | dtype | dispatch (tiled) | per-row, op | per-row, kernel | speedup | top-2048 | NRMSE |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | fp16 | **4061 / 4084 µs** | 5424 µs | 5465 / 5439 µs | **1.35× / 1.33×** | **1.00000** | 1.28e-07 |
 | bf16 | 6961 µs | 6747 µs | 6962 µs | 1.00× | 1.00000 | 0.0 |
 

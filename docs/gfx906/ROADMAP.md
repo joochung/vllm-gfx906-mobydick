@@ -79,7 +79,7 @@ job, and it is why FN-1's verdict is "shipped at kernel level".
 its reason:
 
 | flag | why |
-|---|---|
+| --- | --- |
 | `--dtype float16` | explicit; gfx906 has no native bf16 (the reported failure was the auto-fallback meeting the old bf16-only guards) |
 | `VLLM_USE_V2_MODEL_RUNNER=1` | **required** — the PLE inputs come from the V2 model states; on V1 the layer raises "PLE inputs were not prepared". Do not copy the other recipes' V1 pin here |
 | `--no-enable-prefix-caching` | **was required** for V2-MAMBA-1 (the align-mode IMA); **retired 2026-09-17** once the seed bug was fixed — the recipe leaves prefix caching on and keeps the flag only as a documented fallback |
@@ -276,7 +276,7 @@ tokenizer for an offline smoke rig. Bundle artifact:
 branch, head and base commit.
 
 | patch | content |
-|---|---|
+| --- | --- |
 | 0001 | QSA-FN-1 fp16 enablement — the reported error, 4.4× kernel win |
 | 0002 | V2-MAMBA-1 mamba `align` seed fix — required for prefix caching |
 | 0003 | QSA-FN-4 tiled indexer, fp16-gated |
@@ -327,6 +327,7 @@ precopy_mamba_align_fused_kernel` → dead engine. Evidence, gates and the exact
 measured mechanism: [`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
 
 Why it should be accepted and why it is not duplicate work:
+
 - The bug is **live in `upstream/main` and `upstream/releases/v0.30.0`** (seed line
   verbatim, checked 2026-09-17). Upstream's same-day change narrows the *trigger*
   (only `prefix_cacheable` groups contribute to the min, comment: “would otherwise
@@ -360,6 +361,7 @@ is what fixes the reported `Qwen4Exp QSA currently requires BF16`; upstream
 and on gfx906 it is also a 4.4× kernel win (bf16 has no instruction there).
 
 Extra work this PR needs that UP-1 does not:
+
 - The change touches `vllm/models/qwen4_exp/common/qsa_cache.py`, **shared with the
   NVIDIA implementation** — the PR must show the edits are dtype-*general*
   (`self.dtype` / model dtype) and that no CUDA path changes; upstream's copy of
@@ -476,7 +478,7 @@ DFlash/DFlash2 use their own *trained* draft vocabulary (`draft_vocab_size`, def
 and one shared boot answers both questions against a common reference:
 
 | arm | config | answers |
-|---|---|---|
+| --- | --- | --- |
 | A | MTP k=3, plain | reference (no extra machinery) |
 | B | MTP k=3 + CAT-1 | **production baseline** for Q1 |
 | C | DFlash2, no patch | **Q1** (DFlash2 vs MTP) |
@@ -690,7 +692,6 @@ into something a DFlash2 draft model can consume too, then gate it the way CAT-1
 retracted, so the honest expectation is the ms/step saving). Exactness carries over unchanged:
 rejection sampling uses the distribution the draft was sampled from, and the target keeps its own
 full head.
-
 
 ### DFL2-7 — cover the DFlash2 draft GEMM shapes in the gfx906 GEMV family
 
@@ -918,6 +919,7 @@ histogram is the guard).
 
 **Recon (2026-09-16, the edit list).** The plumbing is small and mirrors what TRITON_ATTN /
 ROCM_ATTN already do:
+
 - `vllm/v1/attention/backend.py:349` rejects a backend whose `supports_non_causal()` is False
   when the request sets `use_non_causal` (`dflash/speculator.py:110` sets it from
   `dflash_has_any_non_causal`), which is the string the log prints. Both triton_attn.py:350
@@ -1053,9 +1055,9 @@ items; do not import Qwen3.5 MoE numbers.
 bracket.** MTP k=2 vs greedy, TP=2, live-context decode tax:
 
 | live ctx | MTP t/s | greedy t/s | MTP/greedy |
-|---|---|---|---|
-| ~2k  | 59.2 | 40.8 | **1.45×** |
-| ~8k  | 44.9 | 38.1 | **1.18×** |
+| --- | --- | --- | --- |
+| ~2k | 59.2 | 40.8 | **1.45×** |
+| ~8k | 44.9 | 38.1 | **1.18×** |
 | ~32k | 25.2 | 30.5 | **0.83×** |
 | ~64k | 16.6 | 24.1 | **0.69×** |
 
@@ -1071,7 +1073,7 @@ boot Q.** Full record: [DEVLOG-mtp1](DEVLOG-mtp1.md). Pinned curve (n=3, cold
 prefill, separate prefill/live-context):
 
 | pp | MTP t/s | greedy t/s | ratio |
-|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: |
 | 2048 | 55.3 | 39.9 | **1.39×** |
 | 16384 | 39.9 | 31.9 | **1.25×** |
 | 32768 | 26.6 | 25.9 | **1.03×** (last win) |
@@ -1097,7 +1099,7 @@ GDN linear-attn stays flat — confirming the crossover mechanism. **K=1 arm
 point — the "crossover" was K=2-specific:
 
 | pp | k=2 (boot Q) | **k=1 (boot S)** | greedy (boot Q) | k1/greedy |
-|---:|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: | ---: |
 | 65536 | 15.95 | **31.61** | 18.86 | **1.68×** |
 | 98304 | 11.19 | **25.29** | 14.80 | **1.71×** |
 | 122880 | 9.18 | **22.07** | 12.74 | **1.73×** |
@@ -1155,7 +1157,7 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
   **Serving A/B @120k-class points (n=3, cold prefill, S9 corpus):**
 
   | pp | k=2 baseline (clamp) | k=2 fixed | gain | vs k=1 same boot |
-  |---:|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: | ---: |
   | 65536 | 15.95 | **37.95** | 2.38× | beats k=1 (31.6) |
   | 98304 | 11.19 | **29.88** | 2.67× | beats k=1 (25.3) |
   | 122880 | 9.18 | **25.70** | 2.80× | beats k=1 (22.1) |
@@ -1174,20 +1176,20 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
   review of branch vs main). **Status: VALIDATED — pending PPL gate + merge.**
 
   **Ideas from external repos (source forks cited in the linked recon docs):**
-  - **SYV-1 — split-KV for multi-query verify.** From
+    - **SYV-1 — split-KV for multi-query verify.** From
     [syv-ai/qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx3090.md) (RTX 3090,
     same model family). Their FA2 only splits KV for single-query requests;
     verify (k+1 queries) ran on 24/82 SMs. **SUPERSEDED by MTP-1b-0** — our
     kernel already has split-KV; the clamp fix is the actual work. Kept as the
     external validation that this is the right lever.
-  - **SYV-2 — lookahead/context drafting.** Draft from the request's own token
+    - **SYV-2 — lookahead/context drafting.** Draft from the request's own token
     history (point-mass, lossless). Their numbers: +55% verbatim, +2–3% prose.
     Our workload has heavy verbatim reproduction; acceptance already 1.0/
     draft-token at 120k so upside is content-shape. Pure scheduler+sampler
     glue, no new params. **Status: open (MTP-1c candidate — pairs with the
     dynamic-depth policy).**
-  - **SYV-3 — quantize MTP draft + small draft vocab.** Their drafter was bf16
-    + full 248k lm_head per draft. ~~Closed negative (marginal K1→K3 = +322 µs
+    - **SYV-3 — quantize MTP draft + small draft vocab.** Their drafter was bf16
+        - full 248k lm_head per draft. ~~Closed negative (marginal K1→K3 = +322 µs
     = 0.4%/step).~~ **RE-OPENED 2026-09-03 — the close used only the MARGINAL
     cost of extra draft rows; it missed the ABSOLUTE B=1 lm_head read.**
     Roofline (see `/local/tmp/mtp1/drafter_memory_bound.md`): drafter lm_head is
@@ -1241,7 +1243,7 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     stock drafter lm_head regressing below ~700 GB/s effective. **The byte-count
     lever survives as CAT-1** (smaller draft vocab halves bytes read — that is
     where the remaining headroom actually is).
-  - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
+    - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
     path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
     **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
     one `torch.topk(k)` replaces the full-vocab sort when all rows' k≤64 and B<8;
@@ -1257,7 +1259,7 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     B=1 +0.6%, **B=4 +3.4%**; sample k=8 p=.9: B=1 +1.4%, B=4 +1.6%. The
     microbench win translates to serving on sampling workloads (control arm
     confirms the delta is the sampler, not run noise). MERGED to main.
-  - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
+    - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
     **Status: CLOSED as dead end (2026-09-08, A6 profile,
     `PROFILE-gdn-bucket-breakdown.md`)** — the rec kernel runs 3.7× the
     pure-BW state-traffic floor (28.8 µs/layer vs 7.7 µs floor: latency-
@@ -1266,10 +1268,10 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     The flag is live for this model family but sub-1 % levers don't clear
     the PPL-gate bar. Flag verified in-tree: `get_mamba_state_dtype_from_config`
     (`models/qwen3_5.py:378/590`).
-  - **SYV-6 — int8 activations (W4A8 Marlin) + negative-scale bug fix.**
+    - **SYV-6 — int8 activations (W4A8 Marlin) + negative-scale bug fix.**
     Batch-mode only (we run B=1); park until multi-request resumes. The bug fix
     is model-portable if we ever hit it. **Status: parked.**
-  - **SYV-7 — hybrid-model prefix caching.** Biggest real-workload win for
+    - **SYV-7 — hybrid-model prefix caching.** Biggest real-workload win for
     chat-on-docs; our sweep uses cold prefill so it doesn't change MTP-1 numbers.
     **Status: DONE (2026-09-04) — nothing to port or enable:** the flag is ON by
     default in our fork (`enable_prefix_caching=True`, `cache.py`) and the model
@@ -1289,11 +1291,11 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     (`prefix_cache_stats` / num_scheduled prefilled tokens). Needs a real agentic
     corpus (pair with the CAT-1 corpus capture when it lands). Low effort:
     config-only A/B, no code. **Status: open (config-only, needs agentic corpus).**
-  - **SYV-8 — DFlash2 block drafter.** Different drafter arch (whole-block
+    - **SYV-8 — DFlash2 block drafter.** Different drafter arch (whole-block
     non-autoregressive). Big effort, needs V2 runner (conflicts with our
     FULLGRAPH path). **Status: parked — revisit only if SYV-1/MTP-1b-0 + SYV-2
     don't deliver.**
-  - **SYV-9 — int8-QK prefill attention.** ~~Prefill-only; not our bottleneck.~~
+    - **SYV-9 — int8-QK prefill attention.** ~~Prefill-only; not our bottleneck.~~
     **Status: HIGH PRIORITY (promoted 2026-09-03, Kevin: "prefill is also very
     relevant to us").** Rationale: gfx906 compute is slow → prefill is
     COMPUTE-bound (unlike decode, which is memory-bound GEMV), so prefill t/s
@@ -1306,7 +1308,7 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     chunked-prefill sizing (`MAX_NUM_BATCHED_TOKENS`), and prefix caching
     (SYV-7) which eliminates redundant prefill entirely. **Next step: prefill
     phase profile before any port.**
-  - **SYV-10 — GDN spec-decode bounds checks (upstream PR #50021; VERIFY).**
+    - **SYV-10 — GDN spec-decode bounds checks (upstream PR #50021; VERIFY).**
     Their vendored `vllm-pr50021-gdn-spec-bounds.patch` fixes an
     illegal-memory-access in the DeltaNet/GDN speculative-decode kernels hit
     with several *concurrent* MTP requests. We run B=1 (low exposure) but the
@@ -1328,7 +1330,7 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     guard matches existing in-file usage (constexpr-compiles-out on ROCm).
     Compile-check lands at the next MTP server launch (boot-Z+1 chat-frac
     arms); field-verify there. Still the B=4 prerequisite.
-  - **SYV-11 — KV-cache compression for capacity (KVarN tier / stock int4·int8
+    - **SYV-11 — KV-cache compression for capacity (KVarN tier / stock int4·int8
     tier; ANALYZE).** Deep-review find (2026-09-07). Their 24 GB 3090 is
     capacity-bound; ours is not *yet* (131k ctx, 64 KB/token fp16 KV = 7.5 GB
     @120k — matches our 7.4 GiB bench records) — so this is a **context
@@ -1336,22 +1338,22 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     *slower* than fp8 at 100k — the dequant eats the bandwidth saving). Two
     tiers, same model family (they run Qwen3.8-27B, so the quality data
     transfers directly):
-    - **KVarN** (Huawei CSL, Apache-2.0; ported to vLLM 0.28 in their repo
+        - **KVarN** (Huawei CSL, Apache-2.0; ported to vLLM 0.28 in their repo
       `kvarn/`): Hadamard rotation + iterative variance normalization,
       4-bit K / 2-bit V per 128-token tile → **12 KB/token (vs 64 fp16)**:
       131k → ~500k-token pool. Their measured: 262k ctx fits, needle-in-haystack
       correct 4k–240k, **PPL +0.16 %**, MTP works. 1/8 the KV bytes.
-    - **Stock `int4_per_token_head` / int8 KV** (their
+        - **Stock `int4_per_token_head` / int8 KV** (their
       `int4-kv-per-token-head.patch` + `spec-decode-int8-kv.patch` fix boot
       blockers on the stock Triton backend): 1/2–1/4 the KV bytes, stock
       machinery, ~20 % decode cost on their box (Triton backend + per-step
       unpack).
     **Status: OPEN — LOW-MED priority; only worth it if Kevin wants >131k
     single-request context or multi-request KV capacity. Gate: PPL probe band
-    + needle + serving A/B; the gfx906 port of the KVarN Triton kernels needs
+        - needle + serving A/B; the gfx906 port of the KVarN Triton kernels needs
     its own validation (dense path only; hybrid page-alignment hunks exist in
     their port).**
-  - **SYV-12 — context-lookup verify extension for MTP ("long block from the prompt"); ANALYZE — the new idea from the deep review. CLOSED negative 2026-09-08 (v1 as built: production-payload A/B net loss −9.3 %/−5.3 %, verified lossless, env-gated default-OFF; the copy-saturated case is UNVERIFIED — the fill's yield was never measured; attribution correction + resurrection gate at the end of the entry; reopen note in `REFRIGERATOR.md`).** Their DFlash2
+    - **SYV-12 — context-lookup verify extension for MTP ("long block from the prompt"); ANALYZE — the new idea from the deep review. CLOSED negative 2026-09-08 (v1 as built: production-payload A/B net loss −9.3 %/−5.3 %, verified lossless, env-gated default-OFF; the copy-saturated case is UNVERIFIED — the fill's yield was never measured; attribution correction + resurrection gate at the end of the entry; reopen note in `REFRIGERATOR.md`).** Their DFlash2
     lookup drafting (`dflash2-lookup-drafting.patch`) generalizes to our MTP
     stack: keep the drafter at k (MTP k=5), but let the **target verify a
     longer block** (k+8) when a prompt-lookup fires — positions past the
@@ -1575,8 +1577,8 @@ evening (handover #2, `ttft-prefill-stall.md` §11): the TTFT stall
     and valid). The per-step O(f) model is characterized (2.63 s +
     34.1 µs/tok per 1024-token step); the owner hunt leads with T6
     (torch intra-op thread cap, `Reducing Torch threads from 8 to 1`)
-    + an in-process 2×2 matrix (OMP × pp, 2 loads); existing B=4
-deode data is mined first; future cells at pp=4096.**
+        - an in-process 2×2 matrix (OMP × pp, 2 loads); existing B=4
+decode data is mined first; future cells at pp=4096.**
     **UPDATED 2026-09-09 late evening (matrix load A, `ttft-prefill-stall.md`
     §12): OMP 1→8 = ratio 1.00 (T6 out). The per-step owner is the
     previous step's GPU tail, observed through a 100% spin-wait on
@@ -1618,7 +1620,7 @@ deode data is mined first; future cells at pp=4096.**
     2 loads) + compiled-mode s9 120k (2 loads) + the B=4-era question
     (the 4th row adds the same cost at B=4; B=4 cells run at pp=4096 per
     the §11 re-order above).
-  - **SYV-13 — mamba/GDN chunked-prefill align fixes (CLOSED 2026-09-08 as
+    - **SYV-13 — mamba/GDN chunked-prefill align fixes (CLOSED 2026-09-08 as
     N/A — verify-only, no code change).** Diffed their
     `mamba-chunked-prefill-align.patch` (qwen38-27b-rtx3090) against our tree,
     both parts: (1) **`src_col` fix** — the live V1 path
@@ -1640,10 +1642,10 @@ deode data is mined first; future cells at pp=4096.**
     serving). The RTX3090 fix targets a codegen artifact on their stack; if
     NaNs ever appear in a partial-chunk GDN prefill here, the one-line
     `tl.where(m_t, b_g, 0.0)` mask is the cheap reviver.
-  - **Ideas from [1CatAI/1Cat-vLLM](RECON-1cat-vllm.md) (V100/SM70, "Make Volta
+    - **Ideas from [1CatAI/1Cat-vLLM](RECON-1cat-vllm.md) (V100/SM70, "Make Volta
     Fast Again" — same generation class as gfx906; runs Qwen3.6-27B-AWQ TP2, the
     near-identical model to ours). Full recon + estimates in the linked doc.**
-  - **CAT-1 — draft-vocabulary shortlisting (DONE — PASS, merge candidate).** Their biggest MTP
+    - **CAT-1 — draft-vocabulary shortlisting (DONE — PASS, merge candidate).** Their biggest MTP
     win: shrink the *drafter's* lm_head vocab from full 248k to a static 131K or
     dynamic 98K+2×512 shortlist → **+21.9% e2e** (80.1→97.7 tok/s) on their TP2
     Qwen3.6-27B-AWQ, lossless by construction (target dist stays full-vocab for
@@ -1682,7 +1684,7 @@ deode data is mined first; future cells at pp=4096.**
     snapshot but **no provenance block** until a fresh build writes one;
     (c) the 131K-list option is still unvalidated — our N = observed ids, and
     only a corpus that demands more ids should justify re-gating it.
-  - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
+    - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
     SYV-9).** Their Volta D=256 prefill kernel = **1.66–2.2× over generic FA2** on
     the same D=256 shape. Techniques: Split-D (D=256→4×D64, paired warps share QK,
     more PV parallelism), **N32 online-softmax as a *quality* requirement** (their
@@ -1693,7 +1695,7 @@ deode data is mined first; future cells at pp=4096.**
     at 120k** → this is the direct target. **Status: OPEN — analyze our Triton
     `gfx906_fa_forward` against head-packing + D-split axes before any port; HIGH
     effort (real FA-kernel rebuild).**
-  - **CAT-3 — FP8 E5M2 KV via one-pass expansion (ANALYZE).** Their biggest *prefill*
+    - **CAT-3 — FP8 E5M2 KV via one-pass expansion (ANALYZE).** Their biggest *prefill*
     FP8-KV speedup: **4.5–4.9×** by a single vectorized `fp8_e5m2_paged_kv_to_fp16`
     gather/expansion into a shared FP16 page-784 workspace (old path re-converted E5M2
     inside *every* query CTA → 96 KiB smem, 1 CTA/SM, ~4% tensor activity). Workspace
@@ -1701,40 +1703,40 @@ deode data is mined first; future cells at pp=4096.**
     today**, so bigger change — but halves KV bytes/bandwidth and the expand-once
     pattern serves SYV-7 prefix caching + long-context decode. **Status: OPEN — needs
     its own FP8-vs-FP16-KV model-level quality gate; HIGH effort.**
-  - **CAT-4 — 128-bit wide aligned KV loads in decode XQA (ANALYZE).** PR #268: one
+    - **CAT-4 — 128-bit wide aligned KV loads in decode XQA (ANALYZE).** PR #268: one
     aligned 128-bit load replaces narrow `half8` fragments, reusing page ID → L1
     global-load requests **−41.5%**, kernel **−23%** (B16/17.8K). Our long-context
     decode is memory-bound on the FA gather; gfx906 equivalent = `v_load_dwordx4`.
     **Status: OPEN — LOW-MOD effort, good first probe for our decode FA path.**
-  - **CAT-5 — prefix/causal-tail separation for chunked prefill (ANALYZE).** Their
+    - **CAT-5 — prefix/causal-tail separation for chunked prefill (ANALYZE).** Their
     superlinear cold-prefill root cause: fixed 1024-token chunks each attend over an
     increasingly long KV prefix → O(L²) work; last 32K of a 64K request = **75%** of
     the prefix-attention sum. Fix: schedule the fully-visible prefix separately from
     the exact causal tail, merge online-softmax state. Directly relevant to our SYV-9
     (FA dominant at 120k prefill). **Status: OPEN — MOD-HIGH effort, pairs with CAT-2.**
-  - **CAT-6 — CTA-local K-parallel small-M GEMM (ANALYZE).** Their M=5 verify AWQ GEMM
+    - **CAT-6 — CTA-local K-parallel small-M GEMM (ANALYZE).** Their M=5 verify AWQ GEMM
     = 6–12% occupancy (68 CTAs/72 SMs); intra-CTA K-split (`1x4x1`→`1x4x2`, FP32
     partials reduced in smem, no extra global workspace). Their target-forward AWQ
     GEMM = 44% of verifier forward (same as ours), but our decode GEMMs are near the BW
     ceiling (SYV-3) so value is uncertain. **Status: OPEN — only if a decode-GEMM profile
     shows occupancy loss at our shapes; MOD effort.**
-  - **CAT-7 — DFlash2 block drafter + LABD/ngram lookup (POSTPONE).** Their ~260 tok/s
+    - **CAT-7 — DFlash2 block drafter + LABD/ngram lookup (POSTPONE).** Their ~260 tok/s
     headline uses the NVFP4 whole-block non-autoregressive DFlash2 drafter (+ optional
     lookup-augmented / prompt-ngram drafting). Same idea as parked **SYV-8** (NVFP4
     checkpoint doesn't transfer to our AWQ; needs V2 runner conflicting with FULLGRAPH).
     The *ngram/lookup* sub-idea maps to **SYV-2** lookahead-drafting. **Status: POSTPONE —
     revisit only if MTP stops delivering.**
-  - **CAT-8 — persistent partition-grid cap (NO-GO).** Their Flash-V100 fixed decode
+    - **CAT-8 — persistent partition-grid cap (NO-GO).** Their Flash-V100 fixed decode
     grid-capping was bitwise-exact but *slower* (register growth + persistent control
     ate the saving; regressed at 65K/262K). Recorded as a dead-end reference so we don't
     re-tread it. **Status: NO-GO.**
-  - **CAT-9 — FP8 prefill tile-selection pitfall (ANALYZE — caution for SYV-9/CAT-3).**
+    - **CAT-9 — FP8 prefill tile-selection pitfall (ANALYZE — caution for SYV-9/CAT-3).**
     Their FP8 prefill regressed with context until they fixed page-size→BM32-phase
     selection and removed per-CTA E5M2 expansion. Adopt as a *design constraint* on any
     int8/FP8 prefill port: right tile/phase at every page size, never convert inside each
     query CTA. **Status: OPEN — design constraint, not a standalone task.**
 
-  - **J2G-1 — persistent all-reduce** (from
+    - **J2G-1 — persistent all-reduce** (from
     [joe2gaan/localaiservers](RECON-joe2gaan-localaiservers.md), TP=8 host).
     Attacks TP comm cost — the per-step work our phase profile could NOT
     attribute (outside any hookable module; hooked modules = ~38% of MTP step).
@@ -1746,23 +1748,23 @@ deode data is mined first; future cells at pp=4096.**
     `/local/tmp/j2g1/`):
 
     | arm | env | @120k ctx | Δ vs A0 | @64k ctx | Δ vs A0 |
-    |-----|-----|----------:|--------:|---------:|--------:|
+| --- | --- | ---: | ---: | ---: | ---: |
     | A0 | none | 12.762 t/s | — | 18.916 t/s | — |
     | **A1** | `NCCL_ALGO=Tree` + `NCCL_PROTO=LL` | **13.115 t/s** | **+2.77%** | **19.723 t/s** | **+4.27%** |
     | A2 | A1 + `MIN/MAX_NCHANNELS=4` | 13.105 t/s | +2.69% | 19.759 t/s | +4.46% |
 
-    - Pass bar (≥2% @120k, no new wedges): **A1 PASSES** (+2.77%, all reps
+        - Pass bar (≥2% @120k, no new wedges): **A1 PASSES** (+2.77%, all reps
       within ±0.3% — not noise). A2 ≈ A1: channel pinning adds nothing; the win
       is Tree+LL alone. No wedges in any arm; clean teardowns.
-    - MTP-workload check: canary with Tree+LL = 39.1 t/s (baseline class
+        - MTP-workload check: canary with Tree+LL = 39.1 t/s (baseline class
       ~39–47) → no regression on the real speculative path.
-    - **Applied default-on** in `run_server.sh` (`NCCL_ALGO=Tree`,
+        - **Applied default-on** in `run_server.sh` (`NCCL_ALGO=Tree`,
       `NCCL_PROTO=LL`) with knob-source attribution to joe2gaan's profile
       (standard env vars, no code port).
-    - **Remaining: full persistent-AR port** (their prebuilt `.so` is TP=8; a
+        - **Remaining: full persistent-AR port** (their prebuilt `.so` is TP=8; a
       gfx906 TP=2 build is the escalation — see J2G-3) and J2G-2 AR pre-fold.
 
-  - **J2G-2 — AR residual pre-fold** (`VLLM_GFX906_AR_PREFOLD_ENABLE`, from
+    - **J2G-2 — AR residual pre-fold** (`VLLM_GFX906_AR_PREFOLD_ENABLE`, from
     `communication_op.py`). Algebraic identity: `allreduce(partial + residual/TP)
     == allreduce(partial) + residual` — fold the layer's residual into the AR
     input so the *next* layer's reduction carries it, saving one fused add per
@@ -1771,28 +1773,28 @@ deode data is mined first; future cells at pp=4096.**
     a **decode** win (per-step comm + FLOPs), complementary to J2G-1's env knobs
     and the persistent-AR port. **Status: new candidate — read their gate logic,
     scope a strict A/B on our TP=2 dense 27B.**
-  - **J2G-3 — hand-tuned RCCL_TREES + custom librccl overlay.** Beyond the env
+    - **J2G-3 — hand-tuned RCCL_TREES + custom librccl overlay.** Beyond the env
     knobs in J2G-1, they ship a prebuilt `librccl.so.1` and an explicit
     `RCCL_TREES='(0(1(3)(4))(2(5(6(7))))|...)'` (4 ring/tree permutations for 8
     ranks). For our TP=2 there's only one edge, so the *trees* don't transfer —
     but if J2G-1's env A/B shows a win, the next step is testing whether a
     gfx906-specific RCCL build beats stock. **Status: new candidate — only worth
     it if J2G-1 lands positive.**
-  - **J2G-4 — row-parallel mutable AR + boundary cut** (`VLLM_GFX906_ROWPAR_...`,
+    - **J2G-4 — row-parallel mutable AR + boundary cut** (`VLLM_GFX906_ROWPAR_...`,
     `ROWPAR_BOUNDARY_MLP_SHAPES=2176x5120`). Splits the row-parallel GEMM/AR
     boundary at a specific MLP shape so the reduction overlaps the next compute.
     Topology/shape-specific (their Qwen3.6 27B MLP); would need re-deriving for
     our model's shapes. **Status: new candidate — low priority, high effort.**
-  - **J2G-5 — tuned Triton MoE block configs** (`vllm_tuned_moe_configs/
+    - **J2G-5 — tuned Triton MoE block configs** (`vllm_tuned_moe_configs/
     E=256,N=128,device_name=AMD_GFX906.json`). Per-batch-size BLOCK_M/N/K +
     warps/stages/waves_per_eu/matrix_instr_nonkdim tuned for gfx906 MoE. Only
     applies to MoE models (we run dense 27B now); note the shipped config is
     Qwen3.6-shaped (E=256, N=128) — a Nemotron-H (g64) port would need its own
     autotune sweep. **Status: new candidate — relevant when we serve a gfx906 MoE.**
 
-  - **J2G-6 — post-AR consumer fusion (allreduce + residual + RMS epilogue).
+    - **J2G-6 — post-AR consumer fusion (allreduce + residual + RMS epilogue).
     ANALYZE.** Deep-review find (2026-09-07, `gfx906-key-learnings-20260606.md`
-    + source inventory). Their dense 27B TP8 profile: the post-AR
+        - source inventory). Their dense 27B TP8 profile: the post-AR
     residual/RMSNorm consumer costs 0.0325 ms of the 0.0893 ms
     `1x5120` MLP-down boundary; a fused `allreduce → add+RMS` kernel beat the
     decomposed chain by 0.023–0.217 ms/call (lower bound ~1.47 ms/token over
@@ -1804,7 +1806,7 @@ deode data is mined first; future cells at pp=4096.**
     LOW-MED; needs a per-boundary profile of OUR TP2 AR+consumer first
     (we have no TP2 AR-cost measurement — our phase profile couldn't
     attribute the unexplained 1.55 ms/step, G1 territory).**
-  - **J2G-7 — custom interleaved SwiGLU MLP GEMV (weight-interleave repack +
+    - **J2G-7 — custom interleaved SwiGLU MLP GEMV (weight-interleave repack +
     fused activation epilogue). ANALYZE.** Their "native interleaved SwiGLU"
     is 13 % of TP8 decode kernel time (2.8 s of 21.7 s profiled) and part of
     their high-water stack: gate/up rows interleaved in the weight layout so
@@ -1824,7 +1826,7 @@ deode data is mined first; future cells at pp=4096.**
     GEMV variant + serving gate); value ~1 % class — do only if a decode-step
     profile confirms the MLP activation pass is still a separate kernel on
     our path.**
-  - **J2G-negative evidence (deep review 2026-09-07, recorded so we don't
+    - **J2G-negative evidence (deep review 2026-09-07, recorded so we don't
     re-walk it):** (1) sequence parallelism — token-shard SP is a 35–59 %
     boundary win in microbench but **rejected in serving**: vLLM overrides
     SP cudagraph capture sizes to [8,16], killing the c1 num_tokens=1 graph
@@ -1899,6 +1901,7 @@ startup is not yet measured either). Multi-arm A/Bs pay startup per arm
 (~1 h of today's run was ~4 launches), so this compounds in dev workflow.
 
 **Step 0 — existing work (search before implementing):**
+
 - Upstream parent issue **vllm-project/vllm#19824 "Improve startup time UX"**
   (breakdown: P2P check, weight load, dynamo trace, inductor compile +
   autotune caching, cudagraph capture, PTX JIT; proposals: lazy cudagraph
@@ -1943,6 +1946,7 @@ fork's one-line GDS-fallback fix = U1 below; +2.8 GiB live VRAM at init →
 forced util 0.95).
 
 **Step 0 — existing work (search before implementing):**
+
 - Our U1 item (upstream queue): fastsafetensors GDS-fallback catch, local
   commit `128e948baf` — check whether it is in the fork's HEAD.
 - Upstream **PR #40183** — fastsafetensors `ParallelLoader` + pipelining
@@ -2321,7 +2325,7 @@ ladder in `gfx906_fa_launcher.cu`); read the VKQ/LDS paths for DV assumptions fi
 then `_pad_head_dim` learns 96. *Risks*: config quality dominates — the ±25 %
 per-dim spread between the 64 and 128 entries means an untuned 96 entry can come out
 **slower** than the padded 128 path; build time/TU size grows; the launcher's
-`head_dim` switch is shared (a mis-keyed entry can shadow D=128 users) and any other
+`head_dim` switch is shared (a wrongly keyed entry can shadow D=128 users) and any other
 caller with head_size 80–96 moves onto the new kernel. *Gate*: standalone at the ViT
 shapes **and** the FA suite (D=128 unchanged) **and** a one-image-prompt TTFT A/B
 (−5 % @1024) — keep it behind an opt-in (`GFX906_FA_VIT_PAD=96`) until that passes,
@@ -2390,6 +2394,7 @@ extended to assert that a full-length (V2-style) host `cu_seqlens` slice with a
 garbage tail is bit-identical, which is the guard the V2-bringup plan asked for.
 
 ### V2-CAT1-1 — the V2 CAT-1 acceptance boost was a harness bug (RETRACTED; the real effect is ms/step)
+
 **Status: CLOSED (2026-09-14, `gfx906/v2-bringup`) — the acceptance effect was a
 measurement artifact.** The A/B client put the arm *name* in the prompt header
 (`RESEARCH-BRIEFING-{arm}-…`); because the header's token count differs per arm
@@ -2552,7 +2557,6 @@ numbers as evidence.
 point is that Muse-Glimmer should use MTP rather than ngram) with the rblock arms
 interleaved (A,B,A) to survive the wedge lottery, and check the ViT backend line.
 
-
 **Status: open; the AWQ checkpoint is downloading (2026-09-15).** Only the GGUF was
 local. The AWQ-INT4 checkpoint (24 GB) is now in `/data/cache/huggingface/hub` — see the findings above.
 
@@ -2580,6 +2584,7 @@ downloads but is untested — so adoption carries a small build step rather than
 stock download.
 
 Follow-ups this created:
+
 - **one clean in-tree extension rebuild** with 3.8.0 installed (all gates so far
   ran against the existing vLLM build) — the release build recipe must still work;
 - **a triton-adopting image build** if the docker images should move off the fork
@@ -2704,6 +2709,7 @@ code. The fp16 storage is released via `register_parameter(name, None)`
 `VLLM_GFX906_QUANT_LAYER0_MOE=1` (default off until soak).
 
 Gates (all passed):
+
 - Unit: 8/8 (`tests/kernels/moe/test_c4_layer0_quant.py`) — bit-exact packing
   vs an independent reference, round-trip error bounds, cross-check against the
   production gfx906 repack.
@@ -2819,7 +2825,7 @@ shared experts 1.0 ms · topk chain ~1.2 ms · SSU+conv 0.5 ms.
   1.10× (wins 1.29–1.60× on the K=2688/large-N shapes, loses 0.69–0.72×
   on K=4096/small-N — mid-N is the hand-tuned CUDA's band); M=4
   0.55–0.80×; M=4096 0.19–0.47×. The serving mode (ngram spec M=6/step
-  + M=4096 prefill) is exactly the losing zone; an M=1-only hybrid
+    - M=4096 prefill) is exactly the losing zone; an M=1-only hybrid
   needs 3× VRAM. Code + probe + tests land on `main` behind
   `VLLM_GFX906_W8A16_INT8=1` (default off). Real win exists for N ≥ 10K
   M=1 lm_head-class shapes (1.60× measured).

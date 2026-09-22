@@ -510,7 +510,7 @@ that both were gated wins awaiting a flip, not parked code.
   module-level aiter import in `rocm_aiter_fa.py` itself.
   **Agentic-corpus re-measure on 0.29 (boot eefacc1e, V1 pinned, 2 reps/cell,
   mclk 1000):** greedy 20.39 @64k / 13.26 @120k, MTP k=3 32.54 / 24.53, MTP k=3
-  + CAT-1 **34.62 / 25.55** — the CAT-1 shortlist reproduces here (+6.4 % /
+    - CAT-1 **34.62 / 25.55** — the CAT-1 shortlist reproduces here (+6.4 % /
   +4.2 % over plain k=3 in-session) and its `MTP draft-vocab shortlist ACTIVE`
   marker is logged in serving, which also de-risks the V2 variant of that check.
   An arm-level re-check of bare MTP k=3 (3 reps) then **retired that reading**:
@@ -667,7 +667,7 @@ that both were gated wins awaiting a flip, not parked code.
 - **M4: long-context split-K accuracy point closed (qwen review #4a).**
   Production split defaults are safe — in fact MORE accurate — at
   16k–32k context: in-process probe (sk 16384/32768, D=256/Hq16/Hkv2
-  + D=128/Hq32/Hkv2, seed 20260829) shows gather kv_split=16 (the B=1
+    - D=128/Hq32/Hkv2, seed 20260829) shows gather kv_split=16 (the B=1
   default) at 5.2e-3/6.6e-3 rel vs fp32 ref and direct-paged
   kv_split=8 (the B≥2 clamp default) at 4.0e-3/5.0e-3 — all ≤ half the
   5e-2 tolerance, and the no-split baseline is WORSE (1.9e-2/2.6e-2):
@@ -957,6 +957,7 @@ that both were gated wins awaiting a flip, not parked code.
   all-decode-step gain estimate was falsified by the x-L2 re-read bound, but
   concurrent decode improved by 14.5% on 35B and 6.1% on Qwen3.8-27B; a
   30-repetition soak passed. See `DEVLOG-fp16-skinny.md`.
+
 ## 2026-08-24
 
 - **FA gather-buffer lifecycle fix.** Capacity-width reuse and a
