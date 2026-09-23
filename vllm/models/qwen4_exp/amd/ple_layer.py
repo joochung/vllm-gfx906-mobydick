@@ -101,11 +101,24 @@ class MmapShardedNGramEmbedding(nn.Module):
             )
         self._shards[shard_index] = tensor
 
+    # The MTP drafter's "no sample here" marker. `sample_idx_mapping` is
+    # pre-filled with it (spec_decode/dflash/speculator.py:145) and reaches
+    # this lookup on every drafter warmup/capture, so it is a normal input, not
+    # corruption. Rows gathered for sentinel slots are discarded downstream.
+    PADDING_SENTINEL = -1
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         if ids.device.type != "cpu":
             raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
         original_shape = ids.shape
         flat_ids = ids.reshape(-1).long()
+        if flat_ids.numel() > 0:
+            # Fold the padding sentinel onto row 0 so it stays in range and is
+            # excluded from the check below. Masking only the sentinel -- as
+            # opposed to clamping the whole tensor -- is what keeps that check
+            # armed: a blanket clamp makes it unreachable, which is exactly how
+            # real corruption would go back to being a silent, wrong row.
+            flat_ids = flat_ids.masked_fill(flat_ids == self.PADDING_SENTINEL, 0)
         shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
         local_idx = flat_ids - shard_idx * self.shard_row_capacity
         out = flat_ids.new_empty(
@@ -116,7 +129,10 @@ class MmapShardedNGramEmbedding(nn.Module):
         # matches no mask, so its row would keep whatever new_empty() found at
         # that address: a silently wrong embedding instead of an error. ids are
         # CPU by the check above, so this costs two small host-side reductions
-        # and no device sync.
+        # and no device sync. (This is not hypothetical: the drafter's -1
+        # padding hit the uninitialized-row path before the check existed -- see
+        # the 2026-09-23 entry in docs/gfx906/degradation.md -- which is why the
+        # sentinel is folded out above rather than rejected or clamped away.)
         if flat_ids.numel() > 0:
             low, high = int(flat_ids.min()), int(flat_ids.max())
             table_rows = self.num_shards * self.shard_row_capacity

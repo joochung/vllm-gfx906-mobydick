@@ -22,7 +22,9 @@ What is asserted, and what deliberately is not:
   `embedding_dim` mismatch, a shard that was never loaded, and an id outside
   the table's row range (negative, or past the last row) -- which before the
   range check matched no shard mask and left its row holding uninitialized
-  memory from `new_empty()`;
+  memory from `new_empty()`; and the one out-of-range id that is *legitimate*,
+  the MTP drafter's `-1` padding sentinel, which must be folded onto a valid
+  row rather than rejected,
 * `load_weights` bookkeeping: which names it reports as loaded, and that
   `hashstats_*` / `token_lookup` leaves are skipped.
 
@@ -207,19 +209,45 @@ def test_missing_shard_raises_rather_than_returning_garbage():
     assert e(torch.tensor([1, 17])).shape == (2, DIM)
 
 
-def test_out_of_range_and_negative_ids_raise_rather_than_returning_garbage(emb):
+def test_out_of_range_ids_raise_rather_than_returning_garbage(emb):
     """An id past the last row matches no shard mask, so before the range check
     its row kept whatever `new_empty()` found there: a wrong embedding with no
-    error. Same for a negative id, which floors to a negative shard index."""
+    error. Same for a negative id, which floors to a negative shard index —
+    except for the drafter's padding sentinel, which has its own test below."""
     table_rows = NUM_SHARDS * CAPACITY
     with pytest.raises(ValueError, match="out of range"):
         emb(torch.tensor([table_rows]))
     with pytest.raises(ValueError, match=r"\[0, 24\]"):
         emb(torch.tensor([0, table_rows]))
     with pytest.raises(ValueError, match="out of range"):
-        emb(torch.tensor([-1]))
+        emb(torch.tensor([-2]))
     # the last valid row still works, and so does the whole valid range
     assert emb(torch.tensor([table_rows - 1])).shape == (1, DIM)
+
+
+def test_drafter_padding_sentinel_is_folded_out_rather_than_rejected(emb):
+    """`-1` is not corruption: the MTP drafter pre-fills `sample_idx_mapping`
+    with it (`spec_decode/dflash/speculator.py:145`) and it arrives on every
+    drafter warmup and capture, so rejecting it takes the whole server down at
+    boot. That is not hypothetical -- the first version of the range check above
+    did exactly that and killed two boots on 2026-09-23 with
+    `PLE ngram id out of range: ids span [-1, -1] but the table holds
+    320001536 rows (128 shards x 2500012)`; see the same date's entry in
+    docs/gfx906/degradation.md.
+
+    The other direction is the more important assertion: folding the sentinel
+    out must happen *before* the range check, not instead of it. A blanket
+    `ids.clamp()` satisfies this test's happy path and silently disarms the
+    check, which is how real corruption goes back to being a wrong row."""
+    sentinel = ple.MmapShardedNGramEmbedding.PADDING_SENTINEL
+    ids = torch.tensor([sentinel, 3, sentinel])
+    out = emb(ids)
+    assert out.shape == (3, DIM)
+    # sentinel rows come from row 0, real rows stay exactly right
+    assert torch.equal(out, _reference(emb._shards, torch.tensor([0, 3, 0]), DIM))
+    # and the range check is still armed in a batch that contains the sentinel
+    with pytest.raises(ValueError, match="out of range"):
+        emb(torch.tensor([sentinel, NUM_SHARDS * CAPACITY]))
 
 
 # --------------------------------------------------------------------------
