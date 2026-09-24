@@ -209,20 +209,71 @@ def test_missing_shard_raises_rather_than_returning_garbage():
     assert e(torch.tensor([1, 17])).shape == (2, DIM)
 
 
-def test_out_of_range_ids_raise_rather_than_returning_garbage(emb):
-    """An id past the last row matches no shard mask, so before the range check
+def test_out_of_range_ids_are_folded_onto_row_zero(emb):
+    """An id past the last row matches no shard mask, so before the range test
     its row kept whatever `new_empty()` found there: a wrong embedding with no
-    error. Same for a negative id, which floors to a negative shard index —
-    except for the drafter's padding sentinel, which has its own test below."""
+    error. It is now folded onto row 0 instead, so every row returned is a row
+    that was actually read.
+
+    Folding rather than raising is the second half of the lesson. The first
+    version of this check raised, and `0xff80ff80ff80ff80` arriving during
+    CUDA-graph capture on 2026-09-23 killed three boots -- see the same date's
+    entry in docs/gfx906/degradation.md."""
     table_rows = NUM_SHARDS * CAPACITY
-    with pytest.raises(ValueError, match="out of range"):
-        emb(torch.tensor([table_rows]))
-    with pytest.raises(ValueError, match=r"\[0, 24\]"):
-        emb(torch.tensor([0, table_rows]))
-    with pytest.raises(ValueError, match="out of range"):
-        emb(torch.tensor([-2]))
+    for bad in (table_rows, -2, 2 * table_rows):
+        out = emb(torch.tensor([bad]))
+        assert torch.equal(out, _reference(emb._shards, torch.tensor([0]), DIM))
+    # mixed with real ids: the real ones are untouched by the fold
+    ids = torch.tensor([5, table_rows, -2, 17])
+    out = emb(ids)
+    assert torch.equal(out, _reference(emb._shards, torch.tensor([5, 0, 0, 17]), DIM))
     # the last valid row still works, and so does the whole valid range
     assert emb(torch.tensor([table_rows - 1])).shape == (1, DIM)
+
+
+def test_capture_time_poison_pattern_does_not_kill_the_boot(emb):
+    """The verbatim value from the three dead boots.
+
+    `0xff80ff80ff80ff80` is what an as-yet-unwritten pinned host buffer reads
+    back as; it reached this lookup only on the compile/graph path, which is why
+    `--enforce-eager` hid it. A guard here must be unable to refuse a boot."""
+    poison = -35747867511423104
+    assert hex(poison & (2**64 - 1)) == "0xff80ff80ff80ff80"
+    ids = torch.full((4, 3), poison, dtype=torch.int64)
+    out = emb(ids)
+    assert out.shape == (4, 3, DIM)
+    assert torch.equal(
+        out, _reference(emb._shards, torch.zeros(4, 3, dtype=torch.long), DIM)
+    )
+
+
+def test_folding_warns_once_per_module(emb, caplog):
+    """Silent folding is how this class of bug becomes invisible: the reason the
+    blanket `clamp()` was worth replacing is that it made corruption look like
+    traffic. So the fold is loud -- but exactly once, because a per-step warning
+    on a boot-time pattern would bury everything else in the log."""
+    with caplog.at_level("WARNING"):
+        emb(torch.tensor([-1, NUM_SHARDS * CAPACITY]))
+        first = [r for r in caplog.records if "outside [0," in r.getMessage()]
+        n_after_first = len(first)
+        emb(torch.tensor([-1, NUM_SHARDS * CAPACITY]))
+    assert n_after_first == 1
+    assert len([r for r in caplog.records if "outside [0," in r.getMessage()]) == 1
+    assert "VLLM_GFX906_PLE_STRICT=1" in first[0].getMessage()
+    # in-range calls say nothing
+    with caplog.at_level("WARNING"):
+        emb(torch.tensor([1, 2, 3]))
+    assert len([r for r in caplog.records if "outside [0," in r.getMessage()]) == 1
+
+
+def test_strict_mode_raises_for_development(emb, monkeypatch):
+    """The diagnostic is opt-in instead of default-on: a raise on this path is a
+    boot refusal, and the inputs that trigger it legitimately occur at boot."""
+    monkeypatch.setenv("VLLM_GFX906_PLE_STRICT", "1")
+    with pytest.raises(ValueError, match=r"out of range.*VLLM_GFX906_PLE_STRICT"):
+        emb(torch.tensor([NUM_SHARDS * CAPACITY]))
+    # in-range ids are unaffected by the strict switch
+    assert emb(torch.tensor([1, 2])).shape == (2, DIM)
 
 
 def test_drafter_padding_sentinel_is_folded_out_rather_than_rejected(emb):
@@ -245,9 +296,12 @@ def test_drafter_padding_sentinel_is_folded_out_rather_than_rejected(emb):
     assert out.shape == (3, DIM)
     # sentinel rows come from row 0, real rows stay exactly right
     assert torch.equal(out, _reference(emb._shards, torch.tensor([0, 3, 0]), DIM))
-    # and the range check is still armed in a batch that contains the sentinel
-    with pytest.raises(ValueError, match="out of range"):
-        emb(torch.tensor([sentinel, NUM_SHARDS * CAPACITY]))
+    # and out-of-range ids in the same batch are handled by the same fold, not
+    # by a path that can refuse a boot
+    mixed = torch.tensor([sentinel, NUM_SHARDS * CAPACITY, 3])
+    assert torch.equal(
+        emb(mixed), _reference(emb._shards, torch.tensor([0, 0, 3]), DIM)
+    )
 
 
 # --------------------------------------------------------------------------
