@@ -4,6 +4,7 @@
 
 import math
 import os
+import time
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.models.qwen4_exp.amd import ple_prof
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -260,6 +262,13 @@ class MmapShardedNGramEmbedding(nn.Module):
                 flat_ids = flat_ids.masked_fill(bad, 0)
         shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
         local_idx = flat_ids - shard_idx * self.shard_row_capacity
+        if ple_prof.prof_enabled():
+            # Distinct shards this lookup actually reads. The gather loop below
+            # runs a fixed 128 iterations and `continue`s on an empty mask, so
+            # this -- not 128 -- is the count of real work, and it is the
+            # quantity a look-ahead prefetch would reduce. One unique() over at
+            # most a few thousand int64s, so it runs only when profiling is on.
+            self._last_shards_touched = int(torch.unique(shard_idx).numel())
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
         )
@@ -1339,6 +1348,14 @@ def qwen4_exp_amd_ple_ngram_embedding(
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     ple_embedding = layer.ple_embedding
     n = ngram_ids.shape[0]
+    # VLLM_GFX906_PLE_PROF=1 brackets the four host-visible steps below (see
+    # vllm/models/qwen4_exp/amd/ple_prof.py for what each one means and why
+    # graph capture is excluded). With the knob unset the statements executed
+    # are exactly the ones that ran before the brackets existed.
+    prof = ple_prof.prof_enabled() and not torch.cuda.is_current_stream_capturing()
+    if prof:
+        faults_before = ple_prof.page_faults()
+        t_drain = time.perf_counter()
     pinned_ids = ple_embedding._pinned_ngram_ids[:n]
     # The mmap'd shard lookup below runs on the host, so the device->host copy
     # has to have landed before the host reads the buffer.  non_blocking=True
@@ -1351,10 +1368,33 @@ def qwen4_exp_amd_ple_ngram_embedding(
     # in self'.  The H2D copy of the result at the end stays async: it is
     # stream-ordered against whatever consumes `output` and needs no host wait.
     pinned_ids.copy_(ngram_ids, non_blocking=False)
+    if prof:
+        t_gather = time.perf_counter()
     result = ple_embedding.ngram_embedding(pinned_ids).flatten(-2)
+    if prof:
+        t_memcpy = time.perf_counter()
     pinned_out = ple_embedding._pinned_output[:n]
     pinned_out.copy_(result.to(dtype=output.dtype))
+    if prof:
+        t_h2d = time.perf_counter()
     output.copy_(pinned_out, non_blocking=True)
+    if prof:
+        faults_after = ple_prof.page_faults()
+        t_end = time.perf_counter()
+        # `rows` is table rows READ (one per ngram id, head_dim wide), not
+        # output tokens; `bytes_staged` is what crosses the H2D link.
+        shards = getattr(ple_embedding.ngram_embedding, "_last_shards_touched", 0)
+        ple_prof.window().record(
+            drain_s=t_gather - t_drain,
+            gather_s=t_memcpy - t_gather,
+            memcpy_s=t_h2d - t_memcpy,
+            h2d_s=t_end - t_h2d,
+            rows=int(ngram_ids.numel()),
+            bytes_staged=int(output.numel() * output.element_size()),
+            shards_touched=shards,
+            minflt_delta=faults_after[0] - faults_before[0],
+            majflt_delta=faults_after[1] - faults_before[1],
+        )
 
 
 # def qwen4_exp_amd_ple_ngram_embedding(
