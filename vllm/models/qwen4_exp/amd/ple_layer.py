@@ -126,6 +126,39 @@ def _advise_random(tensor: torch.Tensor) -> tuple[bool, int, str]:
     return True, length, f"{length} bytes"
 
 
+# VLLM_GFX906_PLE_FASTGATHER=1 selects ``MmapShardedNGramEmbedding._gather_sorted``
+# instead of the original per-shard-mask loop. Measured reason (T3, 2026-09-29,
+# docs/t3-ple-prof-results.md): the gather is a *fixed* cost per lookup, not a
+# per-token one -- 0.0579 ms/row at decode sizes vs 0.0073 at prefill, i.e. 3.46 ms
+# to read 72 rows -- because the loop runs ``num_shards`` (128) iterations and about
+# five torch CPU dispatches per iteration, while a decode batch touches 55.7 of the
+# 128 shards. Cached like the profiler's flag because it is read once per lookup, on
+# a path whose whole purpose is to spend less time per lookup.
+_FASTGATHER: bool | None = None
+
+
+def _fastgather_enabled() -> bool:
+    global _FASTGATHER
+    if _FASTGATHER is None:
+        _FASTGATHER = os.environ.get("VLLM_GFX906_PLE_FASTGATHER", "0") == "1"
+        if _FASTGATHER:
+            logger.info(
+                "PLE ngram lookup: sorted-slice gather enabled "
+                "(VLLM_GFX906_PLE_FASTGATHER=1). The loop still runs num_shards "
+                "iterations, but a shard this batch does not touch now costs one "
+                "integer compare instead of five torch CPU dispatches, and rows "
+                "inside a shard are read in ascending order. Output is "
+                "row-for-row identical to the default path."
+            )
+    return _FASTGATHER
+
+
+def _reset_fastgather_cache() -> None:
+    """Test-only: forget the cached ``VLLM_GFX906_PLE_FASTGATHER`` value."""
+    global _FASTGATHER
+    _FASTGATHER = None
+
+
 class MmapShardedNGramEmbedding(nn.Module):
     """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
     shard tensors, with no TP sharding and no copying. Every rank maps the
@@ -272,17 +305,39 @@ class MmapShardedNGramEmbedding(nn.Module):
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
         )
-        # The loop below can only write rows whose shard index is in
+        # The gather below can only write rows whose shard index is in
         # range(num_shards). An id outside [0, num_shards * shard_row_capacity)
-        # matches no mask, so its row would keep whatever new_empty() found at
+        # matches no shard, so its row would keep whatever new_empty() found at
         # that address: a silently wrong embedding instead of an error. That is
         # why the range test above folds every out-of-range id onto row 0 first
         # -- every row this function returns is a row that was actually read.
-        # Fixed-length loop over every shard, every call — no data-dependent
-        # iteration count. Necessary for CUDA graph capture safety: a Python
-        # loop whose length depends on which shards this specific batch
-        # happens to touch can execute a different number of steps during
-        # warmup/capture than during replay.
+        if _fastgather_enabled():
+            self._gather_sorted(flat_ids, shard_idx, out)
+        else:
+            self._gather_masked(shard_idx, local_idx, out)
+        return out.reshape(*original_shape, self.embedding_dim)
+
+    def _gather_masked(
+        self,
+        shard_idx: torch.Tensor,
+        local_idx: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Gather one row per id, testing every shard against a boolean mask.
+
+        Fixed-length loop over every shard, every call -- no data-dependent
+        iteration count. Necessary for CUDA graph capture safety: a Python
+        loop whose length depends on which shards this specific batch
+        happens to touch can execute a different number of steps during
+        warmup/capture than during replay. That invariant belongs to the
+        gather as a whole, so ``_gather_sorted`` keeps it for the same price.
+
+        The cost of this form is that "is this shard touched" is itself a
+        tensor operation: ``shard_idx == shard`` allocates and fills a mask, and
+        ``mask.any()`` reduces it, for all ``num_shards`` shards whether or not
+        the batch touches them. That is ~5 torch CPU dispatches x 128 shards per
+        lookup, which T3 measured as 3.46 ms of a ~65 ms decode step.
+        """
         for shard in range(self.num_shards):
             mask = shard_idx == shard
             if not mask.any():
@@ -291,7 +346,73 @@ class MmapShardedNGramEmbedding(nn.Module):
             if tensor is None:
                 raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
             out[mask] = tensor.index_select(0, local_idx[mask])
-        return out.reshape(*original_shape, self.embedding_dim)
+
+    def _gather_sorted(
+        self,
+        flat_ids: torch.Tensor,
+        shard_idx: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Gather the same rows, with untouched shards costing one int compare.
+
+        Sorting the ids makes each shard's rows a contiguous span of the
+        destination, so "is this shard touched" becomes ``per_shard[shard] ==
+        0`` -- a Python integer compare against a 128-element list read out of
+        the host tensor once -- and the actual reads become ``index_select``
+        over a contiguous slice instead of a boolean-masked gather. The loop
+        length stays ``self.num_shards``, which is the CUDA-graph invariant
+        ``_gather_masked`` documents; only the per-iteration cost changes.
+
+        Two properties that make this safe to swap in behind the knob:
+
+        * **Bitwise-identical output.** A gather is a per-row copy, so a
+          permutation of the reads cannot change a value. ``torch.sort`` is not
+          required to be stable, and it does not matter here: two equal ids
+          read the same table row, so whichever duplicate lands in which output
+          slot, both slots get that row's bytes.
+        * **Ascending reads inside a shard.** Sorting by id sorts by shard and
+          then by row, so the mmap page touches of one shard go in address
+          order instead of in batch order. T3 showed gather time tracks page
+          faults near-linearly (306k minor faults -> 342 ms, 132k -> 173 ms),
+          so locality is worth having on its own.
+
+        ``flat_ids`` must already be folded into ``[0, num_shards *
+        shard_row_capacity)`` by ``forward``: ``torch.bincount`` rejects
+        negatives, so calling this directly with unfolded ids is a programming
+        error rather than a wrong answer.
+        """
+        n = flat_ids.numel()
+        if n == 0:
+            return
+        counts = torch.bincount(shard_idx, minlength=self.num_shards)
+        sorted_ids, order = torch.sort(flat_ids)
+        local_sorted = torch.remainder(sorted_ids, self.shard_row_capacity)
+        # One host read of num_shards integers. This op is a splitting op and
+        # runs eagerly (see qwen4_exp_amd_ple_ngram_embedding), and the loop
+        # this replaces already read a value-dependent ``mask.any()`` once per
+        # shard, so this is not a new class of host-visible read.
+        per_shard = counts.tolist()
+        gathered = out.new_empty((n, self.embedding_dim))
+        pos = 0
+        for shard in range(self.num_shards):
+            count = per_shard[shard]
+            if count == 0:
+                continue
+            tensor = self._shards[shard]
+            if tensor is None:
+                raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
+            span = slice(pos, pos + count)
+            gathered[span] = tensor.index_select(0, local_sorted[span])
+            pos += count
+        if pos != n:
+            # Would mean ids reached the gather that belong to no shard, which
+            # is the silent-wrong-row failure forward()'s range test exists to
+            # prevent. Fail loudly instead of copying uninitialized rows.
+            raise RuntimeError(
+                f"PLE sorted gather accounted for {pos} of {n} ids; the id "
+                "range guard in forward() did not run"
+            )
+        out.index_copy_(0, order, gathered)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
