@@ -236,6 +236,59 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+ENV_ALLOW_ASYNC_GDN = "VLLM_GFX906_ALLOW_ASYNC_GDN"
+_GDN_LAYER_TYPE = "linear_attention"
+
+
+def gdn_async_ordering_risk(cfg: "VllmConfig") -> str | None:
+    """Return why async scheduling is unsafe for this config, or None.
+
+    The V2 model runner orders batch rows by *planned* token count
+    (`sort_batch_req_ids` in vllm/v1/worker/gpu/model_runner.py), while the GDN
+    metadata builder counts decodes with `query_len == 1` and then asserts that
+    the non-spec decodes occupy the front slice of the batch
+    (vllm/v1/attention/backends/gdn_attn.py). The two predicates agree as long
+    as the scheduler knows each request's next chunk exactly. Under async
+    scheduling a step is built before the previous step's sampled tokens have
+    settled, so a chunked prefill can arrive with a 1-token final chunk that was
+    planned as larger: the runner sorts that row as a prefill, the builder counts
+    it as a decode, and the front slice the builder peels is the wrong set of
+    rows. That is not a slow path -- it is recurrent state written for the wrong
+    request. On this box it took out all four TP workers ~40 minutes into a boot,
+    which is the worst possible failure shape for a serving host.
+
+    Detection is by the `layer_types` marker rather than by importing a model
+    class, because config validation runs before any model code is loaded. It
+    therefore also matches a model that labels its layers `linear_attention` but
+    is served by a different linear-attention kernel; there the cost is only the
+    async optimization, and VLLM_GFX906_ALLOW_ASYNC_GDN=1 turns the guard off for
+    a boot. Only the V2 runner is covered, because that is where the sort
+    predicate lives and where this was observed.
+    """
+    if os.environ.get(ENV_ALLOW_ASYNC_GDN, "0") == "1":
+        return None
+    model_config = cfg.model_config
+    if model_config is None or not cfg.use_v2_model_runner:
+        return None
+    # hf_text_config first: a composite config (VL / audio wrappers) keeps
+    # layer_types on the text sub-config, where the top-level one has none.
+    for level in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        layer_types = getattr(level, "layer_types", None)
+        if isinstance(layer_types, (list, tuple)):
+            if _GDN_LAYER_TYPE in layer_types:
+                return (
+                    "this model has linear-attention (GDN) layers, whose metadata "
+                    "builder requires non-speculative decodes to be the first rows "
+                    "of the batch, and async scheduling builds a step before the "
+                    "previous step has settled"
+                )
+            return None
+    return None
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -1283,6 +1336,13 @@ class VllmConfig:
                 raise ValueError(
                     f"`{executor_backend}` does not support async scheduling yet."
                 )
+            risk = gdn_async_ordering_risk(self)
+            if risk is not None:
+                raise ValueError(
+                    f"Async scheduling is not safe here: {risk}. Start with "
+                    "--no-async-scheduling, or set "
+                    "VLLM_GFX906_ALLOW_ASYNC_GDN=1 to run it anyway."
+                )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             if (
@@ -1329,6 +1389,14 @@ class VllmConfig:
                     "Async scheduling is disabled for ROCm DeepEP "
                     "high-throughput DBO because that combination can corrupt "
                     "DP+EP generation accuracy."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (gdn_risk := gdn_async_ordering_risk(self)) is not None:
+                logger.warning_once(
+                    "Async scheduling is disabled by default: %s. Set %s=1 "
+                    "to enable it anyway.",
+                    gdn_risk,
+                    ENV_ALLOW_ASYNC_GDN,
                 )
                 self.scheduler_config.async_scheduling = False
             else:
