@@ -159,6 +159,44 @@ def _reset_fastgather_cache() -> None:
     _FASTGATHER = None
 
 
+# VLLM_GFX906_PLE_CAPTURE_PROBE=1 is the **E1 Phase 0 ceiling probe**
+# (docs/e1-full-graph-plan.md §3), not a performance option. A CUDA graph
+# replays an op's memcpys and replays *nothing* for its host work, so a PLE op
+# captured into a full decode graph serves the capture-time embedding forever,
+# silently -- which this box did for hours on 2026-09-20
+# (docs/mtp-cudagraph-profile-crash.md §13.2). And with the blocking D2H below
+# it does not even capture: hipErrorStreamCaptureUnsupported (§13.1). To price
+# full-graph decode *before* paying for a graph-safe PLE, this knob makes the
+# op capturable by omitting both the D2H and the gather while a capture is in
+# progress: the graph then records only the H2D from ``_pinned_output`` (zeroed
+# at allocation), which is the one node a real graph-safe PLE would contain.
+# Outside capture the op is byte-for-byte the default path. **Decode output in
+# a probe boot is invalid by construction: PLE contributes zeros.**
+_CAPTURE_PROBE: bool | None = None
+
+
+def _capture_probe_enabled() -> bool:
+    global _CAPTURE_PROBE
+    if _CAPTURE_PROBE is None:
+        _CAPTURE_PROBE = os.environ.get("VLLM_GFX906_PLE_CAPTURE_PROBE", "0") == "1"
+        if _CAPTURE_PROBE:
+            logger.warning(
+                "PLE CAPTURE PROBE ACTIVE (VLLM_GFX906_PLE_CAPTURE_PROBE=1): "
+                "during CUDA graph capture the n-gram D2H and the host shard "
+                "gather are SKIPPED and PLE contributes ZEROS, so replayed PLE "
+                "rows are frozen. Output from this process is NOT VALID. "
+                "Diagnostic only -- measures the ceiling of full-graph decode "
+                "(docs/e1-full-graph-plan.md)."
+            )
+    return _CAPTURE_PROBE
+
+
+def _reset_capture_probe_cache() -> None:
+    """Test-only: forget the cached ``VLLM_GFX906_PLE_CAPTURE_PROBE`` value."""
+    global _CAPTURE_PROBE
+    _CAPTURE_PROBE = None
+
+
 class MmapShardedNGramEmbedding(nn.Module):
     """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
     shard tensors, with no TP sharding and no copying. Every rank maps the
@@ -533,7 +571,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._pinned_ngram_ids = torch.empty(
             (max_total_tokens, self.ngram_heads), dtype=torch.long, device="cpu"
         ).pin_memory()
-        self._pinned_output = torch.empty(
+        self._pinned_output = torch.zeros(
             (max_total_tokens, self.embedding_dim),
             dtype=self.runtime_dtype,
             device="cpu",
@@ -1469,6 +1507,13 @@ def qwen4_exp_amd_ple_ngram_embedding(
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     ple_embedding = layer.ple_embedding
     n = ngram_ids.shape[0]
+    # E1 Phase 0 ceiling probe: while a capture is in progress, record only the
+    # H2D and return. See _capture_probe_enabled() for why a captured gather is
+    # worse than a skipped one, and why the consequence (frozen PLE rows) makes
+    # this a measurement instrument and never a shipping path.
+    if _capture_probe_enabled() and torch.cuda.is_current_stream_capturing():
+        output.copy_(ple_embedding._pinned_output[:n], non_blocking=True)
+        return
     # VLLM_GFX906_PLE_PROF=1 brackets the four host-visible steps below (see
     # vllm/models/qwen4_exp/amd/ple_prof.py for what each one means and why
     # graph capture is excluded). With the knob unset the statements executed
