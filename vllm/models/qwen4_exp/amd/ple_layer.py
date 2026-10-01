@@ -7,6 +7,7 @@ import os
 import time
 import weakref
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -860,6 +861,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: np.ndarray,
         *,
         gather: bool,
+        device_inputs: tuple[Any, ...] | None = None,
     ) -> bool:
         """Turn this step's host-computed row ids into staged embedding rows.
 
@@ -894,6 +896,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # fresh per step, and the compare happens inside the very op of this
             # step, before anything else can recycle them.
             self._host_check_inputs = (input_ids, query_start_loc, ngram_context)
+            # The device half of the same step's inputs, captured HERE rather than
+            # in forward(). The 14:54 boot proved the forward-time stash is dead
+            # code on a compiled path: dynamo runs the Python body at trace time
+            # and the op impl on every step afterwards, so the attribute the
+            # compare read was whatever tracing left behind (None after the first
+            # compare reset it). Staging is plain Python in the worker, it sees
+            # the batch this step will consume, and it is the only place both
+            # sides of the comparison are in scope at once. References, not
+            # copies: these are the runner's persistent buffers, and the compare
+            # runs inside this same step.
+            if device_inputs is not None:
+                self._host_check_dev_inputs = device_inputs
             return True
         dst = self._pinned_ngram_ids[:rows]
         dst.numpy()[:] = ids
@@ -1070,19 +1084,58 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """
         parts = []
         inputs = self._host_check_inputs
+        if device_inputs is None and inputs is None:
+            parts.append("inputs=none(both sides missing)")
+        elif device_inputs is None or inputs is None:
+            # Naming the missing side is the point: the 14:54 boot printed the
+            # draft half and silently dropped the input half, which read like a
+            # dump that had everything.
+            parts.append(
+                "inputs missing on the "
+                + ("device" if device_inputs is None else "host")
+                + " side"
+            )
         if device_inputs is not None and inputs is not None:
             d_ids, d_qsl, d_ctx = device_inputs
             h_ids, h_qsl, h_ctx = inputs
+
+            def _np(t: Any) -> Any:
+                # A None member means "this side has no device counterpart worth
+                # reading"; the ctx window in particular was already exonerated
+                # by the rows that matched, so it is not worth a second sync.
+                if t is None:
+                    return None
+                return t.detach().cpu().numpy()
+
+            dev_ids = _np(d_ids)
+            dev_qsl = _np(d_qsl)
+            dev_ctx = _np(d_ctx)
             parts.append(
                 f"inputs host={h_ids[:rows].tolist()} "
-                f"device={d_ids[:rows].cpu().numpy().tolist()}"
+                + (
+                    f"device={dev_ids[:rows].tolist()}"
+                    if dev_ids is not None
+                    else "device=n/a"
+                )
             )
+            # The runner's query_start_loc is padded to the batch capacity; cut it
+            # to the host's length or the line prints capacity instead of the
+            # request boundaries anyone would compare.
             parts.append(
-                f"qsl host={h_qsl.tolist()} device={d_qsl.cpu().numpy().tolist()}"
+                f"qsl host={h_qsl.tolist()} "
+                + (
+                    f"device={dev_qsl[: h_qsl.shape[0]].tolist()}"
+                    if dev_qsl is not None
+                    else "device=n/a"
+                )
             )
             parts.append(
                 f"ctx host={h_ctx[: max(1, rows)].reshape(-1).tolist()} "
-                f"device={d_ctx[: max(1, rows)].cpu().numpy().reshape(-1).tolist()}"
+                + (
+                    f"device={dev_ctx[: max(1, rows)].reshape(-1).tolist()}"
+                    if dev_ctx is not None
+                    else "device=n/a(host rows that need no draft agreed)"
+                )
             )
         draft = self._host_check_draft
         if draft is not None:
@@ -1102,11 +1155,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         else "?"
                     )
                 )
-        bad = sorted({int(r) for r, _ in np.argwhere(host != dev)})
+        where = np.argwhere(host != dev)
+        bad = sorted({int(r) for r, _ in where})
         parts.append(f"rows differing={bad}")
         for r in bad[:2]:
-            parts.append(f"host row{r}={host[r, :4].tolist()}")
-            parts.append(f"dev  row{r}={dev[r, :4].tolist()}")
+            # Print the HEADS THAT ACTUALLY DIFFER, not the first four. The 14:54
+            # boot truncated every row to [:4], so its second bad row looked
+            # identical on both sides in the very line meant to explain it.
+            cols = sorted({int(c) for c in where[where[:, 0] == r][:, 1]})
+            shown = cols[:4]
+            parts.append(f"row {r} differs in {len(cols)} head(s) {shown}")
+            parts.append(f"host row{r}={host[r, shown].tolist()}")
+            parts.append(f"dev  row{r}={dev[r, shown].tolist()}")
         return "; ".join(parts)
 
     def compare_host_ids(
@@ -1126,7 +1186,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """
         rows = self._host_check_rows
         self._host_check_rows = -1
-        dev_inputs = device_inputs
+        captured = self._host_check_dev_inputs
+        dev_inputs = device_inputs if device_inputs is not None else captured
         self._host_check_dev_inputs = None
         if rows < 0 or rows != device_ids.shape[0]:
             return
@@ -1199,7 +1260,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
         )
-        if self._host_check_rows >= 0:
+        if self._host_check_rows >= 0 and self._host_check_dev_inputs is None:
+            # Fallback for a caller that staged without device inputs (the unit
+            # tests drive forward() directly). On the real path staging already
+            # filled this in, and it must not be overwritten: under torch.compile
+            # this body runs at trace time only, so a value set here is a
+            # trace-time value, not this step's.
             # Differential mode only, and only for the step that staged: the
             # comparison happens inside the custom op, which is handed the ids and
             # nothing else. Not a graph node -- under replay forward does not run,

@@ -371,15 +371,30 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         gather = mode == 1
+        device_inputs: tuple[Any, ...] | None = None
         if not gather:
             # Differential mode: keep the provenance so a mismatch can name the
             # block its draft columns came from instead of describing its output.
             for layer in self._ple_host_layers:
                 layer.note_draft_provenance(values, row_idx, gen)
+            # The device half of this step's inputs, captured in the worker where
+            # both sides are in scope. forward() cannot do it: torch.compile runs
+            # that body at trace time, so anything stashed there is a trace-time
+            # value. The runner's own arrays are padded, so the dump slices them
+            # to the host's lengths. No ctx counterpart is passed: the rows that
+            # need no draft columns agree, which is what exonerates the window.
+            d_ids = getattr(input_batch, "input_ids", None)
+            d_qsl = getattr(input_batch, "query_start_loc", None)
+            if d_ids is not None and d_qsl is not None:
+                device_inputs = (d_ids, d_qsl, None)
         for layer in self._ple_host_layers:
             try:
                 layer.stage_host_step(
-                    input_ids, query_start_loc, ngram_context, gather=gather
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    gather=gather,
+                    device_inputs=device_inputs,
                 )
             except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
                 self.disable_host_staging(

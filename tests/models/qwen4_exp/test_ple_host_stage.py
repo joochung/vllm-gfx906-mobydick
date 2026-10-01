@@ -551,6 +551,11 @@ def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
         num_reqs=num_reqs,
         idx_mapping_np=idx_mapping,
         num_scheduled_tokens=scheduled,
+        # The runner's own device arrays, padded to capacity. The differential
+        # dump reads these (not anything forward() stashed) because torch.compile
+        # runs that body at trace time only.
+        input_ids=torch.zeros(16, dtype=torch.int32),
+        query_start_loc=torch.zeros(4, dtype=torch.int32),
     )
     req_states = SimpleNamespace(
         num_computed_tokens_np=computed, all_token_ids=all_token_ids
@@ -1367,7 +1372,7 @@ def test_mismatch_dump_names_its_inputs(caplog) -> None:  # noqa: ANN001
     emb = StagingEmbedding()
     host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
     dev_ids = host_ids.copy()
-    dev_ids[ROWS - 1, 0] = -1  # one row, one head: enough to disable
+    dev_ids[ROWS - 1, HEADS - 1] = -1  # the LAST head: a [:4] dump would not show it
     emb._host_check_ids = torch.from_numpy(host_ids)
     emb._host_check_rows = ROWS
     ids_arr = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
@@ -1396,9 +1401,111 @@ def test_mismatch_dump_names_its_inputs(caplog) -> None:  # noqa: ANN001
         "first mismatch at 6 rows",
         "inputs host=",
         "device=",
+        "qsl host=",
+        "ctx host=",
         "draft gen=7",
         "rows differing=[5]",
+        # The heads that actually differ, not the first four: the 14:54 boot
+        # truncated every row to [:4] and its second bad row therefore looked
+        # identical on both sides in the line meant to explain it.
+        f"row {ROWS - 1} differs in 1 head(s) [{HEADS - 1}]",
     ):
         assert marker in text, f"missing {marker!r} in:\n{text}"
     # Consumed, so a later step cannot be compared against this step's inputs.
     assert emb._host_check_dev_inputs is None
+
+
+def test_a_dump_that_cannot_name_the_device_side_says_so(
+    caplog,
+) -> None:
+    """Silence about a missing half is worse than a line admitting it.
+
+    The 14:54 dump dropped the input half without comment, which is why it read
+    as a complete diagnosis for a whole round of analysis. A dump that is missing
+    a side has to say which one.
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[1, 0] = -1
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    emb._host_check_inputs = (
+        np.arange(ROWS, dtype=np.int64),
+        np.arange(ROWS + 1, dtype=np.int64),
+        np.zeros((ROWS, CTX), dtype=np.int64),
+    )
+
+    emb.compare_host_ids(torch.from_numpy(dev_ids))  # no device inputs anywhere
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "inputs missing on the device side" in text, text
+    assert "inputs host=" not in text, text
+
+
+def test_the_dump_prints_the_heads_that_differ_not_the_first_four(
+    caplog,
+) -> None:
+    """``[:4]`` is only informative when the disagreement starts at head 0.
+
+    The 14:54 boot reported two bad rows and printed four columns of each, so
+    the row whose disagreement lived past column 3 looked identical on both
+    sides -- the log line said "row 3 differs" and then showed row 3 matching.
+    Eight heads here, disagreement at 5 and 7, so a first-four dump cannot pass.
+    """
+    emb = StagingEmbedding()
+    heads = 8
+    host = np.zeros((3, heads), dtype=np.int64)
+    dev = host.copy()
+    dev[2, 5] = 7
+    dev[2, 7] = 9
+
+    line = emb._id_dump(3, host, dev, None)
+
+    assert "row 2 differs in 2 head(s) [5, 7]" in line, line
+    assert "host row2=[0, 0]" in line, line
+    assert "dev  row2=[7, 9]" in line, line
+    assert "host row2=[0, 0, 0, 0]" not in line, line
+
+
+def test_staging_captures_the_device_side_of_the_inputs(  # noqa: ANN201
+    hostids_env, caplog
+):
+    """The dump has to survive torch.compile, which forward() does not.
+
+    The 14:54 boot printed the draft half of its mismatch and silently dropped
+    the input half. The compare read ``_host_check_dev_inputs`` and the only
+    writer was ``forward()``, whose Python body dynamo runs at trace time and
+    never again on a compiled path -- so on the boot that mattered the attribute
+    was whatever tracing left behind. Staging is plain Python in the worker, and
+    it is the one place both sides of the comparison are in scope at once, so it
+    captures the runner's device arrays and the compare falls back to them when
+    the op has nothing of its own to hand over.
+    """
+    hostids_env["mode"] = 2
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1, st._ple_host_refusals
+    captured = emb._host_check_dev_inputs
+    assert captured is not None, "staging did not capture the device inputs"
+    assert captured[0] is input_batch.input_ids
+
+    # The compiled path: the op hands over nothing, and the dump still names
+    # both sides of the inputs.
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[0, 0] = -1
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    emb.compare_host_ids(torch.from_numpy(dev_ids))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "inputs host=" in text, f"the input half is missing again:\n{text}"
+    assert "device=" in text, text
+    assert "inputs missing on the device side" not in text, text
+    assert emb._host_check_dev_inputs is None, "captured inputs were not consumed"
