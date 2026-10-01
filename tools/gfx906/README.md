@@ -71,3 +71,26 @@ box those two arms fail by construction rather than by regression.
   `docs/decode-perf-suggestions.md` by the paths they have **on the reference box**
   (`/ai/engines/gfx906/unverbraucht/docs/`). Those two write-ups are not (yet) in this
   repo, so those citations do not resolve here.
+
+## `cpu-diff-ngram.py` — host n-gram replica vs the real device function
+
+`compute_ngram_ids_host` (in `vllm/models/qwen4_exp/amd/ple_hostids.py`) is a numpy
+duplicate of `Qwen4ExpNGramEmbedding._compute_ngram_ids`, written so the host can
+build PLE row ids without a device round trip. A duplicate of hash arithmetic is
+only trustworthy while something compares the two, and the differential boot that
+was supposed to do that compares *production* inputs — which cannot tell "the
+formula is wrong" apart from "the inputs were wrong".
+
+This script closes that gap offline: it runs the real `_compute_ngram_ids` on CPU
+and the host replica on byte-identical inputs, over the shapes that matter
+(single request, batched, ragged queries, an eos inside the context, and workspace
+widths both equal to and far larger than the query length).
+
+```bash
+PYTHONPATH=. python tools/gfx906/cpu-diff-ngram.py
+```
+
+As of 2026-10-01 all eight shapes match, which is what makes the differential
+boot's mismatch a statement about the *inputs* rather than about the arithmetic.
+Run it after touching either side of the formula: it needs no GPU, no model, and
+no boot.

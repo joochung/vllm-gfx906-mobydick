@@ -101,6 +101,8 @@ class StagingEmbedding:
     stage_host_step = Qwen4ExpNGramEmbedding.stage_host_step
     take_host_stage = Qwen4ExpNGramEmbedding.take_host_stage
     compare_host_ids = Qwen4ExpNGramEmbedding.compare_host_ids
+    note_draft_provenance = Qwen4ExpNGramEmbedding.note_draft_provenance
+    _id_dump = Qwen4ExpNGramEmbedding._id_dump
     disable_hostids = Qwen4ExpNGramEmbedding.disable_hostids
     _alloc_gen_scratch = Qwen4ExpNGramEmbedding._alloc_gen_scratch
     _gen_scratch = Qwen4ExpNGramEmbedding._gen_scratch
@@ -131,6 +133,10 @@ class StagingEmbedding:
         self._hostids_disabled = False
         self._host_stage_steps = 0
         self._host_id_mismatches = 0
+        self._host_id_matches = 0
+        self._host_check_inputs: tuple[Any, Any, Any] | None = None
+        self._host_check_draft: tuple[Any, Any, int] | None = None
+        self._host_check_dev_inputs: Any = None
         self._rows = rows
         # Generation tripwire state, mirroring the production __init__. The event
         # is a FakeEvent so `query()` is controllable and a synchronize() is a
@@ -486,6 +492,7 @@ class FakeModelState:
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
+        self._last_draft_gen = -1
         self._ple_host_tokens = None
         # The real class builds this in __init__ and seeds it at add time, so the
         # stub has to as well: an unseeded window is a refused step, and these
@@ -505,6 +512,11 @@ class FakeDrafts:
 
     def wait_host_draft_tokens(self):
         return self._result
+
+    def bump_generation(self, gen: int) -> None:
+        """Simulate an epilogue that staged a fresh block."""
+        values, row_idx, _ = self._result
+        self._result = (values.copy(), row_idx.copy(), gen)
 
 
 def _slot_tokens(slot: int, width: int = 64) -> np.ndarray:
@@ -1306,3 +1318,87 @@ def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
     req_states.num_computed_tokens_np[[0, 3]] += 1
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_steps == 1
+
+
+def test_replaying_a_stale_draft_block_refuses(hostids_env) -> None:
+    """A draft block is consumed once: the same generation is last step's tokens.
+
+    This is the one property of the mirror that no shape check can infer. Two
+    consecutive decode steps over an unchanged batch produce an IDENTICAL
+    slot->row map with different values, so a map that lines up is not evidence
+    of freshness -- and a block that is one step old produces exactly the
+    signature the 2026-10-01 14:10 boot showed: the rows whose tokens come from
+    history and draft column 0 agree with the device, the row that needs column
+    1 does not.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    src = _drafts()  # generation fixed at 1, as an epilogue that staged nothing
+    st.set_host_draft_source(src)
+    input_batch, req_states, _ = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1, "first step should stage"
+
+    emb._host_stage_rows = -1  # the op consumed this step's rows
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_refusals.get("draft-gen-stale") == 1
+    assert emb._host_stage_rows == -1, "a stale block was staged anyway"
+    assert st._ple_host_steps == 1
+
+    # The control: the very same batch proceeds the moment a new block exists, so
+    # the refusal above is about the generation and not about "second step ever".
+    src.bump_generation(src.wait_host_draft_tokens()[2] + 1)
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 2, st._ple_host_refusals
+
+
+def test_mismatch_dump_names_its_inputs(caplog) -> None:  # noqa: ANN001
+    """A mismatch that cannot name its tokens is not a diagnosis.
+
+    The arithmetic is proven against the device separately
+    (tools/gfx906/cpu-diff-ngram.py: 8 shapes, including the failing one, all match),
+    so what a production mismatch can mean is "the inputs differed". That is only
+    falsifiable from a log line if the line carries both sides of the inputs and
+    the draft block the host built from.
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[ROWS - 1, 0] = -1  # one row, one head: enough to disable
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    ids_arr = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
+    qsl_arr = np.array([0, 3, 6], dtype=np.int64)
+    ctx_arr = np.arange(ROWS * CTX, dtype=np.int64).reshape(ROWS, CTX)
+    emb._host_check_inputs = (ids_arr, qsl_arr, ctx_arr)
+    emb.note_draft_provenance(
+        np.array([[11, 12, 999], [14, 15, 998]], dtype=np.int64),
+        np.array([0, 3], dtype=np.int64),
+        7,
+    )
+
+    emb.compare_host_ids(
+        torch.from_numpy(dev_ids),
+        (
+            torch.from_numpy(ids_arr),
+            torch.from_numpy(qsl_arr),
+            torch.from_numpy(ctx_arr),
+        ),
+    )
+
+    assert emb._host_id_mismatches == 1
+    assert emb._hostids_disabled is True
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    for marker in (
+        "first mismatch at 6 rows",
+        "inputs host=",
+        "device=",
+        "draft gen=7",
+        "rows differing=[5]",
+    ):
+        assert marker in text, f"missing {marker!r} in:\n{text}"
+    # Consumed, so a later step cannot be compared against this step's inputs.
+    assert emb._host_check_dev_inputs is None

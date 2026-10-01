@@ -606,6 +606,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._hostids_disabled = False
         self._host_stage_steps = 0
         self._host_id_mismatches = 0
+        self._host_id_matches = 0
+        # Differential-mode provenance, for the mismatch dump only. A row that
+        # disagrees is worth nothing unless the dump also shows the three tokens
+        # that produced it and where the host got them, because the arithmetic
+        # itself is now known to match the device (tools/gfx906/cpu-diff-ngram.py).
+        self._host_check_inputs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._host_check_draft: tuple[np.ndarray, np.ndarray, int] | None = None
+        # The op that compares ids is a separate custom op and receives only the
+        # ids, so forward hands the device's inputs over through this attribute.
+        self._host_check_dev_inputs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         # Generation tripwire (P1.5). ``_host_stage_gen`` counts staged steps and
         # is copied into pinned memory in the same act that writes the rows, so a
         # value in the pinned slot means "rows for that step are in the buffer
@@ -878,6 +890,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self._host_check_ids = torch.empty_like(self._pinned_ngram_ids)
             self._host_check_ids[:rows].numpy()[:] = ids
             self._host_check_rows = rows
+            # References, not copies: ``build_decode_step_inputs`` allocates these
+            # fresh per step, and the compare happens inside the very op of this
+            # step, before anything else can recycle them.
+            self._host_check_inputs = (input_ids, query_start_loc, ngram_context)
             return True
         dst = self._pinned_ngram_ids[:rows]
         dst.numpy()[:] = ids
@@ -1027,7 +1043,77 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         self.disable_hostids(f"generation tripwire: {why}")
 
-    def compare_host_ids(self, device_ids: torch.Tensor) -> None:
+    def note_draft_provenance(
+        self, values: np.ndarray | None, row_index: np.ndarray | None, gen: int
+    ) -> None:
+        """Remember which staged draft block this step's ids were built from.
+
+        Differential mode only, and only so a mismatch can name its inputs: the
+        dumps that have been wrong so far described the *output* rows. Column 1 of
+        the mirror is the current suspect, so the dump prints the whole staged
+        block, the slot-to-row map, and the generation the host consumed.
+        """
+        self._host_check_draft = (values, row_index, gen)
+
+    def _id_dump(
+        self,
+        rows: int,
+        host: np.ndarray,
+        dev: np.ndarray,
+        device_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ) -> str:
+        """Everything a mismatch needs, on one line, mode 2 only.
+
+        The synchronising D2H of the device's inputs is the reason this runs on
+        the mismatch path and nowhere else -- ``compare_host_ids`` then disables
+        the host path for the life of the process, so the wait costs one step.
+        """
+        parts = []
+        inputs = self._host_check_inputs
+        if device_inputs is not None and inputs is not None:
+            d_ids, d_qsl, d_ctx = device_inputs
+            h_ids, h_qsl, h_ctx = inputs
+            parts.append(
+                f"inputs host={h_ids[:rows].tolist()} "
+                f"device={d_ids[:rows].cpu().numpy().tolist()}"
+            )
+            parts.append(
+                f"qsl host={h_qsl.tolist()} device={d_qsl.cpu().numpy().tolist()}"
+            )
+            parts.append(
+                f"ctx host={h_ctx[: max(1, rows)].reshape(-1).tolist()} "
+                f"device={d_ctx[: max(1, rows)].cpu().numpy().reshape(-1).tolist()}"
+            )
+        draft = self._host_check_draft
+        if draft is not None:
+            values, row_index, gen = draft
+            if values is None:
+                parts.append("draft=none")
+            else:
+                parts.append(f"draft gen={gen} rows={values.shape}")
+                parts.append(
+                    f"draft block={np.asarray(values).reshape(-1)[:16].tolist()}"
+                )
+                parts.append(
+                    "draft row_idx="
+                    + str(
+                        np.asarray(row_index)[:8].tolist()
+                        if row_index is not None
+                        else "?"
+                    )
+                )
+        bad = sorted({int(r) for r, _ in np.argwhere(host != dev)})
+        parts.append(f"rows differing={bad}")
+        for r in bad[:2]:
+            parts.append(f"host row{r}={host[r, :4].tolist()}")
+            parts.append(f"dev  row{r}={dev[r, :4].tolist()}")
+        return "; ".join(parts)
+
+    def compare_host_ids(
+        self,
+        device_ids: torch.Tensor,
+        device_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
         """Differential mode: the device's ids are now in ``device_ids``.
 
         This is the gate that turns the position arithmetic in
@@ -1040,12 +1126,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """
         rows = self._host_check_rows
         self._host_check_rows = -1
+        dev_inputs = device_inputs
+        self._host_check_dev_inputs = None
         if rows < 0 or rows != device_ids.shape[0]:
             return
         assert self._host_check_ids is not None
         host = self._host_check_ids[:rows].numpy()
         dev = device_ids.numpy()
         if bool(np.array_equal(host, dev)):
+            self._host_id_matches += 1
+            if self._host_id_matches == 1:
+                logger.info(
+                    "PLE HOSTIDS: host and device ids agree for '%s' (%d rows) -- "
+                    "first matching step.",
+                    self.layer_name,
+                    rows,
+                )
             return
         self._host_id_mismatches += 1
         diff = np.argwhere(host != dev)[:4]
@@ -1053,8 +1149,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             f"[{r},{c}] host={int(host[r, c])} device={int(dev[r, c])}" for r, c in diff
         )
         self.disable_hostids(
-            f"first mismatch at {rows} rows: {detail} "
-            f"(host row 0 = {host[0].tolist()}, device row 0 = {dev[0].tolist()})"
+            f"first mismatch at {rows} rows: {detail}; "
+            + self._id_dump(rows, host, dev, dev_inputs)
         )
 
     def disable_hostids(self, why: str) -> None:
@@ -1103,6 +1199,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
         )
+        if self._host_check_rows >= 0:
+            # Differential mode only, and only for the step that staged: the
+            # comparison happens inside the custom op, which is handed the ids and
+            # nothing else. Not a graph node -- under replay forward does not run,
+            # and neither does any comparison.
+            self._host_check_dev_inputs = (
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.runtime_dtype,
@@ -1900,7 +2006,10 @@ def qwen4_exp_amd_ple_ngram_embedding(
     # that mode nothing above was skipped, so the cost when the knob is off or at
     # 1 is one attribute read.
     if getattr(ple_embedding, "_host_check_rows", -1) >= 0:
-        ple_embedding.compare_host_ids(pinned_ids)
+        ple_embedding.compare_host_ids(
+            pinned_ids,
+            getattr(ple_embedding, "_host_check_dev_inputs", None),
+        )
     if prof:
         t_gather = time.perf_counter()
     result = ple_embedding.ngram_embedding(pinned_ids).flatten(-2)

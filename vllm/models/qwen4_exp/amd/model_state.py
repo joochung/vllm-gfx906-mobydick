@@ -86,6 +86,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
+        # The draft-block generation this model state last consumed. Freshness is
+        # the one property of the mirror that no shape check can infer.
+        self._last_draft_gen = -1
         self.ple_query_start_loc = torch.zeros(
             self.max_num_reqs + 1,
             dtype=torch.int32,
@@ -336,7 +339,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         num_reqs = input_batch.num_reqs
         try:
-            values, row_idx, _gen = self._host_drafts.wait_host_draft_tokens()  # type: ignore[attr-defined]
+            values, row_idx, gen = self._host_drafts.wait_host_draft_tokens()  # type: ignore[attr-defined]  # noqa: E501
+            # Freshness, not presence. Two consecutive decode steps over an
+            # unchanged batch produce an IDENTICAL slot->row map with different
+            # values, so a map that lines up proves nothing about which step the
+            # numbers came from. A generation that did not advance since the last
+            # consumption means the epilogue staged nothing in between, and these
+            # are the previous step's drafts -- the signature the 14:10 boot
+            # showed: the rows whose tokens come from history and draft column 0
+            # agreed, the row that needs column 1 did not.
+            if values is not None and gen == self._last_draft_gen:
+                raise HostIdsRefused("draft-gen-stale", f"gen={gen}")
             input_ids, query_start_loc, ngram_context = build_decode_step_inputs(
                 input_batch.idx_mapping_np[:num_reqs],
                 input_batch.num_scheduled_tokens[:num_reqs],
@@ -358,6 +371,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         gather = mode == 1
+        if not gather:
+            # Differential mode: keep the provenance so a mismatch can name the
+            # block its draft columns came from instead of describing its output.
+            for layer in self._ple_host_layers:
+                layer.note_draft_provenance(values, row_idx, gen)
         for layer in self._ple_host_layers:
             try:
                 layer.stage_host_step(
@@ -368,6 +386,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     f"host id staging failed ({type(exc).__name__}: {exc})"
                 )
                 return
+        self._last_draft_gen = gen
         self._ple_host_steps += 1
         if self._ple_host_steps == 1:
             logger.info(
