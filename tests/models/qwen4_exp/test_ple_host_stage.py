@@ -108,6 +108,9 @@ class StagingEmbedding:
     _gen_scratch = Qwen4ExpNGramEmbedding._gen_scratch
     check_host_gen = Qwen4ExpNGramEmbedding.check_host_gen
     _fire_gen = Qwen4ExpNGramEmbedding._fire_gen
+    _begin_invocation = Qwen4ExpNGramEmbedding._begin_invocation
+    _snapshot_compute_inputs = Qwen4ExpNGramEmbedding._snapshot_compute_inputs
+    _read_input_snapshot = Qwen4ExpNGramEmbedding._read_input_snapshot
 
     def __init__(self, rows: int = ROWS, capacity: int = CAPACITY) -> None:
         multipliers, sizes, offsets = _layout()
@@ -152,6 +155,18 @@ class StagingEmbedding:
         self._gen_checks_ok = 0
         self._gen_trips = 0
         self._staged_branch_captured = False
+        # Invocation stamps and the input snapshot (P1.9), mirroring __init__. The
+        # snapshot scratches stay None here: pinning needs a GPU, and what these
+        # tests exercise is the stamping and the dump, not DMA.
+        self._impl_calls = 0
+        self._stage_seq = 0
+        self._stage_at_impl = -1
+        self._host_cross_step_skips = 0
+        self._ids_snapshot: torch.Tensor | None = None
+        self._qsl_snapshot: torch.Tensor | None = None
+        self._pinned_ids_snapshot: torch.Tensor | None = None
+        self._pinned_qsl_snapshot: torch.Tensor | None = None
+        self._host_snap: tuple[Any, Any] | None = None
 
     @property
     def ngram_embedding(self):  # noqa: ANN201
@@ -311,7 +326,13 @@ def test_compare_disables_on_the_first_mismatch() -> None:
     emb._host_check_ids = torch.from_numpy(ids.copy())
     emb._host_check_rows = ROWS
     device = torch.from_numpy(np.full((ROWS, HEADS), 43, dtype=np.int64))
+    # Adjacency stamp (P1.9): the producer stages by way of stage_host_step, which
+    # records the op-entry the stage belongs to. These tests hand the compare a
+    # buffer directly, so they have to say so -- otherwise the same-step gate, which
+    # exists to refuse exactly that situation, refuses them.
+    emb._stage_at_impl = emb._impl_calls
 
+    emb._begin_invocation()
     emb.compare_host_ids(device)
 
     assert emb._hostids_disabled is True
@@ -324,6 +345,12 @@ def test_compare_passes_and_is_consumed_on_agreement() -> None:
     ids = np.full((ROWS, HEADS), 42, dtype=np.int64)
     emb._host_check_ids = torch.from_numpy(ids.copy())
     emb._host_check_rows = ROWS
+    # Adjacency stamp (P1.9): the producer stages by way of stage_host_step, which
+    # records the op-entry the stage belongs to. These tests hand the compare a
+    # buffer directly, so they have to say so -- otherwise the same-step gate, which
+    # exists to refuse exactly that situation, refuses them.
+    emb._stage_at_impl = emb._impl_calls
+    emb._begin_invocation()
     emb.compare_host_ids(torch.from_numpy(ids.copy()))
     assert emb._hostids_disabled is False
     assert emb._host_id_mismatches == 0
@@ -341,6 +368,7 @@ def test_compare_ignores_a_row_count_disagreement() -> None:
     emb = StagingEmbedding()
     emb._host_check_ids = torch.zeros((CAPACITY, HEADS), dtype=torch.long)
     emb._host_check_rows = ROWS
+    emb._begin_invocation()
     emb.compare_host_ids(torch.zeros((ROWS - 1, HEADS), dtype=torch.long))
     assert emb._hostids_disabled is False
     assert emb._host_id_mismatches == 0
@@ -444,6 +472,11 @@ def test_op_disables_after_a_check_mismatch(monkeypatch):
     emb = StagingEmbedding()
     emb._host_check_ids = torch.full((ROWS, HEADS), -7, dtype=torch.long)
     emb._host_check_rows = ROWS
+    # Adjacency stamp (P1.9): the producer stages by way of stage_host_step, which
+    # records the op-entry the stage belongs to. These tests hand the compare a
+    # buffer directly, so they have to say so -- otherwise the same-step gate, which
+    # exists to refuse exactly that situation, refuses them.
+    emb._stage_at_impl = emb._impl_calls
 
     with _op_env(emb, monkeypatch) as emb:
         _run_op()
@@ -1385,6 +1418,8 @@ def test_mismatch_dump_names_its_inputs(caplog) -> None:  # noqa: ANN001
         7,
     )
 
+    emb._stage_at_impl = emb._impl_calls  # the producer staged for this entry
+    emb._begin_invocation()
     emb.compare_host_ids(
         torch.from_numpy(dev_ids),
         (
@@ -1436,6 +1471,8 @@ def test_a_dump_that_cannot_name_the_device_side_says_so(
         np.zeros((ROWS, CTX), dtype=np.int64),
     )
 
+    emb._stage_at_impl = emb._impl_calls  # the producer staged for this entry
+    emb._begin_invocation()
     emb.compare_host_ids(torch.from_numpy(dev_ids))  # no device inputs anywhere
 
     text = "\n".join(r.getMessage() for r in caplog.records)
@@ -1502,6 +1539,8 @@ def test_staging_captures_the_device_side_of_the_inputs(  # noqa: ANN201
     dev_ids[0, 0] = -1
     emb._host_check_ids = torch.from_numpy(host_ids)
     emb._host_check_rows = ROWS
+    emb._stage_at_impl = emb._impl_calls  # the producer staged for this entry
+    emb._begin_invocation()
     emb.compare_host_ids(torch.from_numpy(dev_ids))
 
     text = "\n".join(r.getMessage() for r in caplog.records)
@@ -1509,3 +1548,212 @@ def test_staging_captures_the_device_side_of_the_inputs(  # noqa: ANN201
     assert "device=" in text, text
     assert "inputs missing on the device side" not in text, text
     assert emb._host_check_dev_inputs is None, "captured inputs were not consumed"
+
+
+# ---------------------------------------------------------------------------
+# P1.9: a comparison is only evidence about the step that produced both halves.
+#
+# The 15:37 differential boot compared a host array staged for one step against
+# ids whose rows 2 and 3 are not the output of ANY single input array -- CRT
+# inversion of the printed ids puts a token in those rows that appears nowhere in
+# the step, and substituting that token changes rows 0 and 1 too, which the log
+# says matched. So the two halves came from different computes, and the row-count
+# check passed anyway because the host's row count equalled the graph's padded
+# row count. Everything below exists to make that unrepeatable.
+
+
+def _stage_differential(emb) -> int:
+    """Stage through the producer; return the op entry the stage was stamped at."""
+    before = emb._impl_calls
+    assert _stage(emb, gather=False) is True
+    assert emb._stage_at_impl == before, "the stage did not stamp its invocation"
+    assert emb._stage_seq == 1, "the stage did not number itself"
+    return before
+
+
+def test_a_stage_is_only_compared_by_the_invocation_it_belongs_to() -> None:
+    emb = StagingEmbedding()
+    _stage_differential(emb)
+    emb._begin_invocation()
+    # A second entry into the op: whatever is in the ids buffer now belongs to a
+    # different compute, so the staged array is history.
+    emb._begin_invocation()
+    emb.compare_host_ids(torch.full((ROWS, HEADS), 43, dtype=torch.long))
+
+    assert emb._host_cross_step_skips == 1, "the cross-step gate did not fire"
+    assert emb._host_id_mismatches == 0, "a refused comparison was counted as one"
+    assert emb._hostids_disabled is False, (
+        "a harness limitation disabled the feature it was harnessing"
+    )
+
+
+def test_the_invocation_immediately_after_the_stage_is_compared() -> None:
+    """The gate must be adjacency, not a blanket refusal.
+
+    Without this, the test above is satisfied by a compare that never runs, which
+    is how a diagnostic ends up believing its own silence.
+    """
+    emb = StagingEmbedding()
+    _stage_differential(emb)
+    emb._begin_invocation()
+    emb.compare_host_ids(torch.full((ROWS, HEADS), 43, dtype=torch.long))
+
+    assert emb._hostids_disabled is True
+    assert emb._host_id_mismatches == 1
+    assert emb._host_cross_step_skips == 0
+
+
+def test_the_op_counts_entries_that_compare_nothing(monkeypatch) -> None:
+    """An entry which stages nothing must still advance the counter.
+
+    The counter's job is to know how many computes have happened, and a step that
+    compared nothing is still a compute. Were those entries invisible, the gap
+    would read 1 across a step that had already consumed the stage.
+    """
+    emb = StagingEmbedding()
+    with _op_env(emb, monkeypatch) as emb:
+        _run_op()
+
+    assert emb._impl_calls == 1, "an entry that compared nothing was not counted"
+    assert emb._host_id_mismatches == 0
+
+
+def test_a_stage_alone_is_never_compared() -> None:
+    """A hand-filled buffer with no producer stamp is not a staged step."""
+    emb = StagingEmbedding()
+    emb._host_check_ids = torch.full((ROWS, HEADS), 42, dtype=torch.long)
+    emb._host_check_rows = ROWS
+    emb._begin_invocation()
+    emb.compare_host_ids(torch.full((ROWS, HEADS), 43, dtype=torch.long))
+
+    assert emb._host_cross_step_skips == 1
+    assert emb._hostids_disabled is False
+
+
+def test_snapshot_records_the_arrays_the_compute_read() -> None:
+    """The snapshot is a copy, so it must agree with the source element for element.
+
+    Asserting the copy rather than a constant is the point: a snapshot that
+    silently missed a slice would reproduce the 15:37 confusion, where the inputs
+    printed were not the inputs consumed.
+    """
+    emb = StagingEmbedding()
+    emb._ids_snapshot = torch.zeros(ROWS, dtype=torch.long)
+    emb._qsl_snapshot = torch.zeros(ROWS + 2, dtype=torch.long)
+    ids = torch.arange(ROWS, dtype=torch.long) * 7 + 3
+    qsl = torch.tensor([0, 2, ROWS], dtype=torch.long)
+
+    emb._snapshot_compute_inputs(ids, qsl)
+
+    assert emb._ids_snapshot.tolist() == ids.tolist()
+    assert emb._qsl_snapshot[:3].tolist() == qsl.tolist()
+    assert emb._qsl_snapshot[3:].tolist() == [0] * (ROWS + 2 - 3), (
+        "the copy ran past the source"
+    )
+
+    emb._pinned_ids_snapshot = torch.zeros(ROWS, dtype=torch.long)
+    emb._pinned_qsl_snapshot = torch.zeros(ROWS + 2, dtype=torch.long)
+    got = emb._read_input_snapshot()
+    assert got is not None
+    assert got[0].tolist() == ids.tolist()
+    assert got[1][:3].tolist() == qsl.tolist()
+
+
+def test_no_scratch_makes_the_snapshot_a_no_op() -> None:
+    """Knob off (or not yet allocated): no copy, no crash, dump admits it."""
+    emb = StagingEmbedding()
+    emb._snapshot_compute_inputs(torch.arange(4), torch.tensor([0, 4]))
+    assert emb._read_input_snapshot() is None
+
+
+def test_the_dump_prints_what_the_compute_read(caplog) -> None:
+    """The mismatch line has to name the discrepancy the 15:37 boot could not.
+
+    There, both sides of the printed inputs agreed while the ids differed. The
+    snapshot is the third witness, and a snapshot that disagrees with the runner's
+    buffers is the whole explanation -- so it has to be printed, with the index
+    that diverges, and it has to arrive by way of the real read path rather than
+    being pasted into the attribute the dump reads.
+    """
+    emb = StagingEmbedding()
+    _stage_differential(emb)
+    assert emb._host_check_ids is not None
+    assert emb._host_check_inputs is not None
+    host_ids = emb._host_check_ids[:ROWS].numpy().copy()
+    dev_ids = host_ids.copy()
+    dev_ids[2, 0] = -1
+    ran_ids = np.asarray(emb._host_check_inputs[0])
+    emb._ids_snapshot = torch.zeros(ROWS, dtype=torch.long)
+    emb._ids_snapshot[: ran_ids.shape[0]] = torch.from_numpy(ran_ids.copy())
+    emb._ids_snapshot[1] = int(ran_ids[1]) + 1
+    emb._pinned_ids_snapshot = torch.zeros(ROWS, dtype=torch.long)
+    emb._qsl_snapshot = torch.zeros(ROWS + 2, dtype=torch.long)
+    emb._pinned_qsl_snapshot = torch.zeros(ROWS + 2, dtype=torch.long)
+
+    emb._begin_invocation()
+    emb.compare_host_ids(torch.from_numpy(dev_ids))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    snap = ran_ids.copy()
+    snap[1] += 1
+    assert f"compute ids(snapshot)={snap[:ROWS].tolist()}" in text, text
+    assert (
+        f"snapshot matches host inputs: False first differing index 1: "
+        f"snapshot={int(snap[1])} host={int(ran_ids[1])}" in text
+    ), text
+    assert "op entry=1 stage seq=1" in text, text
+
+
+def test_a_dump_without_the_snapshot_says_which_half_is_missing(caplog) -> None:
+    """The rule the 15:37 dump broke: announce absence, do not omit it."""
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[0, 0] = -1
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    emb._host_snap = None
+    emb._stage_at_impl = emb._impl_calls
+    emb._begin_invocation()
+
+    emb.compare_host_ids(torch.from_numpy(dev_ids))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "compute inputs=none(" in text, text
+
+
+def test_the_device_query_boundaries_are_printed_whole(caplog) -> None:
+    """A padded qsl is a suspect, so it cannot be printed cut to the host's size.
+
+    The runner pads query_start_loc to the batch capacity; a padded boundary makes
+    the compute split the token stream into requests the host never saw. Slicing
+    the array to the host's length, which is what the 15:37 dump did, hides the
+    only evidence of that.
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[0, 0] = -1
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    emb._host_check_inputs = (
+        np.arange(ROWS, dtype=np.int64),
+        np.array([0, 3, 6], dtype=np.int64),
+        np.zeros((ROWS, CTX), dtype=np.int64),
+    )
+    emb._stage_at_impl = emb._impl_calls
+    emb._begin_invocation()
+
+    emb.compare_host_ids(
+        torch.from_numpy(dev_ids),
+        (
+            torch.from_numpy(np.arange(ROWS, dtype=np.int64)),
+            # Capacity 4, two real requests: the two padded boundaries are the
+            # thing being looked for.
+            torch.tensor([0, 3, 6, 6, 6], dtype=torch.long),
+            torch.zeros((ROWS, CTX), dtype=torch.long),
+        ),
+    )
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "qsl host=[0, 3, 6] device=[0, 3, 6, 6, 6]" in text, text

@@ -614,6 +614,32 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # itself is now known to match the device (tools/gfx906/cpu-diff-ngram.py).
         self._host_check_inputs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._host_check_draft: tuple[np.ndarray, np.ndarray, int] | None = None
+        # Invocation stamps (P1.9). ``_impl_calls`` counts every entry into the
+        # custom op, which is the only thing that can tell a staged step from a
+        # consumed one: the compare is only sound for the invocation that
+        # immediately follows the stage. ``_stage_seq`` numbers the stages
+        # themselves so a dump can say which stage a compare consumed, and
+        # ``_host_cross_step_skips`` counts the comparisons refused for want of
+        # that adjacency. The 15:37 boot is the reason: rows 0,1 agreed and rows
+        # 2,3 carried a token that appears nowhere in the step, which is not a
+        # possible output of any single input array (proven by CRT inversion of
+        # the printed ids), so the two halves came from different computes.
+        self._impl_calls = 0
+        self._stage_seq = 0
+        self._stage_at_impl = -1
+        self._host_cross_step_skips = 0
+        # The compute's OWN input arrays, snapshotted by a node inside the
+        # compiled region (mode 2 only). Reading the runner's buffers at compare
+        # time is not the same measurement: the ids were produced by a graph
+        # replay from the graph's view of those buffers, at a point in the step
+        # this Python code cannot see. A copy enqueued there runs on every replay,
+        # so what lands in these pinned rows is what the hash actually consumed.
+        self._ids_snapshot: torch.Tensor | None = None
+        self._qsl_snapshot: torch.Tensor | None = None
+        self._pinned_ids_snapshot: torch.Tensor | None = None
+        self._pinned_qsl_snapshot: torch.Tensor | None = None
+        self._ids_ptr_last = -1
+        self._host_snap: tuple[np.ndarray, np.ndarray] | None = None
         # The op that compares ids is a separate custom op and receives only the
         # ids, so forward hands the device's inputs over through this attribute.
         self._host_check_dev_inputs: (
@@ -892,6 +918,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self._host_check_ids = torch.empty_like(self._pinned_ngram_ids)
             self._host_check_ids[:rows].numpy()[:] = ids
             self._host_check_rows = rows
+            # Invocation stamp (P1.9): this stage belongs to the NEXT entry into
+            # the op, and only to that one. Anything that enters the op in
+            # between -- a second PLE call in the step, a step that staged and
+            # never reached this op -- makes the gap != 1 and the comparison is
+            # refused rather than believed.
+            self._stage_seq += 1
+            self._stage_at_impl = self._impl_calls
             # References, not copies: ``build_decode_step_inputs`` allocates these
             # fresh per step, and the compare happens inside the very op of this
             # step, before anything else can recycle them.
@@ -952,6 +985,75 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._gen_device = torch.zeros(
             1, dtype=torch.long, device=self.layer_multipliers.device
         )
+
+    def _alloc_snap_scratch(self) -> None:
+        """Device scratch holding the compute's own input arrays (mode 2 only).
+
+        Allocated with the weights, because a capture must never have to allocate
+        the buffer a captured node writes into. Nothing is allocated unless the
+        knob is at 2: with it off or at 1 these would be bytes and a per-step copy
+        that no one reads.
+        """
+        if ple_hostids.hostids_mode() != 2:
+            return
+        device = self.layer_multipliers.device
+        self._ids_snapshot = torch.zeros(
+            self._pinned_ngram_ids.shape[0], dtype=torch.long, device=device
+        )
+        self._qsl_snapshot = torch.zeros(
+            self.padded_buffer.shape[0] + 1, dtype=torch.long, device=device
+        )
+        self._pinned_ids_snapshot = torch.zeros_like(self._ids_snapshot).pin_memory()
+        self._pinned_qsl_snapshot = torch.zeros_like(self._qsl_snapshot).pin_memory()
+
+    def _snapshot_compute_inputs(
+        self, input_ids: torch.Tensor, query_start_loc: torch.Tensor
+    ) -> None:
+        """Record, as graph nodes, the arrays this compute is consuming.
+
+        Called from ``forward`` *inside* the compiled region, before the split op,
+        so the copies become nodes of the same graph that produced the ids and run
+        on every replay. This is the difference between "what the hash read" and
+        "what the runner's buffers say when Python looks at them later", which is
+        what P1.8 was reading. A frozen or replayed graph is invisible to that
+        later look, which is why the 15:37 dump printed identical inputs on both
+        sides of a mismatch that is arithmetically impossible for identical inputs.
+        """
+        snap = self._ids_snapshot
+        if snap is None or self._hostids_disabled:
+            return
+        ids = input_ids.reshape(-1)
+        snap[: ids.numel()].copy_(ids)
+        qsl_snap = self._qsl_snapshot
+        if qsl_snap is not None:
+            qsl_snap[: query_start_loc.numel()].copy_(query_start_loc)
+
+    def _read_input_snapshot(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Pull the snapshot into host memory and return numpy views.
+
+        Legal outside a capture, which is where the custom op runs, and ordered:
+        the copies above sit ahead of the op on the same stream, and the op has
+        already done a blocking D2H of the ids by the time this is called, so the
+        snapshot rows this step's graph wrote cannot still be in flight.
+        """
+        pinned = self._pinned_ids_snapshot
+        if pinned is None or self._ids_snapshot is None:
+            return None
+        pinned.copy_(self._ids_snapshot, non_blocking=False)
+        qsl_pinned = self._pinned_qsl_snapshot
+        if qsl_pinned is not None and self._qsl_snapshot is not None:
+            qsl_pinned.copy_(self._qsl_snapshot, non_blocking=False)
+            return pinned.numpy(), qsl_pinned.numpy()
+        return pinned.numpy(), None
+
+    def _begin_invocation(self) -> None:
+        """Count one entry into the PLE custom op.
+
+        The impl calls this first thing; a test that drives
+        :meth:`compare_host_ids` directly must call it too, because the point of
+        the counter is that a comparison belongs to an invocation.
+        """
+        self._impl_calls += 1
 
     def _gen_scratch(self, device: torch.device) -> torch.Tensor:
         """The device scratch the graph copies the generation into.
@@ -1118,13 +1220,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     else "device=n/a"
                 )
             )
-            # The runner's query_start_loc is padded to the batch capacity; cut it
-            # to the host's length or the line prints capacity instead of the
-            # request boundaries anyone would compare.
+            # The runner's query_start_loc is padded to the batch capacity, and
+            # that padding is itself a suspect: a padded boundary makes the
+            # compute split the token stream into requests the host never saw.
+            # Cutting it to the host's length hid exactly that, so print the
+            # whole thing -- it is at most max_num_seqs+1 numbers.
             parts.append(
                 f"qsl host={h_qsl.tolist()} "
                 + (
-                    f"device={dev_qsl[: h_qsl.shape[0]].tolist()}"
+                    f"device={dev_qsl.tolist()}"
                     if dev_qsl is not None
                     else "device=n/a"
                 )
@@ -1158,6 +1262,51 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         where = np.argwhere(host != dev)
         bad = sorted({int(r) for r, _ in where})
         parts.append(f"rows differing={bad}")
+        # What the compute itself consumed (P1.9). The section above reads the
+        # runner's buffers from Python at compare time; this one is a copy taken
+        # inside the graph, so it is the only view of the arrays the hash
+        # actually read. Saying whether the two agree is the whole point: if they
+        # differ, an inputs-identical mismatch is explained, and if they agree,
+        # the input side is closed and the arithmetic is the suspect again.
+        parts.append(
+            f"op entry={self._impl_calls} stage seq={self._stage_seq} "
+            f"ids rows={int(dev.shape[0]) if dev.ndim == 2 else dev.shape[0]}"
+        )
+        snap = self._host_snap
+        if snap is None:
+            parts.append(
+                "compute inputs=none(snapshot not allocated; mode 2 allocates it "
+                "with the weights)"
+            )
+        else:
+            snap_ids, snap_qsl = snap
+            n = min(rows, int(snap_ids.shape[0]))
+            parts.append(f"compute ids(snapshot)={snap_ids[:n].tolist()}")
+            parts.append(
+                "compute qsl(snapshot)="
+                + (
+                    str(snap_qsl.tolist())
+                    if snap_qsl is not None
+                    else "n/a(qsl scratch not allocated)"
+                )
+            )
+            if inputs is not None:
+                h_ids = inputs[0]
+                m = min(n, int(np.asarray(h_ids).shape[0]))
+                same = bool(
+                    np.array_equal(np.asarray(snap_ids[:m]), np.asarray(h_ids[:m]))
+                )
+                bits = ""
+                if not same:
+                    first = int(
+                        np.argmax(np.asarray(snap_ids[:m]) != np.asarray(h_ids[:m]))
+                    )
+                    bits = (
+                        f" first differing index {first}: "
+                        f"snapshot={int(snap_ids[first])} "
+                        f"host={int(np.asarray(h_ids)[first])}"
+                    )
+                parts.append(f"snapshot matches host inputs: {same}{bits}")
         for r in bad[:2]:
             # Print the HEADS THAT ACTUALLY DIFFER, not the first four. The 14:54
             # boot truncated every row to [:4], so its second bad row looked
@@ -1191,6 +1340,33 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._host_check_dev_inputs = None
         if rows < 0 or rows != device_ids.shape[0]:
             return
+        # Same-step gate (P1.9). A comparison is only evidence if the ids in
+        # ``device_ids`` came from the compute that this stage described, and the
+        # only thing that can prove that from here is that the stage was
+        # immediately followed by this entry into the op. Row counts cannot: the
+        # 15:37 boot had 4 rows on both sides and an array that is not the output
+        # of ANY single input (rows 0,1 and rows 2,3 invert to different token
+        # streams), which is what an adjacency check is for and shape is not.
+        gap = self._impl_calls - self._stage_at_impl
+        if self._stage_at_impl < 0 or gap != 1:
+            self._host_cross_step_skips += 1
+            if (
+                self._host_cross_step_skips == 1
+                or self._host_cross_step_skips % 32 == 0
+            ):
+                logger.info(
+                    "PLE HOSTIDS: SKIPPED a comparison for '%s' -- stage seq %d "
+                    "was stamped at op entry %d and this is op entry %d (gap %d), "
+                    "so these ids do not belong to the staged step (%d skipped).",
+                    self.layer_name,
+                    self._stage_seq,
+                    self._stage_at_impl,
+                    self._impl_calls,
+                    gap,
+                    self._host_cross_step_skips,
+                )
+            return
+        self._host_snap = self._read_input_snapshot()
         assert self._host_check_ids is not None
         host = self._host_check_ids[:rows].numpy()
         dev = device_ids.numpy()
@@ -1260,6 +1436,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
         )
+        # Differential mode: record what THIS compute consumed, as part of the
+        # same graph. Placed after the ids and before the split op so the copies
+        # sit ahead of the op on the stream, which is what lets the op read them
+        # without waiting. No-op unless the knob is at 2.
+        self._snapshot_compute_inputs(input_ids, query_start_loc)
         if self._host_check_rows >= 0 and self._host_check_dev_inputs is None:
             # Fallback for a caller that staged without device inputs (the unit
             # tests drive forward() directly). On the real path staging already
@@ -1357,6 +1538,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # fails or lands in that graph's private pool, where the other graphs and
         # the host's read-back would not see it.
         self._alloc_gen_scratch()
+        self._alloc_snap_scratch()
         return loaded
 
 
@@ -2013,6 +2195,11 @@ def qwen4_exp_amd_ple_ngram_embedding(
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     ple_embedding = layer.ple_embedding
+    # Every entry into this op is one candidate consumer of a staged step, so
+    # the count that decides whether a comparison is same-step has to be bumped
+    # here and not inside the comparison: an entry that never compares is
+    # exactly the event that makes a later comparison cross-step.
+    ple_embedding._begin_invocation()
     n = ngram_ids.shape[0]
     # E1 Phase 0 ceiling probe: while a capture is in progress, record only the
     # H2D and return. See _capture_probe_enabled() for why a captured gather is
