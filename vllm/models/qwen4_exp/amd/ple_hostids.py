@@ -314,8 +314,159 @@ def compute_ngram_ids_host(
     return out
 
 
+class HostIdsRefused(ValueError):
+    """The host cannot produce this step's ids, so the device path must run.
+
+    Subclasses :class:`ValueError` because that is the contract
+    ``compute_ngram_ids_host`` already documents: a refusal is not a failure to
+    propagate, it is the signal to fall back. ``reason`` is a short stable token
+    so a caller can *count* which precondition fires in production instead of
+    guessing from a log line -- the difference between "the host path covers
+    94 % of decode steps" and a knob that quietly never engages.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
+def build_decode_step_inputs(
+    idx_mapping_np: np.ndarray,
+    num_scheduled_tokens_np: np.ndarray,
+    num_computed_tokens_np: np.ndarray,
+    all_token_ids_np: np.ndarray,
+    draft_values_np: np.ndarray | None,
+    draft_row_idx: np.ndarray | None,
+    *,
+    ngram_context_len: int,
+    eos_token_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rebuild one pure-decode step's PLE inputs on the host.
+
+    Returns ``(input_ids, query_start_loc, ngram_context)`` -- exactly the three
+    arrays ``Qwen4ExpNGramEmbedding._compute_ngram_ids`` is handed on the device,
+    so the result goes straight into :func:`compute_ngram_ids_host`.
+
+    Why each piece lives where it lives (the derivation, not a guess):
+
+    * **The first row's token is at sequence position ``num_computed_tokens``.**
+      ``_post_update_kernel`` advances ``total_len`` by ``num_sampled`` and
+      ``num_computed_tokens`` by ``query_len - num_rejected``, and those two
+      deltas are the same number (the accepted rows). So a request carries
+      exactly one more stored token than it has computed tokens, and the stored
+      token the next step feeds first is the one at index
+      ``num_computed_tokens`` of ``all_token_ids`` -- which the GPU wrote into
+      the UVA mirror at the end of the previous step.
+    * **The context window is the ``ngram_context_len`` tokens strictly before
+      that index**, EOS-filled on the left. That is ``_prepare_ngram_context``
+      reproduced: ``context_end = num_computed_tokens``, offsets
+      ``arange(-context_len, 0)``, ``where(idx >= 0, token, eos)``. Reading it
+      from ``all_token_ids_np`` rather than ``.gpu`` is the whole point -- same
+      pages, no stream-ordered read.
+    * **Rows 1..q-1 are this step's drafts** and are deliberately *not* in
+      ``all_token_ids`` (they are speculative, only the accepted prefix is
+      committed). They come from the pinned mirror staged at the previous step's
+      epilogue, addressed by the row index that mirror published -- never by
+      batch position.
+
+    The one thing this function cannot check is that ``num_computed_tokens_np``
+    equals the device's ``num_computed_tokens``: the two are updated by different
+    code (the scheduler here, ``_post_update_kernel`` there) and
+    ``states.py`` calls the host one an *optimistic upper bound*. A disagreement
+    would shift every id this function produces and nothing here would notice,
+    so the consumer must run in differential mode (compare against the device's
+    own ids) before this path is trusted for serving.
+
+    Raises:
+        HostIdsRefused: any batch shape this function has not been shown to
+            reproduce. The caller must take the device path.
+    """
+    if draft_values_np is None or draft_row_idx is None:
+        raise HostIdsRefused("no-drafts", "staging is off or nothing was staged")
+    ngram_context_len = int(ngram_context_len)
+    if ngram_context_len < 1:
+        raise HostIdsRefused("context-width", str(ngram_context_len))
+
+    num_reqs = int(idx_mapping_np.size)
+    if num_reqs == 0:
+        raise HostIdsRefused("empty-batch")
+    if int(num_scheduled_tokens_np.size) < num_reqs:
+        raise HostIdsRefused(
+            "layout",
+            f"num_scheduled_tokens has {num_scheduled_tokens_np.size} "
+            f"entries for {num_reqs} requests",
+        )
+    if all_token_ids_np.ndim != 2:
+        raise HostIdsRefused("layout", "all_token_ids_np must be 2D")
+
+    slots = np.asarray(idx_mapping_np, dtype=np.int64)
+    if (slots < 0).any():
+        raise HostIdsRefused("negative-slot", slots.tolist())
+    queries = np.asarray(num_scheduled_tokens_np, dtype=np.int64)[:num_reqs]
+    num_draft = int(draft_values_np.shape[1])
+    if not bool((queries == num_draft + 1).all()):
+        # A request with a different row count is a prefill, a chunked prefill, a
+        # short draft, or a padded slot. Any of them means this step is not the
+        # shape the host path was written for, and the batch is not separable:
+        # the ids array is one flat buffer, so a partial host answer would be a
+        # partial D2H -- which is the whole reason narrowed D1 was killed.
+        raise HostIdsRefused(
+            "not-pure-decode",
+            f"queries {queries.tolist()} != draft+1 = {num_draft + 1}",
+        )
+
+    # Staged rows are addressed by the req_state slot they belonged to. The
+    # previous step's batch may be larger, smaller, or shifted relative to this
+    # one, and a slot appears at most once per batch, so a scatter into a
+    # max_num_reqs-sized table is exact and costs one fill per step.
+    row_of_slot = np.full(int(all_token_ids_np.shape[0]), -1, dtype=np.int64)
+    staged_slots = np.asarray(draft_row_idx, dtype=np.int64)
+    if staged_slots.size and int(staged_slots.max()) >= row_of_slot.size:
+        raise HostIdsRefused("layout", "staged row index out of range")
+    row_of_slot[staged_slots] = np.arange(staged_slots.size, dtype=np.int64)
+
+    positions = np.asarray(num_computed_tokens_np, dtype=np.int64)[slots]
+    if (positions < 0).any() or (positions >= all_token_ids_np.shape[1]).any():
+        # Also catches a wildly optimistic host mirror of the device counter.
+        raise HostIdsRefused("position-out-of-range", f"positions {positions.tolist()}")
+
+    total_tokens = int(queries.sum())
+    input_ids = np.empty(total_tokens, dtype=np.int64)
+    query_start_loc = np.zeros(num_reqs + 1, dtype=np.int64)
+    np.cumsum(queries, out=query_start_loc[1:])
+    ngram_context = np.full(
+        (num_reqs, ngram_context_len), int(eos_token_id), dtype=np.int64
+    )
+
+    for i in range(num_reqs):
+        slot = int(slots[i])
+        pos = int(positions[i])
+        row = int(row_of_slot[slot])
+        if row < 0:
+            # This request was not in the step that staged the drafts, so its
+            # rows 1..q-1 are unknown here. Refusing the whole batch is the only
+            # safe answer: the device would use this step's real drafts.
+            raise HostIdsRefused("row-missing", f"slot {slot} had no staged draft")
+
+        start_of_context = pos - ngram_context_len
+        if start_of_context >= 0:
+            ngram_context[i] = all_token_ids_np[slot, start_of_context:pos]
+        elif pos > 0:
+            # Left-EOS-fill, exactly the device's where(idx >= 0, token, eos).
+            ngram_context[i, ngram_context_len - pos :] = all_token_ids_np[slot, 0:pos]
+
+        start = int(query_start_loc[i])
+        end = int(query_start_loc[i + 1])
+        input_ids[start] = all_token_ids_np[slot, pos]
+        input_ids[start + 1 : end] = draft_values_np[row, : end - start - 1]
+
+    return input_ids, query_start_loc, ngram_context
+
+
 __all__ = [
     "PADDING_SENTINEL",
+    "HostIdsRefused",
+    "build_decode_step_inputs",
     "compute_ngram_ids_host",
     "hostids_enabled",
 ]
