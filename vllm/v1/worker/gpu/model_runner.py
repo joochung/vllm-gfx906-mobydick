@@ -478,7 +478,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # vllm/models/qwen4_exp/__init__.py, i.e. model code, into every worker
         # of every model. tests/models/qwen4_exp/test_ple_hostids_wiring.py
         # asserts the two readers of the name cannot drift apart.
-        host_draft_staging = os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0") == "1"
+        # "1" = host ids authoritative, "2" = differential (compare only). Both
+        # need the mirror; the set of accepted values is pinned to
+        # ple_hostids.hostids_mode() by a test, because a value one reader accepts
+        # and the other ignores is a knob that silently never engages.
+        host_draft_staging = os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0") in (
+            "1",
+            "2",
+        )
         if host_draft_staging and self.scheduler_config.async_scheduling:
             logger.error(
                 "GFX906_PLE_HOSTIDS: REFUSED - async scheduling is active, so "
@@ -630,6 +637,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+
+        # GFX906: the host PLE id producer needs the draft mirror staged by the
+        # handler above. Wired once here rather than passed per step, and only
+        # when staging is actually on; model states that do not consume it (every
+        # other model) are not asked.
+        if getattr(self.draft_tokens_handler, "host_draft_staging", False) and hasattr(
+            self.model_state, "set_host_draft_source"
+        ):
+            self.model_state.set_host_draft_source(self.draft_tokens_handler)
 
         self.decode_query_len = (
             self.num_speculative_steps

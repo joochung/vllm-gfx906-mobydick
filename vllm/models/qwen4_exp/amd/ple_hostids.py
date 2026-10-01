@@ -105,8 +105,14 @@ producers.
 """
 
 
-def hostids_enabled() -> bool:
-    """``VLLM_GFX906_PLE_HOSTIDS=1`` turns host-side ids on. Off by default.
+def hostids_mode() -> int:
+    """``VLLM_GFX906_PLE_HOSTIDS``: 0 off (default), 1 host ids, 2 differential.
+
+    2 is the mode that has to run before 1 is ever trusted: it computes the host
+    ids, keeps the device path fully in charge, and compares the two answers
+    every step. It retains the blocking D2H, so a differential boot measures no
+    performance at all -- it is a correctness boot whose subject is the position
+    arithmetic that nothing host-side can check on its own.
 
     Deliberately read with ``os.environ.get`` rather than registered in
     ``vllm/envs.py``: like the other gfx906 experiment knobs it is local, and
@@ -114,7 +120,17 @@ def hostids_enabled() -> bool:
     boot. Engagement is proven by the activation line the caller logs, never by
     the absence of that warning.
     """
-    return os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0") == "1"
+    raw = os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0")
+    if raw == "1":
+        return 1
+    if raw == "2":
+        return 2
+    return 0
+
+
+def hostids_enabled() -> bool:
+    """Host ids are authoritative for the steps the builder accepts."""
+    return hostids_mode() == 1
 
 
 def _as_int64(values: np.ndarray | None, name: str) -> np.ndarray:
@@ -469,4 +485,5 @@ __all__ = [
     "build_decode_step_inputs",
     "compute_ngram_ids_host",
     "hostids_enabled",
+    "hostids_mode",
 ]

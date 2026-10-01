@@ -5,8 +5,10 @@
 import math
 import os
 import time
+import weakref
 from collections.abc import Iterable, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,7 +24,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.models.qwen4_exp.amd import ple_prof
+from vllm.models.qwen4_exp.amd import ple_hostids, ple_prof
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -35,6 +37,23 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
+
+_HOST_STAGEABLE: "weakref.WeakSet[Qwen4ExpNGramEmbedding]" = weakref.WeakSet()
+"""PLE embedding modules that opted into host-side id staging, by env at init.
+
+Weak on purpose: engines come and go inside one process (tests, the offline
+runner), and a strong registry would keep the 99 GiB shard mappings and their
+pinned buffers alive after the engine that owned them was gone. The producer
+(:meth:`Qwen4ExpModelState._stage_host_ple_ids`) iterates this set per step; an
+empty set -- the default, because ``VLLM_GFX906_PLE_HOSTIDS`` is unset -- means
+the per-step cost is one ``len()`` and nothing else.
+"""
+
+
+def host_stageable_layers() -> list:
+    """The PLE embedding modules that asked for host-staged ids."""
+    return list(_HOST_STAGEABLE)
+
 
 # from ..common.ple import PLEVocabParallelEmbedding
 
@@ -576,6 +595,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             dtype=self.runtime_dtype,
             device="cpu",
         ).pin_memory()
+        # Host-side id staging (VLLM_GFX906_PLE_HOSTIDS). Row counts, not
+        # booleans: a count only means "this step, these rows" if it equals the
+        # row count the consumer is about to write, so the flag is checked
+        # against `n` rather than trusted on its own. -1 = nothing staged.
+        self._host_stage_rows = -1
+        self._host_check_rows = -1
+        self._host_check_ids: torch.Tensor | None = None
+        self._host_hash_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._hostids_disabled = False
+        self._host_stage_steps = 0
+        self._host_id_mismatches = 0
+        if ple_hostids.hostids_mode() != 0:
+            _HOST_STAGEABLE.add(self)
+            logger.info(
+                "PLE HOSTIDS: embedding '%s' registered for host-staged ids (mode %s)",
+                layer_name,
+                ple_hostids.hostids_mode(),
+            )
 
         if self.ngram_size < 2:
             raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
@@ -749,6 +786,150 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = torch.cat(id_blocks, dim=-1)
         return ngram_ids
 
+    # ------------------------------------------------------------------
+    # Host-side id staging (E1 Phase 1, VLLM_GFX906_PLE_HOSTIDS)
+    # ------------------------------------------------------------------
+    #
+    # A captured FULL decode graph replays the H2D out of ``_pinned_output`` and
+    # nothing else: the blocking D2H of the ids and the host gather that produced
+    # them ran once during capture and are not graph nodes. For the replay to be
+    # correct, the host must therefore fill ``_pinned_output`` itself every step,
+    # from ids it obtained without asking the device for anything. That is what
+    # these methods do; :meth:`Qwen4ExpModelState._stage_host_ple_ids` is the
+    # producer, and it runs every step even under graph replay.
+    #
+    # Single-buffer reuse is safe here for the same reason today's path is safe:
+    # the H2D is enqueued on the compute stream ahead of this step's sampling,
+    # and sync scheduling makes the host wait for sampled tokens before the next
+    # step is prepared. Under async scheduling that ordering disappears, which is
+    # exactly why the config guard refuses HOSTIDS together with it.
+
+    def _host_hash_buffers(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """CPU views of the three hash-layout buffers, snapshotted once.
+
+        They are registered on the CPU and end up on the device with the model,
+        so a per-step ``.cpu()`` would be a synchronising D2H on a path whose
+        entire purpose is to remove host waits. Snapshot on first use instead:
+        ``load_weights`` has run by then and nothing mutates them afterwards
+        (the cache is dropped if it runs again).
+        """
+        if self._host_hash_cache is None:
+            self._host_hash_cache = (
+                self.layer_multipliers.detach().cpu().numpy(),
+                self.ngram_heads_vocab_sizes.detach().cpu().numpy(),
+                self.ngram_heads_offsets.detach().cpu().numpy(),
+            )
+        return self._host_hash_cache
+
+    def stage_host_step(
+        self,
+        input_ids: np.ndarray,
+        query_start_loc: np.ndarray,
+        ngram_context: np.ndarray,
+        *,
+        gather: bool,
+    ) -> bool:
+        """Turn this step's host-computed row ids into staged embedding rows.
+
+        ``gather=False`` is differential mode: the ids are kept in a side buffer
+        for :meth:`compare_host_ids` against the device's own answer, and the
+        device path is left completely in charge.
+        """
+        if self._hostids_disabled:
+            return False
+        multipliers, vocab_sizes, head_offsets = self._host_hash_buffers()
+        ids = ple_hostids.compute_ngram_ids_host(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            multipliers=multipliers,
+            vocab_sizes=vocab_sizes,
+            head_offsets=head_offsets,
+            eos_token_id=self.eos_token_id,
+            ngram_size=self.ngram_size,
+            heads_per_ngram=self.heads_per_ngram,
+        )
+        rows = int(ids.shape[0])
+        if rows > self._pinned_ngram_ids.shape[0]:
+            return False
+        if not gather:
+            if self._host_check_ids is None:
+                # Never DMA'd: the device's ids arrive through the normal D2H.
+                self._host_check_ids = torch.empty_like(self._pinned_ngram_ids)
+            self._host_check_ids[:rows].numpy()[:] = ids
+            self._host_check_rows = rows
+            return True
+        dst = self._pinned_ngram_ids[:rows]
+        dst.numpy()[:] = ids
+        result = self.ngram_embedding(dst).flatten(-2)
+        self._pinned_output[:rows].copy_(result.to(dtype=self.runtime_dtype))
+        self._host_stage_rows = rows
+        self._host_stage_steps += 1
+        if self._host_stage_steps == 1:
+            logger.info(
+                "PLE HOSTIDS: staged %d rows of host-computed ids for '%s' "
+                "(first step). Device D2H is skipped for these steps.",
+                rows,
+                self.layer_name,
+            )
+        return True
+
+    def take_host_stage(self, rows: int) -> bool:
+        """Consume the staged flag. True only if it covers exactly ``rows``.
+
+        Kept as the tested description of the rule; the op reads the attribute
+        directly (getattr) so stub embeddings used by the probe/prof tests, which
+        never set it, keep taking the device path instead of raising inside a
+        capture. Consumed unconditionally when present: a flag left over from a
+        step that never reached this op must not be allowed to skip a later
+        step's D2H, which would silently feed that step the previous step's rows.
+        """
+        staged = self._host_stage_rows
+        self._host_stage_rows = -1
+        return staged == rows
+
+    def compare_host_ids(self, device_ids: torch.Tensor) -> None:
+        """Differential mode: the device's ids are now in ``device_ids``.
+
+        This is the gate that turns the position arithmetic in
+        ``build_decode_step_inputs`` from a reading of ``_post_update_kernel``
+        into a measurement. One mismatch is enough to distrust the host path for
+        the life of the process: a *shifting* disagreement (the optimistic
+        ``num_computed_tokens_np`` mirror leading the device by a token) would
+        otherwise pass some steps and fail others, which is the worst possible
+        failure mode for a lookup table whose output looks like text either way.
+        """
+        rows = self._host_check_rows
+        self._host_check_rows = -1
+        if rows < 0 or rows != device_ids.shape[0]:
+            return
+        assert self._host_check_ids is not None
+        host = self._host_check_ids[:rows].numpy()
+        dev = device_ids.numpy()
+        if bool(np.array_equal(host, dev)):
+            return
+        self._host_id_mismatches += 1
+        diff = np.argwhere(host != dev)[:4]
+        detail = ", ".join(
+            f"[{r},{c}] host={int(host[r, c])} device={int(dev[r, c])}" for r, c in diff
+        )
+        self.disable_hostids(
+            f"first mismatch at {rows} rows: {detail} "
+            f"(host row 0 = {host[0].tolist()}, device row 0 = {dev[0].tolist()})"
+        )
+
+    def disable_hostids(self, why: str) -> None:
+        if self._hostids_disabled:
+            return
+        self._hostids_disabled = True
+        logger.warning(
+            "PLE HOSTIDS: DISABLED for '%s' after %d staged step(s) -- %s. "
+            "The device path handles every step from here on.",
+            self.layer_name,
+            self._host_stage_steps,
+            why,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -819,6 +1000,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
                     )
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                if name in (
+                    "layer_multipliers",
+                    "ngram_heads_vocab_sizes",
+                    "ngram_heads_offsets",
+                ):
+                    # The host id producer caches the CPU view of these three.
+                    # They are load-time constants, but caching must not survive
+                    # a reload of the very weights it reads.
+                    self._host_hash_cache = None
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
@@ -1514,6 +1704,19 @@ def qwen4_exp_amd_ple_ngram_embedding(
     if _capture_probe_enabled() and torch.cuda.is_current_stream_capturing():
         output.copy_(ple_embedding._pinned_output[:n], non_blocking=True)
         return
+    # E1 Phase 1 (VLLM_GFX906_PLE_HOSTIDS): the host already computed this step's
+    # ids, gathered them out of the mmap'd shards, and left the result in
+    # _pinned_output -- so the blocking D2H below, the wait this whole line of work
+    # exists to remove, and the host gather are both skipped and only the H2D runs.
+    # Row-count agreement is a necessary condition and the generation tripwire
+    # (P1.5) is what makes it sufficient. Read by getattr, not by method call, so
+    # a stub embedding that never stages falls through to the device path.
+    staged = getattr(ple_embedding, "_host_stage_rows", -1)
+    if staged != -1:
+        ple_embedding._host_stage_rows = -1
+        if staged == n:
+            output.copy_(ple_embedding._pinned_output[:n], non_blocking=True)
+            return
     # VLLM_GFX906_PLE_PROF=1 brackets the four host-visible steps below (see
     # vllm/models/qwen4_exp/amd/ple_prof.py for what each one means and why
     # graph capture is excluded). With the knob unset the statements executed
@@ -1534,6 +1737,12 @@ def qwen4_exp_amd_ple_ngram_embedding(
     # in self'.  The H2D copy of the result at the end stays async: it is
     # stream-ordered against whatever consumes `output` and needs no host wait.
     pinned_ids.copy_(ngram_ids, non_blocking=False)
+    # Differential mode (VLLM_GFX906_PLE_HOSTIDS=2): the device's own ids are now
+    # in host memory, which is the only thing they can be compared against. In
+    # that mode nothing above was skipped, so the cost when the knob is off or at
+    # 1 is one attribute read.
+    if getattr(ple_embedding, "_host_check_rows", -1) >= 0:
+        ple_embedding.compare_host_ids(pinned_ids)
     if prof:
         t_gather = time.perf_counter()
     result = ple_embedding.ngram_embedding(pinned_ids).flatten(-2)

@@ -72,6 +72,30 @@ def test_async_conflict_silent_when_sync_or_unset():
     assert ple_hostids_async_conflict(False, environ={}) is None
 
 
+def test_async_conflict_covers_every_nonzero_value():
+    """Differential mode ("2") reads the same mirror, so async breaks it too.
+
+    It would not produce wrong output -- the device path still answers -- but the
+    comparison would run against a one-step-old row set and report mismatches
+    that are the scheduler's doing, not the arithmetic's. A guard that matches
+    only "1" leaves that mode unguarded.
+    """
+    from vllm.models.qwen4_exp.amd import ple_hostids
+
+    assert ple_hostids_async_conflict(True, environ={ENV_PLE_HOSTIDS: "2"}) is not None
+    assert ple_hostids_async_conflict(True, environ={ENV_PLE_HOSTIDS: "7"}) is not None
+    assert ple_hostids_async_conflict(True, environ={ENV_PLE_HOSTIDS: ""}) is None
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setenv(ENV_PLE_HOSTIDS, "2")
+        assert ple_hostids.hostids_mode() == 2
+        assert ple_hostids.hostids_enabled() is False, (
+            "differential mode must not be treated as the authoritative path"
+        )
+    finally:
+        monkey.undo()
+
+
 def test_env_name_agrees_between_guard_and_worker():
     """The guard, the worker and the model must all read one environment name.
 
@@ -97,6 +121,42 @@ def test_env_name_agrees_between_guard_and_worker():
         assert ple_hostids.hostids_enabled() is False
         monkey.setenv(ENV_PLE_HOSTIDS, "1")
         assert ple_hostids.hostids_enabled() is True
+    finally:
+        monkey.undo()
+
+
+def test_accepted_values_agree_between_mode_and_worker():
+    """``hostids_mode()`` and the worker must accept the same set of values.
+
+    The worker cannot import model code (it would drag the model into every
+    worker of every model), so it re-implements the read of the same variable. A
+    value one side accepts and the other ignores is the worst drift there is:
+    differential mode would boot with no draft mirror, refuse every step, and
+    report a clean run.
+    """
+    import inspect
+    import pathlib
+
+    from vllm.models.qwen4_exp.amd import ple_hostids
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    src = pathlib.Path(inspect.getfile(model_runner_module)).read_text()
+    assert 'in ("1", "2")' in src, (
+        "the worker's accepted value set moved; update it and this test together"
+    )
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        for raw, expected in (
+            ("0", False),
+            ("", False),
+            ("1", True),
+            ("2", True),
+            ("3", False),
+            ("yes", False),
+        ):
+            monkey.setenv(ENV_PLE_HOSTIDS, raw)
+            assert (ple_hostids.hostids_mode() != 0) is expected, raw
     finally:
         monkey.undo()
 

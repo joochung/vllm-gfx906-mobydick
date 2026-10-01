@@ -269,7 +269,10 @@ def ple_hostids_async_conflict(
     answers; a guard that has never been observed to pass is not a guard.
     """
     env = os.environ if environ is None else environ
-    if not async_scheduling or env.get(ENV_PLE_HOSTIDS, "0") != "1":
+    # Any non-zero value, not just "1": "2" (differential) reads the same mirror,
+    # so the same one-step lag applies -- it would only produce spurious mismatches
+    # instead of wrong ids, which is still a knob that cannot be evaluated.
+    if not async_scheduling or env.get(ENV_PLE_HOSTIDS, "0") in ("0", ""):
         return None
     return (
         f"{ENV_PLE_HOSTIDS} requires synchronous scheduling: the host copy of "

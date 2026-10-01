@@ -9,6 +9,11 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.models.qwen4_exp.amd import ple_hostids
+from vllm.models.qwen4_exp.amd.ple_hostids import (
+    HostIdsRefused,
+    build_decode_step_inputs,
+)
 from vllm.models.qwen4_exp.amd.ple_prefetch import (
     PleRowPrefetcher,
     plan_lookahead_chunks,
@@ -64,6 +69,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int64,
             device=self.device,
         )
+        # Host-side id staging (VLLM_GFX906_PLE_HOSTIDS). The draft mirror is set
+        # once by the model runner, never per step; the layer list and refusal
+        # counters exist so "the host path quietly never engaged" is a log line
+        # rather than a guess.
+        self._host_drafts: object | None = None
+        self._ple_host_layers: list | None = None
+        self._ple_host_refusals: dict[str, int] = {}
+        self._ple_host_refusal_logged: set[str] = set()
+        self._ple_host_steps = 0
         self.ple_query_start_loc = torch.zeros(
             self.max_num_reqs + 1,
             dtype=torch.int32,
@@ -227,6 +241,129 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         return context
 
+    def _stage_host_ple_ids(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> None:
+        """Compute this step's PLE ids on the host, if the step is one we can.
+
+        Runs every step, including steps that replay a captured CUDA graph —
+        which is the whole reason the host has to do this work itself: a captured
+        FULL decode graph replays the H2D out of ``_pinned_output`` and contains
+        neither the D2H of the ids nor the gather that produced them.
+
+        Every failure mode returns without touching the model inputs, so the
+        device path stays the default answer to anything unexpected. Refusals are
+        counted per reason and the first of each is logged: coverage is a claim
+        that needs evidence, and "the knob was set" is not that evidence.
+        """
+        mode = ple_hostids.hostids_mode()
+        if mode == 0 or not self.uses_ngram_embedding:
+            return
+        if self._ple_host_layers is None:
+            from vllm.models.qwen4_exp.amd.ple_layer import host_stageable_layers
+
+            layers = [
+                layer
+                for layer in host_stageable_layers()
+                if layer.ngram_size - 1 == self.ngram_context_len
+            ]
+            if not layers:
+                # The env var is set but no PLE module registered (import order,
+                # or the knob was set for a model without PLE). Say so once.
+                self._note_host_refusal("no-registered-layers")
+                return
+            self._ple_host_layers = layers
+        if self._host_drafts is None:
+            self._note_host_refusal("no-draft-source")
+            return
+        if self._ple_host_tokens is None:
+            buf = getattr(getattr(req_states, "all_token_ids", None), "_uva_buf", None)
+            host = getattr(buf, "np", None)
+            if host is None or host.ndim != 2:
+                self.disable_host_staging("req_states.all_token_ids has no host view")
+                return
+            self._ple_host_tokens = host
+
+        num_reqs = input_batch.num_reqs
+        try:
+            values, row_idx, _gen = self._host_drafts.wait_host_draft_tokens()  # type: ignore[attr-defined]
+            input_ids, query_start_loc, ngram_context = build_decode_step_inputs(
+                input_batch.idx_mapping_np[:num_reqs],
+                input_batch.num_scheduled_tokens[:num_reqs],
+                req_states.num_computed_tokens_np,
+                self._ple_host_tokens,
+                values,
+                row_idx,
+                ngram_context_len=self.ngram_context_len,
+                eos_token_id=self.ngram_eos_token_id,
+            )
+        except HostIdsRefused as exc:
+            self._note_host_refusal(exc.reason)
+            return
+        except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+            self.disable_host_staging(
+                f"host id build failed ({type(exc).__name__}: {exc})"
+            )
+            return
+
+        gather = mode == 1
+        for layer in self._ple_host_layers:
+            try:
+                layer.stage_host_step(
+                    input_ids, query_start_loc, ngram_context, gather=gather
+                )
+            except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+                self.disable_host_staging(
+                    f"host id staging failed ({type(exc).__name__}: {exc})"
+                )
+                return
+        self._ple_host_steps += 1
+        if self._ple_host_steps == 1:
+            logger.info(
+                "PLE HOSTIDS: host step inputs built for %d request(s), %d row(s) "
+                "(mode %s: %s)",
+                num_reqs,
+                int(input_ids.size),
+                mode,
+                "host ids authoritative, device D2H skipped"
+                if gather
+                else "differential: device path in charge, ids compared every step",
+            )
+
+    def set_host_draft_source(self, handler: object) -> None:
+        """Wire in the worker's staged draft-token mirror (P1.1).
+
+        Called once at init by the model runner, and only when staging is enabled,
+        so the per-step path costs one attribute read. Without it the host has
+        rows 1..q-1 of no step and refuses every batch.
+        """
+        self._host_drafts = handler
+
+    def disable_host_staging(self, why: str) -> None:
+        if not self._ple_host_layers:
+            return
+        logger.warning(
+            "PLE HOSTIDS: host staging disabled after %d step(s) -- %s. The "
+            "device path handles every step from here on. Refusals so far: %s",
+            self._ple_host_steps,
+            why,
+            dict(self._ple_host_refusals),
+        )
+        self._ple_host_layers = []
+
+    def _note_host_refusal(self, reason: str) -> None:
+        self._ple_host_refusals[reason] = self._ple_host_refusals.get(reason, 0) + 1
+        if reason not in self._ple_host_refusal_logged:
+            self._ple_host_refusal_logged.add(reason)
+            logger.info(
+                "PLE HOSTIDS: first refusal (%s); device path used for that step. "
+                "Counts so far: %s",
+                reason,
+                dict(self._ple_host_refusals),
+            )
+
     def prepare_inputs(
         self,
         input_batch: InputBatch,
@@ -243,6 +380,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
         )
+        # Host ids first: the pinned rows they fill are what this step's H2D (or,
+        # under a captured graph, the replayed H2D) delivers to the device, so
+        # they have to be in place before the forward is enqueued.
+        self._stage_host_ple_ids(input_batch, req_states)
         # Issued last: the current chunk's inputs are already prepared, so the
         # hints overlap the GPU work that follows instead of delaying it.
         self._prefetch_next_ple_chunk(input_batch, req_states)
