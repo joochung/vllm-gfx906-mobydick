@@ -239,6 +239,47 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
 ENV_ALLOW_ASYNC_GDN = "VLLM_GFX906_ALLOW_ASYNC_GDN"
 _GDN_LAYER_TYPE = "linear_attention"
 
+ENV_PLE_HOSTIDS = "VLLM_GFX906_PLE_HOSTIDS"
+"""Mirror each step's draft tokens into pinned host memory so the next step's PLE
+n-gram ids can be computed on the host (docs/d1-host-ids-design.md). Named here
+because two places read it -- config validation, and the worker that does the
+staging -- and a typo in either one is a knob that silently never engages.
+"""
+
+
+def ple_hostids_async_conflict(
+    async_scheduling: bool, environ: dict[str, str] | None = None
+) -> str | None:
+    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` cannot be correct here, or None.
+
+    The host only ever has a decode step's drafted rows because sync scheduling
+    parks it at the end of every step: ``DraftTokensHandler`` mirrors
+    ``req_states.draft_tokens`` on a copy stream, and the wait that makes the
+    mirror usable is the ``copy_event.synchronize()`` in
+    ``v1/worker/gpu/async_utils.py`` that sync scheduling pays anyway. Turn
+    async scheduling on and that wait disappears, so the mirror serves step N+1
+    drafts captured a step late. Nothing raises: the ids are still in range, the
+    n-gram hashes still land on real rows of a 20-million-row table, and the
+    model receives an embedding computed from the wrong context. That is the
+    same class of failure as a captured CUDA graph replaying a stale PLE
+    embedding (mtp-cudagraph-profile-crash.md 13.2), which ran on this box for
+    hours before anyone noticed.
+
+    The check is a function rather than inline so it can be tested against both
+    answers; a guard that has never been observed to pass is not a guard.
+    """
+    env = os.environ if environ is None else environ
+    if not async_scheduling or env.get(ENV_PLE_HOSTIDS, "0") != "1":
+        return None
+    return (
+        f"{ENV_PLE_HOSTIDS} requires synchronous scheduling: the host copy of "
+        "this step's draft tokens is only complete because the engine waits for "
+        "them at the end of every step (async_utils.py get_output). With async "
+        "scheduling the mirror lags one step, which yields a plausible ngram id "
+        "built from stale context rather than an error. Run with "
+        "--no-async-scheduling, or unset the variable."
+    )
+
 
 def gdn_async_ordering_risk(cfg: "VllmConfig") -> str | None:
     """Return why async scheduling is unsafe for this config, or None.
@@ -1401,6 +1442,24 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
+
+        # GFX906: VLLM_GFX906_PLE_HOSTIDS mirrors each step's draft tokens into a
+        # pinned host buffer so the *next* step's PLE n-gram ids can be computed
+        # on the host instead of by a device kernel plus a blocking D2H. It only
+        # works because sync scheduling parks the host at the end of every step
+        # (async_utils.py get_output -> copy_event.synchronize); under async
+        # scheduling that wait is gone, the mirror lags one step, and the result
+        # is a plausible ngram id built from stale context -- a wrong answer, not
+        # a crash, and the same silent-freeze class as a captured graph replaying
+        # a stale PLE embedding (mtp-cudagraph-profile-crash.md 13.2). Refusing
+        # rather than quietly dropping the knob is deliberate: a knob that fails
+        # to engage is indistinguishable from one that worked.
+        if (
+            hostids_conflict := ple_hostids_async_conflict(
+                self.scheduler_config.async_scheduling
+            )
+        ) is not None:
+            raise ValueError(hostids_conflict)
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:

@@ -461,7 +461,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        #
+        # GFX906: VLLM_GFX906_PLE_HOSTIDS also mirrors each step's draft tokens
+        # into a pinned host buffer. That mirror is the only way the host can
+        # know the three-of-four drafted rows of the *next* decode step
+        # (docs/d1-host-ids-design.md for the trace), and it rests on the
+        # end-of-step host sync that sync scheduling performs anyway: with async
+        # scheduling the mirror would lag one step and produce a plausible
+        # ngram id built from stale context, which is a wrong answer rather
+        # than a crash. VllmConfig refuses that combination at validation; this
+        # is the belt-and-braces check for a config built without validation
+        # (tests, and any future direct construction).
+        #
+        # The environment variable is read here rather than via
+        # ple_hostids.hostids_enabled() on purpose: importing that module pulls
+        # vllm/models/qwen4_exp/__init__.py, i.e. model code, into every worker
+        # of every model. tests/models/qwen4_exp/test_ple_hostids_wiring.py
+        # asserts the two readers of the name cannot drift apart.
+        host_draft_staging = os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0") == "1"
+        if host_draft_staging and self.scheduler_config.async_scheduling:
+            logger.error(
+                "GFX906_PLE_HOSTIDS: REFUSED - async scheduling is active, so "
+                "the end-of-step host sync the draft mirror depends on does not "
+                "happen. Falling back to the device path (unchanged behaviour)."
+            )
+            host_draft_staging = False
+        elif host_draft_staging:
+            logger.info(
+                "GFX906_PLE_HOSTIDS: enabled at worker init; per-worker "
+                "engagement is the 'GFX906_PLE_HOSTIDS: draft staging active' "
+                "line on the first step that drafts."
+            )
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device, host_draft_staging=host_draft_staging
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 

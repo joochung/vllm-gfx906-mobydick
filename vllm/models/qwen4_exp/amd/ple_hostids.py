@@ -20,9 +20,22 @@ rewrite the residual lookup is page-fault-bound, and ``drain`` is host *idle*
 while the GPU catches up.
 
 Removing the round trip means computing the ids where the gather already is.
-The host can do that because it already knows the step's input tokens
-(``InputBatch`` keeps them in a host array) and can mirror the two-token ngram
-context from the same host-side token history the read-ahead prefetcher uses.
+The host can do that, but not as cheaply as it looks: this runner keeps **no host
+array of the step's input ids** (there is no ``input_ids_np`` / ``token_ids_cpu``
+here -- ``input_batch.input_ids`` is device-only, and decode rows are placed on
+the device by ``combine_sampled_and_draft_tokens``). The host has to *rebuild*
+them per request, from three pieces it does have:
+
+* the tokens accepted last step, as a host list-of-lists in ``ModelRunnerOutput``
+  (``sampled_token_ids``), which is the row's first token;
+* this step's draft tokens, mirrored to pinned host memory by
+  ``DraftTokensHandler`` when ``VLLM_GFX906_PLE_HOSTIDS`` is set -- without that
+  mirror the host knows 1 of the 4 rows a speculative decode step feeds this
+  layer, because ``spec_decode/utils.py`` deliberately never copies drafts to
+  the host (``docs/d1-host-ids-design.md`` has the trace);
+* the per-request token history in ``req_states.all_token_ids._uva_buf.np``,
+  which is pinned host memory that the GPU also writes, and is where the
+  two-token ngram context comes from.
 
 Bit-identity is the whole contract
 ----------------------------------
