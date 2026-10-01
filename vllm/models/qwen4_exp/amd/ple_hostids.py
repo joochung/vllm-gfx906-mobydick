@@ -133,6 +133,51 @@ def hostids_enabled() -> bool:
     return hostids_mode() == 1
 
 
+def hostids_check_interval() -> int:
+    """Every how many steps the generation tripwire samples (P1.5).
+
+    The sample costs one 8-byte device->host copy issued non-blocking and one
+    ``Event.query()`` on a later step, so the interval is not about cost -- it is
+    about how long a frozen graph can run before it is caught. The default of 64
+    means "a few hundred milliseconds of serving" at decode rates here, which is
+    the difference between the 2026-09-20 incident (found after 5 h 30 m) and a
+    boot-visible failure. Set to 1 to sample every step when debugging.
+    """
+    raw = os.environ.get("VLLM_GFX906_PLE_HOSTIDS_CHECK", "").strip()
+    if not raw:
+        return 64
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 64
+
+
+def gen_verdict(read_gen: int, staged_gen: int) -> str:
+    """Compare what the graph delivered against what the host staged.
+
+    ``read_gen`` is the generation the device reported for the last step that ran
+    the staged branch; ``staged_gen`` is the generation the host had staged as of
+    just before that step was prepared. Pure arithmetic with no torch in it, so
+    the whole truth table is testable without a device:
+
+    * ``"no-staging"`` -- the host has never staged, so there is nothing for the
+      graph to have delivered. A vacuous pass is not a pass, so this is reported
+      separately rather than folded into ``"ok"``.
+    * ``"ok"`` -- the device is replaying exactly what the host last staged.
+    * ``"frozen"`` -- the device is behind. This is the 2026-09-20 signature: the
+      graph is running, or not running, but it is not carrying the host's work.
+    * ``"ahead"`` -- the device is ahead of the host, which cannot happen with one
+      producer and one scratch. It means the scratch is being written by something
+      else (a second embedding sharing a buffer, a re-capture, a stale test), and
+      an instrument being wrong about the direction of time is worth stopping for.
+    """
+    if staged_gen <= 0:
+        return "no-staging"
+    if read_gen == staged_gen:
+        return "ok"
+    return "frozen" if read_gen < staged_gen else "ahead"
+
+
 def _as_int64(values: np.ndarray | None, name: str) -> np.ndarray:
     """Return ``values`` as a contiguous int64 array, without a copy if it can be.
 
@@ -484,6 +529,8 @@ __all__ = [
     "HostIdsRefused",
     "build_decode_step_inputs",
     "compute_ngram_ids_host",
+    "gen_verdict",
+    "hostids_check_interval",
     "hostids_enabled",
     "hostids_mode",
 ]

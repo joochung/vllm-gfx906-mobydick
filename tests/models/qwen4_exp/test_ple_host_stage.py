@@ -63,6 +63,29 @@ def _layout() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return multipliers, sizes, offsets
 
 
+class FakeEvent:
+    """Stand-in for ``torch.cuda.Event`` whose readiness the test owns.
+
+    ``synchronize`` raises on purpose: "the tripwire never waits" is then asserted
+    by every test that uses the event, not only by the one written to check it.
+    """
+
+    def __init__(self, ready: bool = True) -> None:
+        self.ready = ready
+        self.records = 0
+        self.queries = 0
+
+    def record(self) -> None:
+        self.records += 1
+
+    def query(self) -> bool:
+        self.queries += 1
+        return self.ready
+
+    def synchronize(self) -> None:  # pragma: no cover - must never run
+        raise AssertionError("the generation tripwire synchronised on the device")
+
+
 class StagingEmbedding:
     """Stand-in ``self`` for the real staging methods of the embedding module.
 
@@ -78,6 +101,10 @@ class StagingEmbedding:
     take_host_stage = Qwen4ExpNGramEmbedding.take_host_stage
     compare_host_ids = Qwen4ExpNGramEmbedding.compare_host_ids
     disable_hostids = Qwen4ExpNGramEmbedding.disable_hostids
+    _alloc_gen_scratch = Qwen4ExpNGramEmbedding._alloc_gen_scratch
+    _gen_scratch = Qwen4ExpNGramEmbedding._gen_scratch
+    check_host_gen = Qwen4ExpNGramEmbedding.check_host_gen
+    _fire_gen = Qwen4ExpNGramEmbedding._fire_gen
 
     def __init__(self, rows: int = ROWS, capacity: int = CAPACITY) -> None:
         multipliers, sizes, offsets = _layout()
@@ -104,6 +131,20 @@ class StagingEmbedding:
         self._host_stage_steps = 0
         self._host_id_mismatches = 0
         self._rows = rows
+        # Generation tripwire state, mirroring the production __init__. The event
+        # is a FakeEvent so `query()` is controllable and a synchronize() is a
+        # test failure rather than a wait.
+        self._host_stage_gen = 0
+        self._pinned_gen = torch.zeros(1, dtype=torch.long)
+        self._pinned_gen_read = torch.zeros(1, dtype=torch.long)
+        self._gen_device: torch.Tensor | None = torch.zeros(1, dtype=torch.long)
+        self._gen_event = FakeEvent()
+        self._gen_pending_expected = 0
+        self._gen_check_countdown = 1
+        self._gen_stuck = 0
+        self._gen_checks_ok = 0
+        self._gen_trips = 0
+        self._staged_branch_captured = False
 
     @property
     def ngram_embedding(self):  # noqa: ANN201
@@ -439,6 +480,7 @@ class FakeModelState:
         self.ngram_eos_token_id = EOS
         self._host_drafts = None
         self._ple_host_layers: list | None = None
+        self._ple_host_gen_layers: list = []
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
@@ -720,3 +762,379 @@ def test_disable_reports_the_coverage_it_is_leaving(hostids_env, caplog) -> None
     # Engagement and coverage have to be recoverable from the log alone: a
     # disable that does not say how much it is switching off is not auditable.
     assert any("after 1 step" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# P1.5: the generation tripwire
+#
+# A frozen CUDA graph is silent: it replays its captured work and prints nothing,
+# so the only way to know it is carrying this step's PLE rows is to have the graph
+# itself carry a number. These tests cover the whole chain -- the counter written
+# with the rows, the copy inside the graph, the non-blocking read, the verdict --
+# because the failure it exists to catch (2026-09-20: wrong embeddings for five
+# and a half hours, found by eye) is invisible to every other check here.
+# --------------------------------------------------------------------------
+
+
+def _stage(emb, *, gather: bool = True, num_reqs: int = 2) -> bool:
+    inp, qsl, ctx = _step_inputs(num_reqs=num_reqs)
+    return emb.stage_host_step(inp, qsl, ctx, gather=gather)
+
+
+def _interval(monkeypatch, n: int) -> None:
+    monkeypatch.setattr(ple_hostids, "hostids_check_interval", lambda: n)
+
+
+def _replay(emb, gen: int) -> None:
+    """Stand in for the graph: the captured copy put ``gen`` into the scratch.
+
+    Call this *before* the check that issues the read, not after. The read is a
+    copy that runs in stream order, so what it samples is the scratch's value at
+    the moment the issue happens -- setting the scratch afterwards would model a
+    copy that reads the future, and would have made the frozen-handoff tests pass
+    for the wrong reason.
+    """
+    assert emb._gen_device is not None
+    emb._gen_device.fill_(gen)
+
+
+def test_gen_verdict_covers_every_direction() -> None:
+    """The pure half of the tripwire, testable with no torch and no device."""
+    assert ple_hostids.gen_verdict(5, 5) == "ok"
+    assert ple_hostids.gen_verdict(4, 5) == "frozen"
+    assert ple_hostids.gen_verdict(0, 5) == "frozen"
+    assert ple_hostids.gen_verdict(6, 5) == "ahead"
+    # "never staged" must not borrow "ok"'s authority.
+    assert ple_hostids.gen_verdict(0, 0) == "no-staging"
+
+
+def test_check_interval_defaults_clamps_and_ignores_junk(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_GFX906_PLE_HOSTIDS_CHECK", raising=False)
+    assert ple_hostids.hostids_check_interval() == 64
+    monkeypatch.setenv("VLLM_GFX906_PLE_HOSTIDS_CHECK", "1")
+    assert ple_hostids.hostids_check_interval() == 1
+    # 0 would sample every step and, worse, make `countdown > 0` never true in a
+    # way that reads like a bug; a negative interval is not a thing.
+    monkeypatch.setenv("VLLM_GFX906_PLE_HOSTIDS_CHECK", "0")
+    assert ple_hostids.hostids_check_interval() == 1
+    monkeypatch.setenv("VLLM_GFX906_PLE_HOSTIDS_CHECK", "yes")
+    assert ple_hostids.hostids_check_interval() == 64
+
+
+def test_staging_advances_the_generation_with_the_rows() -> None:
+    emb = StagingEmbedding()
+    assert _stage(emb) is True
+    assert emb._host_stage_gen == 1
+    assert int(emb._pinned_gen[0]) == 1
+    _stage(emb)
+    assert emb._host_stage_gen == 2 and int(emb._pinned_gen[0]) == 2
+
+
+def test_a_refused_stage_does_not_advance_the_generation() -> None:
+    """The same-act rule, observed from the refusing side.
+
+    ``stage_host_step`` returns before writing anything when the rows will not
+    fit, so the counter must not move either. A counter that advanced past a
+    refusal would tell the next check "the graph owes you generation N" for rows
+    that were never staged -- inventing a stale handoff out of a healthy step.
+    """
+    emb = StagingEmbedding()
+    assert _stage(emb) is True
+    # 3 requests x 3 tokens = 9 rows > CAPACITY: refused, nothing written.
+    assert _stage(emb, num_reqs=3) is False
+    assert emb._host_stage_gen == 1, "a refused step advanced the generation"
+    assert int(emb._pinned_gen[0]) == 1
+
+
+def test_differential_mode_never_advances_the_generation() -> None:
+    """Mode 2 keeps the device in charge, so the tripwire stays inert by design.
+
+    Not a mode check inside the op: the counter simply never leaves zero, which
+    makes "frozen" unreachable for a path that never claimed to hand anything off.
+    """
+    emb = StagingEmbedding()
+    assert _stage(emb, gather=False) is True
+    assert emb._host_stage_gen == 0
+    assert int(emb._pinned_gen[0]) == 0
+
+
+def test_the_check_issues_a_read_only_every_nth_step(monkeypatch) -> None:
+    """Sampling is throttled, and the sampled step's answer arrives on the next."""
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 3)
+    emb._gen_check_countdown = 3
+    _stage(emb)
+    verdicts = []
+    for _ in range(9):
+        _replay(emb, emb._host_stage_gen)  # the graph keeps up
+        verdicts.append(emb.check_host_gen())
+    assert verdicts[:6] == ["", "", "issued", "ok", "", ""], verdicts
+    # Two samples in nine steps of interval 3 (the step that reads a verdict back
+    # also occupies a step, which is why this is not every third call exactly).
+    assert verdicts.count("issued") == 2
+    assert emb._gen_event.records == 2
+    assert emb._gen_checks_ok == 2
+    assert emb._hostids_disabled is False
+
+
+def test_nothing_staged_yet_is_not_reported_as_ok() -> None:
+    """A vacuous pass is reported as what it is.
+
+    "ok" for a boot that has staged nothing would make the first interval of every
+    run look verified, which is the same class of lie as an instrument that cannot
+    go red.
+    """
+    emb = StagingEmbedding()
+    assert emb.check_host_gen() == "no-staging"
+    assert emb._gen_checks_ok == 0
+
+
+def test_a_fresh_handoff_passes_and_is_counted(monkeypatch) -> None:
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    _stage(emb)
+    _replay(emb, 1)  # the graph delivered generation 1
+    assert emb.check_host_gen() == "issued"
+    assert emb.check_host_gen() == "ok"
+    assert emb._gen_checks_ok == 1
+    assert emb._hostids_disabled is False
+    assert emb._gen_trips == 0
+
+
+def test_a_frozen_handoff_disables_while_the_device_path_is_reachable(
+    monkeypatch,
+) -> None:
+    """No captured graph => the device path really does run, so back off."""
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    _stage(emb)
+    _replay(emb, 0)  # the scratch is stuck at capture's value
+    assert emb.check_host_gen() == "issued"
+    assert emb.check_host_gen() == "frozen"
+    assert emb._hostids_disabled is True
+    assert emb._gen_trips == 1
+
+
+def test_a_frozen_handoff_is_fatal_once_a_graph_captured_the_staged_branch(
+    monkeypatch,
+) -> None:
+    """The case where "fall back" is not a thing a replay can do.
+
+    Inside a captured graph the op body does not run, so the device path is
+    unreachable and every further step embeds the wrong step's tokens. Continuing
+    is the 2026-09-20 failure; raising is the only correct remaining action.
+    """
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    emb._staged_branch_captured = True
+    _stage(emb)
+    _replay(emb, 0)  # capture's value: the graph never advanced it
+    assert emb.check_host_gen() == "issued"
+    with pytest.raises(RuntimeError, match="frozen embeddings"):
+        emb.check_host_gen()
+
+
+def test_a_device_value_ahead_of_the_host_is_not_treated_as_ok(monkeypatch) -> None:
+    """One scratch and one producer cannot get ahead; if it does, stop anyway."""
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    _stage(emb)
+    _replay(emb, 9)
+    assert emb.check_host_gen() == "issued"
+    assert emb.check_host_gen() == "ahead"
+    assert emb._hostids_disabled is True
+
+
+def test_a_read_that_never_lands_fails_instead_of_hanging(monkeypatch) -> None:
+    """If the scratch is never written the check must still terminate loudly."""
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    emb._gen_event = FakeEvent(ready=False)
+    _stage(emb)
+    verdicts = [emb.check_host_gen() for _ in range(6)]
+    assert verdicts[0] == "issued"
+    assert "in-flight" in verdicts
+    assert emb._hostids_disabled is True, verdicts
+    assert emb._gen_trips == 1
+
+
+def test_the_check_never_waits_on_the_device(monkeypatch) -> None:
+    """The instrument must not cost the thing it protects.
+
+    ``FakeEvent.synchronize`` raises, so reaching it anywhere in this file fails
+    the test that happened to be running; this test asserts the non-blocking path
+    was actually exercised rather than skipped.
+    """
+    emb = StagingEmbedding()
+    _interval(monkeypatch, 1)
+    emb._gen_event = FakeEvent(ready=False)
+    _stage(emb)
+    assert emb.check_host_gen() == "issued"
+    assert emb.check_host_gen() == "in-flight"
+    assert emb._gen_event.records == 1
+    assert emb._gen_event.queries == 1
+    assert emb._hostids_disabled is False
+
+
+def test_the_op_copies_the_generation_into_the_scratch(monkeypatch) -> None:
+    """The graph node that makes the tripwire a measurement instead of a tautology.
+
+    RED CONTROL: delete the ``scratch.copy_`` in the staged branch and this fails,
+    because the scratch would still hold capture's value while the host counter
+    marched on.
+    """
+    emb = StagingEmbedding()
+    emb._host_stage_rows = ROWS
+    emb._pinned_gen.fill_(7)
+    assert emb._gen_device is not None
+    assert int(emb._gen_device[0]) == 0
+    with _op_env(emb, monkeypatch):
+        _run_op()
+    assert int(emb._gen_device[0]) == 7
+
+
+def test_the_op_records_that_the_staged_branch_was_captured(monkeypatch) -> None:
+    """What makes a tripwire fire fatal rather than a quiet disable."""
+    emb = StagingEmbedding()
+    emb._host_stage_rows = ROWS
+    with _op_env(emb, monkeypatch, capturing=True):
+        _run_op()
+    assert emb._staged_branch_captured is True
+
+    emb = StagingEmbedding()
+    emb._host_stage_rows = ROWS
+    with _op_env(emb, monkeypatch, capturing=False):
+        _run_op()
+    assert emb._staged_branch_captured is False
+
+
+def test_the_device_path_never_touches_the_generation_scratch(monkeypatch) -> None:
+    """The copy is a node of the staged branch only.
+
+    If the device path also copied, a frozen staged graph would be "fixed" by the
+    eager path writing the counter, and the tripwire would report a healthy handoff
+    for a graph that delivered nothing.
+    """
+    emb = StagingEmbedding()
+    emb._host_stage_rows = ROWS - 1  # disagreement -> device path
+    emb._pinned_gen.fill_(7)
+    with _op_env(emb, monkeypatch):
+        _run_op()
+    assert emb.lookup_calls == 1
+    assert emb._gen_device is not None
+    assert int(emb._gen_device[0]) == 0, "the device path advanced the tripwire"
+
+
+def test_scratch_allocation_refuses_to_happen_inside_a_capture(monkeypatch) -> None:
+    emb = StagingEmbedding()
+    emb._gen_device = None
+    emb._host_stage_rows = ROWS
+    with (
+        _op_env(emb, monkeypatch, capturing=True),
+        pytest.raises(RuntimeError, match="never allocated"),
+    ):
+        _run_op()
+
+
+def test_scratch_is_created_lazily_outside_a_capture(monkeypatch) -> None:
+    """A module that never ran load_weights still works, and reports honestly."""
+    emb = StagingEmbedding()
+    emb._gen_device = None
+    emb._host_stage_rows = ROWS
+    emb._pinned_gen.fill_(4)
+    with _op_env(emb, monkeypatch, capturing=False):
+        _run_op()
+    assert emb._gen_device is not None
+    assert int(emb._gen_device[0]) == 4
+
+
+# --------------------------------------------------------------------------
+# Wiring: the model state runs the check even on steps it refused
+# --------------------------------------------------------------------------
+
+
+class WatchedLayer:
+    """A registered embedding that records tripwire samples."""
+
+    ngram_size = NGRAM_SIZE
+
+    def __init__(self) -> None:
+        self.samples = 0
+        self._staged_branch_captured = False
+        self._host_stage_rows = -1
+
+    def check_host_gen(self) -> str:
+        self.samples += 1
+        return "ok"
+
+    def take_host_stage(self):
+        return None
+
+    def stage_host_step(self, *a: Any, **kw: Any) -> bool:  # noqa: ANN002, ANN003
+        return False
+
+
+def test_the_check_runs_on_steps_the_host_refused(hostids_env) -> None:
+    """A refusal is the interesting case, so the check sits above the refusals."""
+    hostids_env["layers"] = [WatchedLayer()]
+    st = FakeModelState()
+    input_batch, req_states, _ = _batch_and_states()
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert "no-draft-source" in st._ple_host_refusals
+    assert st._ple_host_steps == 0
+    layer = hostids_env["layers"][0]
+    assert layer.samples == 1, "the tripwire was skipped on a refused step"
+
+
+def test_the_check_runs_once_per_registered_layer(hostids_env) -> None:
+    hostids_env["layers"] = [WatchedLayer(), WatchedLayer()]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    st._stage_host_ple_ids(input_batch, req_states)
+    # Resolution is what arms the watchers; nothing sets this by hand.
+    assert st._ple_host_gen_layers == hostids_env["layers"]
+    assert all(layer.samples == 1 for layer in hostids_env["layers"])
+
+
+def test_disabling_keeps_the_tripwire_armed_after_capture(hostids_env, caplog) -> None:
+    """Disabling the host path must not disarm the instrument that proves it broke.
+
+    Once a graph captured the staged branch, a disabled host path *is* the
+    frozen-embedding state; and the disable message must not claim a device path
+    that a replay cannot reach.
+    """
+    layer = WatchedLayer()
+    hostids_env["layers"] = [layer]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    layer._staged_branch_captured = True
+    with caplog.at_level("WARNING"):
+        st.disable_host_staging("test reason")
+
+    assert st._ple_host_layers == []
+    assert st._ple_host_gen_layers == [layer], "disarming hid the frozen graph"
+    assert any("does NOT handle" in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+
+
+def test_disabling_reports_a_real_fallback_when_nothing_was_captured(
+    hostids_env, caplog
+) -> None:
+    layer = WatchedLayer()
+    hostids_env["layers"] = [layer]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    with caplog.at_level("WARNING"):
+        st.disable_host_staging("test reason")
+
+    assert st._ple_host_layers == []
+    assert st._ple_host_gen_layers == [layer]
+    assert any("handles every step" in r.getMessage() for r in caplog.records)

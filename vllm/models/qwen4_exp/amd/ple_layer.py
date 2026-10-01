@@ -606,6 +606,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._hostids_disabled = False
         self._host_stage_steps = 0
         self._host_id_mismatches = 0
+        # Generation tripwire (P1.5). ``_host_stage_gen`` counts staged steps and
+        # is copied into pinned memory in the same act that writes the rows, so a
+        # value in the pinned slot means "rows for that step are in the buffer
+        # next to it". ``_gen_device`` is what the graph writes; ``_pinned_gen_read``
+        # is where the host reads it back without waiting. All four 8-byte buffers
+        # exist even with the knob off -- they are nothing, and a None-check per
+        # step is worse than 8 bytes.
+        self._host_stage_gen = 0
+        self._pinned_gen = torch.zeros(1, dtype=torch.long, device="cpu").pin_memory()
+        self._pinned_gen_read = torch.zeros(
+            1, dtype=torch.long, device="cpu"
+        ).pin_memory()
+        self._gen_device: torch.Tensor | None = None
+        self._gen_event = torch.cuda.Event()
+        self._gen_pending_expected = 0
+        self._gen_check_countdown = ple_hostids.hostids_check_interval()
+        self._gen_stuck = 0
+        self._gen_checks_ok = 0
+        self._gen_trips = 0
+        self._staged_branch_captured = False
         if ple_hostids.hostids_mode() != 0:
             _HOST_STAGEABLE.add(self)
             logger.info(
@@ -865,6 +885,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._pinned_output[:rows].copy_(result.to(dtype=self.runtime_dtype))
         self._host_stage_rows = rows
         self._host_stage_steps += 1
+        # Same-act rule: the generation counter goes into pinned memory after the
+        # rows it describes are already in the buffer beside it, never before. A
+        # counter that leads its rows would let a replay look fresh while reading
+        # the previous step's embedding rows -- the exact failure this counter is
+        # installed to detect. Differential mode takes the early return above and
+        # never advances the counter, so the tripwire stays inert there by
+        # construction rather than by a mode check.
+        self._host_stage_gen += 1
+        self._pinned_gen[0] = self._host_stage_gen
         if self._host_stage_steps == 1:
             logger.info(
                 "PLE HOSTIDS: staged %d rows of host-computed ids for '%s' "
@@ -887,6 +916,116 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         staged = self._host_stage_rows
         self._host_stage_rows = -1
         return staged == rows
+
+    def _alloc_gen_scratch(self) -> None:
+        """Create the device mirror of ``_pinned_gen`` on the weights' device."""
+        self._gen_device = torch.zeros(
+            1, dtype=torch.long, device=self.layer_multipliers.device
+        )
+
+    def _gen_scratch(self, device: torch.device) -> torch.Tensor:
+        """The device scratch the graph copies the generation into.
+
+        Falls back to lazy creation for a module that never ran ``load_weights``
+        (a stand-in in a test), but refuses to allocate inside a capture instead
+        of letting the allocation fail in whatever way the backend chooses.
+        """
+        scratch = self._gen_device
+        if scratch is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "PLE generation scratch was never allocated before graph "
+                    "capture; the generation tripwire cannot be recorded into a "
+                    "graph retroactively. Load weights before capturing."
+                )
+            scratch = torch.zeros(1, dtype=torch.long, device=device)
+            self._gen_device = scratch
+        return scratch
+
+    def check_host_gen(self) -> str:
+        """Sample what the graph delivered, and refuse if it is not fresh.
+
+        Called once per step from the model state, before this step stages
+        anything, and independent of whether this step can be staged at all -- a
+        step the host refused is exactly the step whose replay is worth looking
+        at. Never synchronises: the read is issued non-blocking on step N, its
+        event is polled with ``query()`` on a later step, and a read that has not
+        landed is left in flight rather than waited on. A tripwire that adds a
+        host wait to the step would be priced in the same currency as the bug it
+        catches.
+
+        The expected value is the generation staged as of *before* this step
+        stages, because the copy issued below is stream-ordered after the previous
+        step's replay and before this step's. Computing it after staging instead
+        would compare the device against a value it cannot possibly have seen yet
+        and fire on every healthy step -- which is a red control here, not a
+        hypothetical.
+        """
+        if self._hostids_disabled or self._gen_device is None:
+            return ""
+        interval = ple_hostids.hostids_check_interval()
+        expected = self._gen_pending_expected
+        if expected:
+            if not self._gen_event.query():
+                self._gen_stuck += 1
+                if self._gen_stuck > 4 * interval:
+                    self._fire_gen(
+                        f"generation read did not land in {self._gen_stuck} steps "
+                        "(the device scratch is not being written, or the stream is "
+                        "wedged)"
+                    )
+                return "in-flight"
+            self._gen_stuck = 0
+            self._gen_pending_expected = 0
+            read = int(self._pinned_gen_read[0])
+            verdict = ple_hostids.gen_verdict(read, expected)
+            if verdict == "ok":
+                self._gen_checks_ok += 1
+                return verdict
+            self._fire_gen(
+                f"the device reported generation {read} for a step the host staged "
+                f"as generation {expected}"
+            )
+            return verdict
+        if self._host_stage_gen == 0:
+            # Nothing has been staged yet, so there is nothing the graph could
+            # have delivered. Reporting this as "ok" would make the first N steps
+            # of every boot look verified.
+            return "no-staging"
+        self._gen_check_countdown -= 1
+        if self._gen_check_countdown > 0:
+            return ""
+        self._gen_check_countdown = interval
+        self._gen_pending_expected = self._host_stage_gen
+        self._pinned_gen_read.copy_(self._gen_device, non_blocking=True)
+        self._gen_event.record()
+        return "issued"
+
+    def _fire_gen(self, why: str) -> None:
+        """The handoff is not fresh. What happens next depends on reachability.
+
+        If no graph has captured the staged branch, the device path genuinely runs
+        every step, so disabling the host path is a real fallback and the boot
+        stays correct. If a graph *has* captured it, the op body no longer runs at
+        replay: there is no device path to fall back to, and every further step
+        would serve embedding rows belonging to a different step. Plausible text is
+        the worst possible output of a lookup table, so this raises instead.
+
+        A raise on a hot path is a behaviour change, and this one is deliberately
+        narrow: it is unreachable unless the staged branch was captured, which is
+        unreachable unless the knob is on and a FULL graph was built around it.
+        """
+        self._gen_trips += 1
+        if self._staged_branch_captured:
+            raise RuntimeError(
+                f"PLE HOSTIDS generation tripwire for '{self.layer_name}': {why}. A "
+                "captured graph is replaying host-staged PLE rows and the handoff is "
+                "not fresh, so every step from here would embed the wrong step's "
+                "tokens. The device path is not reachable from inside a replay, so "
+                "continuing would serve frozen embeddings -- the 2026-09-20 failure "
+                "mode. Stopping the engine is the only safe action."
+            )
+        self.disable_hostids(f"generation tripwire: {why}")
 
     def compare_host_ids(self, device_ids: torch.Tensor) -> None:
         """Differential mode: the device's ids are now in ``device_ids``.
@@ -1040,6 +1179,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        # The device mirror of the generation counter is allocated here rather
+        # than lazily because the first execution of the staged branch may be
+        # inside a CUDA graph capture: an allocation inside a capture either
+        # fails or lands in that graph's private pool, where the other graphs and
+        # the host's read-back would not see it.
+        self._alloc_gen_scratch()
         return loaded
 
 
@@ -1716,6 +1861,19 @@ def qwen4_exp_amd_ple_ngram_embedding(
         ple_embedding._host_stage_rows = -1
         if staged == n:
             output.copy_(ple_embedding._pinned_output[:n], non_blocking=True)
+            # P1.5 generation tripwire: one 8-byte copy *inside* the graph, so what
+            # comes back later is the generation the replay delivered and not the
+            # one capture left behind. Without this node the tripwire could only
+            # ever report what capture did, which is precisely the 2026-09-20
+            # failure it exists to catch.
+            scratch = ple_embedding._gen_scratch(output.device)
+            scratch.copy_(ple_embedding._pinned_gen, non_blocking=True)
+            if torch.cuda.is_current_stream_capturing():
+                # Host-side bookkeeping during capture: records that the staged
+                # branch -- and therefore this copy -- is in the graph, which is
+                # what makes a tripwire fire fatal rather than a disable. Not a
+                # graph node, and deliberately so.
+                ple_embedding._staged_branch_captured = True
             return
     # VLLM_GFX906_PLE_PROF=1 brackets the four host-visible steps below (see
     # vllm/models/qwen4_exp/amd/ple_prof.py for what each one means and why

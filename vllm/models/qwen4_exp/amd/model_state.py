@@ -75,6 +75,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # rather than a guess.
         self._host_drafts: object | None = None
         self._ple_host_layers: list | None = None
+        # Layers watched by the generation tripwire. Kept separate from
+        # ``_ple_host_layers`` because disabling the host path must not disarm the
+        # instrument: once a graph has captured the staged branch, a disabled host
+        # path is the frozen-embedding state, and the tripwire is the only thing
+        # that can see it.
+        self._ple_host_gen_layers: list = []
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
@@ -275,6 +281,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 self._note_host_refusal("no-registered-layers")
                 return
             self._ple_host_layers = layers
+            self._ple_host_gen_layers = list(layers)
+        # Tripwire first, and above the refusal paths it exists to observe: a step
+        # the host could not stage is exactly the step whose replay is worth
+        # looking at. It raises when a graph captured the staged branch and the
+        # handoff went stale, which is the one case where "fall back to the device
+        # path" is not something a replay can do.
+        for layer in self._ple_host_gen_layers:
+            layer.check_host_gen()
         if self._host_drafts is None:
             self._note_host_refusal("no-draft-source")
             return
@@ -343,6 +357,26 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
     def disable_host_staging(self, why: str) -> None:
         if not self._ple_host_layers:
+            return
+        captured = any(
+            getattr(layer, "_staged_branch_captured", False)
+            for layer in self._ple_host_gen_layers
+        )
+        if captured:
+            # Do not claim a fallback that a replay cannot perform. The op body
+            # stopped running for these steps, so the graph keeps replaying
+            # whatever is in the pinned buffer and the generation tripwire is what
+            # says so out loud.
+            logger.warning(
+                "PLE HOSTIDS: host staging disabled after %d step(s) -- %s. A graph "
+                "has captured the staged branch, so the device path does NOT handle "
+                "these steps: the pinned rows will keep replaying. The generation "
+                "tripwire stays armed. Refusals so far: %s",
+                self._ple_host_steps,
+                why,
+                dict(self._ple_host_refusals),
+            )
+            self._ple_host_layers = []
             return
         logger.warning(
             "PLE HOSTIDS: host staging disabled after %d step(s) -- %s. The "

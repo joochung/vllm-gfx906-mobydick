@@ -317,7 +317,14 @@ class _Stub:
     Constructing the real module means running the prime search over
     `ngram_vocab_size_base`, which is not what is under test here; `load_weights`
     only ever touches the attributes below, so it is called unbound against this.
+    The list of things it touches is the contract: when ``load_weights`` grows a
+    new responsibility the stub has to grow it too, which is how the P1.5 scratch
+    allocation below is exercised rather than worked around.
     """
+
+    # Real method, not a no-op: load_weights allocates the generation tripwire's
+    # device mirror, and that allocation is a claim worth testing behaviourally.
+    _alloc_gen_scratch = ple.Qwen4ExpNGramEmbedding._alloc_gen_scratch
 
     def __init__(self, split_ngram_parts=NUM_SHARDS, dim=DIM):
         self.split_ngram_parts = split_ngram_parts
@@ -327,6 +334,8 @@ class _Stub:
         self.ngram_embedding = ple.MmapShardedNGramEmbedding(
             split_ngram_parts, CAPACITY, dim
         )
+        # Production __init__ sets this to None; load_weights is what fills it in.
+        self._gen_device: torch.Tensor | None = None
 
 
 def _load(stub, weights):
@@ -370,6 +379,25 @@ def test_load_weights_fills_persistent_buffers():
     loaded = _load(stub, [("ngram_heads_offsets", vals)])
     assert "ngram_heads_offsets" in loaded
     assert torch.equal(stub.ngram_heads_offsets, vals)
+
+
+def test_load_weights_allocates_the_generation_scratch():
+    """P1.5: the tripwire's device mirror must exist before the first capture.
+
+    Asserted behaviourally rather than by grepping for the call: a formatter is
+    free to reflow source, and a missing allocation is not free. The scratch's
+    first value is the whole difference between "the graph has never run the
+    staged branch" and a generation the host will accept as fresh.
+    """
+    stub = _Stub()
+    assert getattr(stub, "_gen_device", None) is None
+    _load(stub, [("ngram_heads_offsets", torch.zeros(2, dtype=torch.long))])
+    scratch = stub._gen_device
+    assert isinstance(scratch, torch.Tensor), "load_weights did not allocate it"
+    assert scratch.dtype == torch.long
+    assert scratch.numel() == 1
+    assert int(scratch[0]) == 0, "the scratch must start as 'never written'"
+    assert scratch.device == stub.layer_multipliers.device
 
 
 def test_load_weights_rejects_buffer_shape_mismatch():

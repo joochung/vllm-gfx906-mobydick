@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import regex as re
 import torch
 
 from vllm.config.vllm import ENV_PLE_HOSTIDS, ple_hostids_async_conflict
@@ -141,22 +142,33 @@ def test_accepted_values_agree_between_mode_and_worker():
     from vllm.v1.worker.gpu import model_runner as model_runner_module
 
     src = pathlib.Path(inspect.getfile(model_runner_module)).read_text()
-    assert 'in ("1", "2")' in src, (
-        "the worker's accepted value set moved; update it and this test together"
+    # The accepted set is *extracted*, not string-matched. A literal like
+    # 'in ("1", "2")' is text a formatter is free to reflow across lines, and a
+    # test that goes red because a hook re-wrapped a tuple teaches people to
+    # ignore red tests. What has to stay true is the set, so the set is what is
+    # read out of the source.
+    match = re.search(
+        r'os\.environ\.get\(\s*"VLLM_GFX906_PLE_HOSTIDS",\s*"(?P<default>[^"]*)"\)'
+        r"\s+in\s*\((?P<values>[^)]*)\)",
+        src,
+    )
+    assert match, (
+        "the worker no longer reads VLLM_GFX906_PLE_HOSTIDS against a literal "
+        "tuple of accepted values; update this test and the worker together"
+    )
+    accepted = set(re.findall(r'"([^"]*)"', match.group("values")))
+    assert accepted == {"1", "2"}, accepted
+    assert match.group("default") not in accepted, (
+        "the default value must not be one of the accepted ones"
     )
 
     monkey = pytest.MonkeyPatch()
     try:
-        for raw, expected in (
-            ("0", False),
-            ("", False),
-            ("1", True),
-            ("2", True),
-            ("3", False),
-            ("yes", False),
-        ):
+        # The worker's rule is `raw in accepted`, ours is `hostids_mode() != 0`;
+        # they must agree on every value, including the ones neither side likes.
+        for raw in ("0", "", "1", "2", "3", "yes", "00", " 1"):
             monkey.setenv(ENV_PLE_HOSTIDS, raw)
-            assert (ple_hostids.hostids_mode() != 0) is expected, raw
+            assert (raw in accepted) is (ple_hostids.hostids_mode() != 0), raw
     finally:
         monkey.undo()
 
