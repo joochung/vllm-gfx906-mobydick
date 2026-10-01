@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.models.qwen4_exp.amd import ple_hostids
 from vllm.models.qwen4_exp.amd.ple_hostids import (
     HostIdsRefused,
+    HostTokenHistory,
     build_decode_step_inputs,
 )
 from vllm.models.qwen4_exp.amd.ple_prefetch import (
@@ -19,6 +20,7 @@ from vllm.models.qwen4_exp.amd.ple_prefetch import (
     plan_lookahead_chunks,
     prefetch_enabled,
 )
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -95,6 +97,37 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self._ple_prefetcher: PleRowPrefetcher | None = None
         self._ple_prefetch_wanted = prefetch_enabled()
         self._ple_host_tokens = None
+        # P1.6: the host mirror of committed tokens, plus the request -> slot map
+        # that lets ``remove_request`` clean the mirror's queue. Built here rather
+        # than lazily because seeding happens at add time, before any step has
+        # consulted the knob -- and an unseeded window is a step that cannot
+        # stage. The size comes from the ngram config, so the mirror is correct
+        # whether or not ids are ever staged on the host.
+        self._ple_host_history = HostTokenHistory(
+            self.max_num_reqs, self.ngram_context_len + 1
+        )
+        self._ple_host_slots: dict[str, int] = {}
+
+    # ------------------------------------------------------------- lifecycle
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        # Seed with exactly the list ``req_states.add_request`` staged into its
+        # UVA array -- the runner passes the same ``prefill_token_ids`` to both.
+        # That list is host-written, so it is the one part of a request's history
+        # the host can trust without asking the device; everything after it
+        # arrives through ``HostTokenHistory.stage_step``.
+        self._ple_host_slots[new_req_data.req_id] = req_index
+        self._ple_host_history.seed(req_index, new_req_data.prefill_token_ids or ())
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        # The runner calls this *before* ``req_states.remove_request``, so the
+        # slot is still resolvable here. Cleaning the mirror is not tidiness: an
+        # in-flight commit belonging to a finished request would otherwise land on
+        # whoever reuses the slot next and corrupt its token count.
+        req_index = self._ple_host_slots.pop(req_id, None)
+        if req_index is not None:
+            self._ple_host_history.invalidate(req_index)
 
     # ------------------------------------------------------------- read-ahead
     def _ple_prefetch_modules(self):
@@ -292,13 +325,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if self._host_drafts is None:
             self._note_host_refusal("no-draft-source")
             return
-        if self._ple_host_tokens is None:
-            buf = getattr(getattr(req_states, "all_token_ids", None), "_uva_buf", None)
-            host = getattr(buf, "np", None)
-            if host is None or host.ndim != 2:
-                self.disable_host_staging("req_states.all_token_ids has no host view")
-                return
-            self._ple_host_tokens = host
+        # Apply every queued commit whose device->host copy has landed. This is
+        # the only place the queue is drained, and it never blocks: a commit still
+        # in flight makes this step refuse below rather than wait, because waiting
+        # here is the per-step host sync the whole design exists to remove.
+        self._ple_host_history.drain()
+        if self._ple_host_history.pending:
+            self._note_host_refusal("history-pending")
+            return
 
         num_reqs = input_batch.num_reqs
         try:
@@ -307,7 +341,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 input_batch.idx_mapping_np[:num_reqs],
                 input_batch.num_scheduled_tokens[:num_reqs],
                 req_states.num_computed_tokens_np,
-                self._ple_host_tokens,
+                self._ple_host_history.window,
+                self._ple_host_history.length,
                 values,
                 row_idx,
                 ngram_context_len=self.ngram_context_len,
@@ -354,6 +389,44 @@ class Qwen4ExpModelState(MambaHybridModelState):
         rows 1..q-1 of no step and refuses every batch.
         """
         self._host_drafts = handler
+
+    def stage_host_tokens(
+        self,
+        slots: object,
+        sampled: object,
+        num_sampled: object,
+        done: object,
+    ) -> bool:
+        """Queue one step's accepted tokens for the host PLE mirror (P1.6).
+
+        Called by the model runner's epilogue with the arrays the async output
+        copy produced, plus its copy event: nothing here reads ``sampled``, so
+        the data may still be in flight. The consumer applies it in
+        ``_stage_host_ple_ids`` once ``done.query()`` says so, and refuses the
+        step until then -- which is what keeps this knob free of the per-step
+        host sync it exists to remove.
+
+        Returns whether the commit was queued. Failures are counted, never
+        raised: a knob that can kill a serving step is worse than one that
+        reports no coverage.
+        """
+        if ple_hostids.hostids_mode() == 0:
+            # The epilogue runs on every step of every boot; with the knob off
+            # this must cost nothing and, above all, must not log.
+            return False
+        try:
+            staged = self._ple_host_history.stage_step(
+                slots,
+                sampled,
+                num_sampled,
+                done,  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+            self._note_host_refusal(f"stage-tokens-{type(exc).__name__}")
+            return False
+        if not staged:
+            self._note_host_refusal("stage-tokens-rejected")
+        return staged
 
     def disable_host_staging(self, why: str) -> None:
         if not self._ple_host_layers:

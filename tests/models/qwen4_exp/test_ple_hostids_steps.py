@@ -32,6 +32,7 @@ import pytest
 
 from vllm.models.qwen4_exp.amd.ple_hostids import (
     HostIdsRefused,
+    HostTokenHistory,
     build_decode_step_inputs,
 )
 
@@ -167,12 +168,42 @@ class Harness:
         }
         self.all_token_ids = np.zeros((len(slots) + 8, max_model_len), dtype=np.int32)
         self.num_computed = np.zeros(len(slots) + 8, dtype=np.int32)
+        # The host mirror the builder actually reads: same slot index, one row
+        # per request, width = context + the token at the current position.
+        self.history = HostTokenHistory(len(slots) + 8, CTX + 1)
 
     def sync(self, slot: int) -> None:
-        """Publish a device-side request state into the host-visible arrays."""
+        """Publish a device-side request state into the host-visible arrays.
+
+        ``all_token_ids`` here is the UVA mirror, which the builder no longer
+        reads: its generated region arrives via a GPU kernel that is not ordered
+        before a host read in ``prepare_inputs``. It is kept because two tests
+        use it to prove the builder is indifferent to its state.
+        """
         state = self.states[slot]
         self.all_token_ids[slot, : state.total_len] = state.uva[: state.total_len]
         self.num_computed[slot] = state.num_computed
+
+    def seed_history(self, slot: int) -> None:
+        """What ``ModelState.add_request`` does: seed the window from the token
+        list the scheduler sent, which is the whole prompt (plus any tokens
+        already generated, for a resumed request).
+        """
+        state = self.states[slot]
+        self.history.seed(slot, state.uva[: state.total_len])
+
+    def stage_step(self, batch: list[int], sampled: list[np.ndarray]) -> None:
+        """What the model runner's epilogue does: hand this step's accepted
+        tokens to the history, with counts, and a copy event that has landed.
+        """
+        matrix = np.zeros((len(batch), K + 1), dtype=np.int32)
+        counts = np.zeros(len(batch), dtype=np.int32)
+        for row, tokens in enumerate(sampled):
+            matrix[row, : tokens.size] = tokens
+            counts[row] = tokens.size
+        assert self.history.stage_step(
+            np.array(batch, dtype=np.int32), matrix, counts, None
+        )
 
     def stage(self, batch: list[int], rng: np.random.default_rng) -> np.ndarray:
         """Fresh drafts for the next step, laid out in ``batch`` order.
@@ -199,6 +230,7 @@ class Harness:
         which must never be confused with the next step's drafts.
         """
         row_of_slot = {int(s): r for r, s in enumerate(row_idx)}
+        committed: list[np.ndarray] = []
         for slot in batch:
             state = self.states[slot]
             drafts_in = staged[row_of_slot[slot]]
@@ -212,14 +244,22 @@ class Harness:
                 num_rejected=(K + 1) - accepted,
             )
             self.sync(slot)
+            committed.append(sampled)
+        # The device got the tokens; the host mirror gets the same tensor the
+        # device consumed, which is what the epilogue hands over.
+        self.stage_step(batch, committed)
 
 
 def _build(harness: Harness, batch: list[int], staged, row_idx):
+    # The consumer drains first, exactly as _stage_host_ple_ids does: a commit is
+    # applied once its copy event reports done, and never blocks waiting for one.
+    harness.history.drain()
     return build_decode_step_inputs(
         np.array(batch, dtype=np.int32),
         np.full(len(batch), K + 1, dtype=np.int32),
         harness.num_computed,
-        harness.all_token_ids,
+        harness.history.window,
+        harness.history.length,
         staged,
         row_idx,
         ngram_context_len=CTX,
@@ -243,6 +283,7 @@ def test_matches_device_formula_over_a_long_run():
         state.uva[: prompt.size] = prompt
         state.last_sampled = int(prompt[-1])
         harness.sync(slot)
+        harness.seed_history(slot)
 
     row_idx = np.array(batch, dtype=np.int32)
     staged = harness.stage(batch, rng)
@@ -272,7 +313,6 @@ def test_row_order_follows_the_staged_index_not_batch_position():
     previous batch was ``[5, 0, 3]`` and this step's is ``[0, 3, 5]``, so reading
     the mirror by position would hand every request another request's drafts.
     """
-    rng = np.random.default_rng(11)
     prev, now = [5, 0, 3], [0, 3, 5]
     harness = Harness(now)
     for slot in now:
@@ -282,20 +322,26 @@ def test_row_order_follows_the_staged_index_not_batch_position():
         state.uva[: prompt.size] = prompt
         state.last_sampled = int(prompt[-1])
         harness.sync(slot)
+        harness.seed_history(slot)
 
     drafts = {s: np.full(K, 1000 + s, dtype=np.int32) for s in now}
     staged = np.array([drafts[s] for s in prev], dtype=np.int32)
     row_idx = np.array(prev, dtype=np.int32)
     # Advance the device state so the mirror's bonus tokens move, without
-    # re-staging (the staged block is the previous step's).
+    # re-staging (the staged block is the previous step's). The host mirror is
+    # told about the same accepted tokens, in *this* step's batch order.
+    committed: list[np.ndarray] = []
     for slot in now:
         state = harness.states[slot]
+        sampled = np.concatenate((drafts[slot][:1], [9000 + slot]))
         state.post_update(
             query_len=K + 1,
-            sampled_tokens=np.concatenate((drafts[slot][:1], [9000 + slot])),
+            sampled_tokens=sampled,
             num_rejected=K - 1,
         )
         harness.sync(slot)
+        committed.append(sampled)
+    harness.stage_step(now, committed)
 
     input_ids, qsl, _ = _build(harness, now, staged, row_idx)
     for i, slot in enumerate(now):
@@ -313,17 +359,23 @@ def test_first_decode_step_left_fills_eos_like_the_device():
     state.total_len, state.num_computed = 1, 0
     state.last_sampled = 42
     harness.sync(1)
+    harness.seed_history(1)
     staged = np.full((1, K), 77, dtype=np.int32)
     input_ids, qsl, ctx = _build(harness, [1], staged, np.array([1], np.int32))
     assert ctx[0].tolist() == [EOS, EOS]
     assert input_ids.tolist() == [42, 77, 77, 77]
 
+    # The next step: the sampler committed 43, so the host mirror learns it the
+    # way production does -- from the accepted-token commit, not by re-reading
+    # the UVA array.
     state.uva[1] = 43
     state.total_len, state.num_computed = 2, 1
     state.last_sampled = 43
     harness.sync(1)
+    harness.stage_step([1], [np.array([43], dtype=np.int32)])
     _, _, ctx = _build(harness, [1], staged, np.array([1], np.int32))
     assert ctx[0].tolist() == [EOS, 42]
+    assert input_ids.tolist() == [42, 77, 77, 77]
 
 
 def test_rows_beyond_the_bonus_come_from_the_mirror_not_uva():
@@ -341,11 +393,62 @@ def test_rows_beyond_the_bonus_come_from_the_mirror_not_uva():
     # Garbage past the committed prefix, exactly what a rejected step leaves.
     state.uva[4:8] = [999, 998, 997, 996]
     harness.sync(2)
+    harness.seed_history(2)
     harness.all_token_ids[2, 4:8] = [999, 998, 997, 996]
 
     staged = np.array([[70, 71, 72]], dtype=np.int32)
     input_ids, _, _ = _build(harness, [2], staged, np.array([2], np.int32))
     assert input_ids.tolist() == [8, 70, 71, 72]
+
+
+def test_ids_ignore_a_host_invisible_generated_region():
+    """The 2026-10-01 differential failure, frozen as a test.
+
+    ``_post_update_kernel`` writes generated tokens into ``all_token_ids`` with a
+    GPU kernel that is not ordered before the host read in the next step's
+    ``prepare_inputs``. So the mirror's newest cells -- the only ones this path
+    needs -- can still hold what the buffer held before: zeros. That is what made
+    the first differential boot refuse, and the arithmetic identified it: a zero
+    token on every ngram lane hashes to a zero remainder, so every id collapses
+    to its bare ``head_offsets`` entry. Ids come from ``HostTokenHistory`` now,
+    so wiping everything the kernel wrote must change nothing.
+    """
+    rng = np.random.default_rng(31)
+    batch = [0, 4]
+    prompt_len = 8
+    harness = Harness(batch, max_model_len=256)
+    for slot in batch:
+        state = harness.states[slot]
+        prompt = rng.integers(1000, 2000, size=prompt_len, dtype=np.int32)
+        state.total_len, state.num_computed = prompt.size, prompt.size - 1
+        state.uva[: prompt.size] = prompt
+        state.last_sampled = int(prompt[-1])
+        harness.sync(slot)
+        harness.seed_history(slot)
+
+    row_idx = np.array(batch, dtype=np.int32)
+    staged = harness.stage(batch, rng)
+    for _ in range(12):
+        # Only the prompt cells are host-written (``states.py`` stages the prompt
+        # into the UVA buffer at add time). Everything past it arrived by kernel.
+        for slot in batch:
+            prompt_cells = harness.all_token_ids[slot, :prompt_len].copy()
+            harness.all_token_ids[slot] = 0
+            harness.all_token_ids[slot, :prompt_len] = prompt_cells
+
+        ids, qsl, ctx = _build(harness, batch, staged, row_idx)
+        for i, slot in enumerate(batch):
+            state = harness.states[slot]
+            row = int(np.where(row_idx == slot)[0][0])
+            got = ids[int(qsl[i]) : int(qsl[i + 1])]
+            assert got.tolist() == device_input_ids(state, staged[row]).tolist(), (
+                f"slot {slot} after a wiped mirror: {got.tolist()}"
+            )
+            assert ctx[i].tolist() == device_prepare_ngram_context(state).tolist(), (
+                f"context for slot {slot} after a wiped mirror"
+            )
+        harness.step(batch, staged, row_idx, rng)
+        staged = harness.stage(batch, rng)
 
 
 # --------------------------------------------------------------------------
@@ -363,6 +466,7 @@ def _ready_harness() -> tuple[Harness, list[int], np.ndarray]:
         state.uva[: prompt.size] = prompt
         state.last_sampled = int(prompt[-1])
         harness.sync(slot)
+        harness.seed_history(slot)
     staged = np.array([[30, 31, 32], [40, 41, 42]], dtype=np.int32)
     return harness, batch, staged
 
@@ -375,7 +479,8 @@ def test_refuses_batch_that_is_not_pure_decode():
             np.array(batch, np.int32),
             queries,
             harness.num_computed,
-            harness.all_token_ids,
+            harness.history.window,
+            harness.history.length,
             staged,
             np.array(batch, np.int32),
             ngram_context_len=CTX,
@@ -389,7 +494,8 @@ def test_refuses_batch_that_is_not_pure_decode():
         np.array([batch[0]], np.int32),
         np.array([K + 1], np.int32),
         harness.num_computed,
-        harness.all_token_ids,
+        harness.history.window,
+        harness.history.length,
         staged[:1],
         np.array([batch[0]], np.int32),
         ngram_context_len=CTX,
@@ -413,7 +519,8 @@ def test_refuses_missing_or_empty_staging():
             np.array(batch, np.int32),
             np.full(len(batch), K + 1, np.int32),
             harness.num_computed,
-            harness.all_token_ids,
+            harness.history.window,
+            harness.history.length,
             None,
             row_idx,
             ngram_context_len=CTX,
@@ -426,7 +533,8 @@ def test_refuses_missing_or_empty_staging():
             np.array([], np.int32),
             np.array([], np.int32),
             harness.num_computed,
-            harness.all_token_ids,
+            harness.history.window,
+            harness.history.length,
             staged,
             row_idx,
             ngram_context_len=CTX,
@@ -435,13 +543,63 @@ def test_refuses_missing_or_empty_staging():
     assert excinfo.value.reason == "empty-batch"
 
 
-def test_refuses_out_of_range_position():
-    """The host mirror is optimistic; a wild value must not index the table."""
+def test_refuses_a_host_counter_disagreeing_with_the_commit_count():
+    """The two counters must agree exactly, in either direction.
+
+    ``num_computed_tokens_np`` is the scheduler's copy and ``states.py`` calls it
+    an optimistic upper bound; ``history.length`` is counted from the accepted
+    token counts. A step where they disagree would build every id from a shifted
+    context, which is why this is a refusal and not a clamp.
+    """
     harness, batch, staged = _ready_harness()
-    harness.num_computed[batch[1]] = harness.max_model_len + 5
+    row_idx = np.array(batch, np.int32)
+    harness.num_computed[batch[1]] += 1  # the scheduler raced ahead
+    with pytest.raises(HostIdsRefused) as excinfo:
+        _build(harness, batch, staged, row_idx)
+    assert excinfo.value.reason == "history-length"
+
+    harness, batch, staged = _ready_harness()
+    harness.history.length[batch[0]] += 3  # the mirror ran ahead
+    with pytest.raises(HostIdsRefused) as excinfo:
+        _build(harness, batch, staged, row_idx)
+    assert excinfo.value.reason == "history-length"
+
+    # Control: without either perturbation the same build succeeds.
+    harness, batch, staged = _ready_harness()
+    ids, _, _ = _build(harness, batch, staged, row_idx)
+    assert ids.size == (K + 1) * len(batch)
+
+
+def test_refuses_a_negative_position():
+    """A freed or padding slot must never index anything."""
+    harness, batch, staged = _ready_harness()
+    harness.num_computed[batch[1]] = -1
     with pytest.raises(HostIdsRefused) as excinfo:
         _build(harness, batch, staged, np.array(batch, np.int32))
     assert excinfo.value.reason == "position-out-of-range"
+
+
+def test_refuses_a_window_too_narrow_for_the_context():
+    """Producer and reader disagreeing about what the width counts is a refusal.
+
+    The window must hold the context *and* the token at the current position; a
+    narrower one would silently read a shifted context and emit plausible ids.
+    """
+    harness, batch, staged = _ready_harness()
+    narrow = np.zeros((harness.history.num_slots, CTX), dtype=np.int64)
+    with pytest.raises(HostIdsRefused) as excinfo:
+        build_decode_step_inputs(
+            np.array(batch, np.int32),
+            np.full(len(batch), K + 1, np.int32),
+            harness.num_computed,
+            narrow,
+            harness.history.length,
+            staged,
+            np.array(batch, np.int32),
+            ngram_context_len=CTX,
+            eos_token_id=EOS,
+        )
+    assert excinfo.value.reason == "window-width"
 
 
 def test_refuses_padded_negative_slot():
@@ -470,6 +628,8 @@ def test_reason_tokens_are_stable():
         "position-out-of-range",
         "negative-slot",
         "context-width",
+        "history-length",
+        "window-width",
         "layout",
     }
     harness, batch, staged = _ready_harness()

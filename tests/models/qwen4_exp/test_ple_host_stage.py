@@ -38,6 +38,7 @@ import torch
 from vllm.models.qwen4_exp.amd import model_state as model_state_module
 from vllm.models.qwen4_exp.amd import ple_hostids
 from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module
+from vllm.models.qwen4_exp.amd.ple_hostids import HostTokenHistory
 from vllm.models.qwen4_exp.amd.ple_layer import (  # noqa: F401
     Qwen4ExpNGramEmbedding,
     qwen4_exp_amd_ple_ngram_embedding,
@@ -471,6 +472,7 @@ class FakeModelState:
 
     _stage_host_ple_ids = model_state_module.Qwen4ExpModelState._stage_host_ple_ids
     set_host_draft_source = model_state_module.Qwen4ExpModelState.set_host_draft_source
+    stage_host_tokens = model_state_module.Qwen4ExpModelState.stage_host_tokens
     disable_host_staging = model_state_module.Qwen4ExpModelState.disable_host_staging
     _note_host_refusal = model_state_module.Qwen4ExpModelState._note_host_refusal
 
@@ -485,6 +487,12 @@ class FakeModelState:
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
         self._ple_host_tokens = None
+        # The real class builds this in __init__ and seeds it at add time, so the
+        # stub has to as well: an unseeded window is a refused step, and these
+        # tests are about which steps get through.
+        self._ple_host_history = HostTokenHistory(slots, CTX + 1)
+        for slot in range(slots):
+            self._ple_host_history.seed(slot, _slot_tokens(slot)[: _POSITION + 1])
         self.slots = slots
 
     def staged_rows(self) -> list[int]:
@@ -499,16 +507,29 @@ class FakeDrafts:
         return self._result
 
 
+def _slot_tokens(slot: int, width: int = 64) -> np.ndarray:
+    """The token history a slot carries, shared by the batch and the stub."""
+    return np.arange(width, dtype=np.int64) + 1000 * (slot + 1)
+
+
+_POSITION = 5  # every request in _batch_and_states sits here
+
+
 def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
-    """A pure-decode batch over slots 0 and 3, with a UVA-shaped host mirror."""
+    """A pure-decode batch over slots 0 and 3, with a UVA-shaped host mirror.
+
+    The mirror is deliberately still here after P1.6: the id path no longer reads
+    it, and one test below asserts that a batch with no host view at all now
+    stages instead of disabling itself.
+    """
     slots = [0, 3][:num_reqs]
     idx_mapping = np.array(slots, dtype=np.int64)
     scheduled = np.array([q] * num_reqs, dtype=np.int32)
     computed = np.zeros(8, dtype=np.int64)
-    computed[slots] = 5  # context is available for every row
+    computed[slots] = _POSITION  # context is available for every row
     tokens = np.zeros((8, 64), dtype=np.int64)
     for slot in slots:
-        tokens[slot, :] = np.arange(64) + 1000 * (slot + 1)
+        tokens[slot, :] = _slot_tokens(slot)
     all_token_ids = (
         SimpleNamespace(_uva_buf=SimpleNamespace(np=tokens))
         if uva
@@ -590,14 +611,24 @@ def test_host_stage_source_is_wired_once(hostids_env) -> None:
     assert st._host_drafts is handler
 
 
-def test_no_host_view_of_all_token_ids_disables(hostids_env) -> None:
+def test_id_path_survives_a_platform_with_no_host_view(hostids_env) -> None:
+    """P1.6: the ids no longer depend on a host view of ``all_token_ids``.
+
+    Before the token mirror existed, a ``req_states.all_token_ids`` without a
+    ``_uva_buf`` meant the host could never know a step's history, so staging
+    disabled itself permanently. That is exactly the buffer whose newest cells are
+    written by a GPU kernel unordered before the host read, so depending on it was
+    both fragile and unnecessary. The prefetcher still disables itself on such a
+    platform -- that path reads the device array by design.
+    """
     hostids_env["layers"] = [StagingEmbedding()]
     st = FakeModelState()
     st.set_host_draft_source(_drafts())
     input_batch, req_states, _ = _batch_and_states(uva=False)
     st._stage_host_ple_ids(input_batch, req_states)
-    assert st._ple_host_layers == [], "kept trying on a platform with no host view"
-    assert st._ple_host_steps == 0
+    assert st._ple_host_refusals == {}, f"refused: {st._ple_host_refusals}"
+    assert st._ple_host_steps == 1
+    assert st.staged_rows() == [ROWS]
 
 
 def test_pure_decode_batch_reaches_the_layer(hostids_env) -> None:
@@ -618,9 +649,9 @@ def test_pure_decode_batch_reaches_the_layer(hostids_env) -> None:
     assert emb.lookup_calls == 1
     assert st._ple_host_steps == 1
     # Not just "something was staged": the ids must be the ones this batch's
-    # slots, positions and drafts imply. Row 0 of each request is the last sampled
-    # token from the UVA mirror at the slot's computed position; the rest are the
-    # staged drafts.
+    # slots, positions and drafts imply. Row 0 of each request is the newest
+    # committed token, from the host token mirror at the slot's computed position;
+    # the rest are the staged drafts.
     expected_rows = []
     staged_drafts = _drafts().wait_host_draft_tokens()[0]
     for order, slot in enumerate((0, 3)):
@@ -1138,3 +1169,140 @@ def test_disabling_reports_a_real_fallback_when_nothing_was_captured(
     assert st._ple_host_layers == []
     assert st._ple_host_gen_layers == [layer]
     assert any("handles every step" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The producer side: the model runner's epilogue handing over accepted tokens
+# ---------------------------------------------------------------------------
+
+
+class FakeCopyEvent:
+    """``AsyncOutput.copy_event``, as far as the mirror is concerned."""
+
+    def __init__(self, done: bool = False) -> None:
+        self.done = done
+        self.queries = 0
+
+    def query(self) -> bool:
+        self.queries += 1
+        return self.done
+
+
+def _commit(counts=(1, 1), done=False):
+    """A commit for slots 0 and 3: one accepted token each by default."""
+    rows = np.array([[7, 8, 9, 10], [11, 12, 13, 14]], dtype=np.int32)
+    return (
+        np.array([0, 3], dtype=np.int32),
+        rows,
+        np.array(counts, dtype=np.int32),
+        FakeCopyEvent(done),
+    )
+
+
+def test_epilogue_commit_is_free_when_the_knob_is_off(hostids_env) -> None:
+    """The epilogue runs on every step of every boot, knob or no knob.
+
+    So with the knob off it must queue nothing, count nothing and -- because a
+    stray log line here would be read as engagement -- say nothing.
+    """
+    hostids_env["mode"] = 0
+    st = FakeModelState()
+    assert st.stage_host_tokens(*_commit()) is False
+    assert st._ple_host_history.pending == 0
+    assert st._ple_host_refusals == {}
+
+
+def test_landed_commit_advances_the_step(hostids_env) -> None:
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    assert st.stage_host_tokens(*_commit(done=True)) is True
+    # The commit carries one accepted token per request; the device's post-update
+    # kernel advances num_computed by the same count, and so does the scheduler's
+    # host copy that the batch carries.
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_refusals == {}, f"refused: {st._ple_host_refusals}"
+    assert st._ple_host_steps == 1
+    assert st._ple_host_history.pending == 0
+    # The token the commit carried is now the newest cell of each slot's window,
+    # which is what the builder reads as row 0. (That the ids then follow is
+    # test_pure_decode_batch_reaches_the_layer's job, with hashed values.)
+    assert st.staged_rows() == [ROWS]
+    assert emb.lookup_calls == 1
+    hist = st._ple_host_history
+    assert (hist.window[0][-1], hist.window[3][-1]) == (7, 11)
+    assert (hist.length[0], hist.length[3]) == (_POSITION + 2, _POSITION + 2)
+
+
+def test_unlanded_commit_refuses_the_step_rather_than_waiting(hostids_env) -> None:
+    """The design's central bargain: no per-step host sync, so refuse instead.
+
+    A commit whose D2H has not landed means the newest token is not host-visible
+    yet. Blocking for it is the sync this whole path exists to remove; skipping it
+    would build ids one token short. Refusing the step costs the device path one
+    step and keeps the promise.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    slots, rows, counts, event = _commit(done=False)
+    assert st.stage_host_tokens(slots, rows, counts, event) is True
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_refusals.get("history-pending") == 1
+    assert st._ple_host_steps == 0
+    assert emb.lookup_calls == 0
+
+    # The copy lands; the same step now goes through, with the counter advanced
+    # by the commit it was waiting on.
+    event.done = True
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1
+    assert st._ple_host_history.pending == 0
+
+
+def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
+    """A commit that fails validation is dropped, and the exact-length check shows it.
+
+    The device advanced its counter whether or not the host mirror got the tokens,
+    so the mirror is one token short afterwards. The check must refuse the steps it
+    can no longer vouch for rather than build ids from a history with a hole in it
+    -- which is the same guarantee a full queue gives (``MAX_PENDING`` drops the new
+    commit), paid for here by one refused step instead of a wrong embedding.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    slots, rows, counts, event = _commit(done=True)
+    # A commit claiming more accepted tokens than the row holds.
+    assert (
+        st.stage_host_tokens(slots, rows, np.array([9, 1], dtype=np.int32), event)
+        is False
+    )
+    assert "stage-tokens-rejected" in st._ple_host_refusals
+
+    # The device advanced anyway, so the mirror now lags by exactly one token.
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_refusals.get("history-length") == 1
+    assert st._ple_host_steps == 0, "staged ids built from a history with a hole"
+
+    # The next commit closes the gap: two accepted tokens per request, and the
+    # counter advances by the same amount the device advanced.
+    assert (
+        st.stage_host_tokens(slots, rows, np.array([2, 2], dtype=np.int32), event)
+        is True
+    )
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1

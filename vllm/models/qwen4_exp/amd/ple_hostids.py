@@ -33,9 +33,15 @@ them per request, from three pieces it does have:
   mirror the host knows 1 of the 4 rows a speculative decode step feeds this
   layer, because ``spec_decode/utils.py`` deliberately never copies drafts to
   the host (``docs/d1-host-ids-design.md`` has the trace);
-* the per-request token history in ``req_states.all_token_ids._uva_buf.np``,
-  which is pinned host memory that the GPU also writes, and is where the
-  two-token ngram context comes from.
+* the per-request token history in :class:`HostTokenHistory`, a rolling window
+  fed from the host copy of ``sampled_token_ids`` that ``AsyncOutput`` already
+  makes. It is *not* ``req_states.all_token_ids._uva_buf.np``: that is genuinely
+  pinned host memory the accelerator view aliases, but its prompt region is
+  written host-side at add time while its generated region is written by a GPU
+  kernel (``input_batch.py:577``) unordered before a host read in
+  ``prepare_inputs``, so mid-decode the newest cells -- the only ones this path
+  needs -- are still zeros. The first differential boot caught exactly that on
+  2026-10-01; see ``HostTokenHistory`` for the mechanism and the fix.
 
 Bit-identity is the whole contract
 ----------------------------------
@@ -391,11 +397,215 @@ class HostIdsRefused(ValueError):
         self.reason = reason
 
 
+class _PendingCommit:
+    """One step's accepted tokens, waiting for its D2H to land.
+
+    Holds references rather than copies: copying ``sampled`` before its event
+    has completed is precisely the bug this class exists to avoid. ``slots`` and
+    ``num_sampled`` are copied at stage time because those come from persistent
+    buffers the runner overwrites on the next step, while ``sampled`` is a fresh
+    allocation per step made by ``async_copy_to_np``.
+    """
+
+    __slots__ = ("done", "num_sampled", "sampled", "slots")
+
+    def __init__(self, slots, sampled, num_sampled, done) -> None:  # noqa: ANN001
+        self.slots = slots
+        self.sampled = sampled
+        self.num_sampled = num_sampled
+        self.done = done
+
+
+class HostTokenHistory:
+    """The last ``width`` committed tokens of each request, on the host.
+
+    ``build_decode_step_inputs`` needs ``ngram_context_len + 1`` consecutive
+    tokens per request, ending at the newest committed one. ``width`` is exactly
+    that many, so ``window[slot]`` is the chronological tail of the request:
+    ``window[slot, -1]`` is the token the next step feeds as its first row and
+    ``window[slot, :-1]`` is its ngram context.
+
+    Why the sampled tokens are the right source, and not ``all_token_ids``.
+    The device appends generated tokens in ``_post_update_kernel``
+    (``input_batch.py:577``), which takes the first ``num_sampled[i]`` entries of
+    row i of ``sampler_output.sampled_token_ids`` and writes them at
+    ``total_len + i``. ``AsyncOutput`` (``async_utils.py``) copies *that same
+    tensor* and *those same counts* to host memory every step for output
+    processing, and under sync scheduling ``get_output()`` waits for it before
+    the scheduler produces the next step. So this class mirrors a copy the
+    worker already pays for: no extra D2H, no extra stream, and no wait at all --
+    :meth:`drain` only ever calls ``Event.query()``.
+
+    The trim rule is the device's trim rule on purpose: ``num_sampled`` is how
+    many of a row's sampled tokens were accepted, so a rejected draft is never
+    appended here either, and the window agrees with the device's history by
+    construction instead of by luck. ``length[slot]`` counts the same accepted
+    tokens, which is what lets the builder require exact agreement with
+    ``num_computed_tokens`` instead of trusting it.
+
+    Not thread safe and not meant to be: it is staged by the model runner's
+    epilogue and drained by the same worker thread at the top of the next step.
+    """
+
+    MAX_PENDING = 8
+    """Bound on queued commits.
+
+    Exceeding it drops the *new* commit, which makes the affected slots' lengths
+    lag. The builder's exact-length check turns that into a counted refusal, so
+    a drop costs coverage, never correctness. Eight steps of un-drained output
+    copies means the copy stream is a full step behind, which is a bug worth
+    seeing in the refusal counts rather than hiding behind a bigger bound.
+    """
+
+    def __init__(self, num_slots: int, width: int) -> None:
+        if num_slots <= 0 or width <= 0:
+            raise ValueError(
+                f"num_slots and width must be positive, got {num_slots}, {width}"
+            )
+        self.num_slots = int(num_slots)
+        self.width = int(width)
+        self.window = np.zeros((self.num_slots, self.width), dtype=np.int64)
+        self.length = np.zeros(self.num_slots, dtype=np.int64)
+        self._pending: list[_PendingCommit] = []
+        # Counted, not raised: a knob that can kill a boot is worse than one
+        # that reports its own coverage.
+        self.staged = 0
+        self.dropped = 0
+
+    def _check_slot(self, slot: int) -> None:
+        if slot < 0 or slot >= self.num_slots:
+            raise ValueError(f"slot {slot} outside 0..{self.num_slots - 1}")
+
+    def seed(self, slot: int, tokens: object) -> None:
+        """(Re)start a slot from the full token list the scheduler sends at add.
+
+        ``RequestState.add_request`` gets ``all_token_ids`` = prompt plus, for a
+        resumed request, the tokens already generated. Seeding from it is exact,
+        and it is also what makes a re-preempted request usable again: the
+        window is rebuilt from scratch, so a stale one can never survive a slot
+        being reused.
+        """
+        self._check_slot(slot)
+        values = np.asarray(tokens, dtype=np.int64).ravel()
+        self.length[slot] = int(values.size)
+        row = self.window[slot]
+        row[:] = 0
+        if values.size:
+            take = min(values.size, self.width)
+            row[self.width - take :] = values[values.size - take :]
+
+    def commit(self, slot: int, values: object) -> None:
+        """Append accepted tokens to a slot's window (empty is a no-op)."""
+        self._check_slot(slot)
+        row = np.asarray(values, dtype=np.int64).ravel()
+        n = int(row.size)
+        if n == 0:
+            return
+        self.length[slot] += n
+        w = self.window[slot]
+        if n >= self.width:
+            w[:] = row[n - self.width :]
+        else:
+            # Chronological left-to-right, newest at the right: drop the n
+            # oldest cells and shift the rest left. ``.copy()`` because the
+            # slices overlap and numpy does not promise correct behaviour for
+            # overlapping assignment.
+            w[: self.width - n] = w[n:].copy()
+            w[self.width - n :] = row
+
+    def invalidate(self, slot: int) -> None:
+        """Forget a slot, and drop any queued commit that would resurrect it.
+
+        A request removed while its step's copy is still in flight would
+        otherwise append its tokens to whoever reuses the slot next. The
+        exact-length check would catch that too, but it would catch it as a
+        permanent refusal for the new request -- so the queue is cleaned here.
+        """
+        self._check_slot(slot)
+        self.length[slot] = 0
+        self.window[slot] = 0
+        for entry in self._pending:
+            hit = entry.slots == slot
+            if hit.any():
+                entry.num_sampled = entry.num_sampled.copy()
+                entry.num_sampled[hit] = 0
+
+    def stage_step(
+        self,
+        slots: np.ndarray,
+        sampled: np.ndarray,
+        num_sampled: np.ndarray,
+        done: object,
+    ) -> bool:
+        """Queue one step's accepted tokens. Reads nothing, blocks on nothing.
+
+        ``done`` is the ``AsyncOutput`` copy event (anything with ``query()``,
+        including ``None`` for a caller whose data is already host-side, which is
+        how the tests stage synchronously).
+
+        Returns False -- and counts a drop -- on any inconsistency, because a
+        malformed commit would reorder a slot's history.
+        """
+        slots = np.asarray(slots)
+        num_sampled = np.asarray(num_sampled)
+        if (
+            sampled.ndim != 2
+            or slots.ndim != 1
+            or num_sampled.ndim != 1
+            or slots.shape[0] != sampled.shape[0]
+            or num_sampled.shape[0] != slots.shape[0]
+        ):
+            self.dropped += 1
+            return False
+        if slots.size and (int(slots.min()) < 0 or int(slots.max()) >= self.num_slots):
+            self.dropped += 1
+            return False
+        if num_sampled.size and (
+            int(num_sampled.min()) < 0 or int(num_sampled.max()) > sampled.shape[1]
+        ):
+            self.dropped += 1
+            return False
+        if len(self._pending) >= self.MAX_PENDING:
+            self.dropped += 1
+            return False
+        self._pending.append(
+            _PendingCommit(slots.copy(), sampled, num_sampled.copy(), done)
+        )
+        self.staged += 1
+        return True
+
+    def drain(self) -> int:
+        """Apply every queued commit whose copy has landed. Never blocks.
+
+        Stops at the first commit that has not landed: the window is append-only
+        per slot, so applying step N+1 before step N would put a request's
+        tokens in the wrong order.
+        """
+        applied = 0
+        while self._pending:
+            entry = self._pending[0]
+            if entry.done is not None and not entry.done.query():
+                break
+            self._pending.pop(0)
+            for i in range(int(entry.slots.size)):
+                n = int(entry.num_sampled[i])
+                if n:
+                    self.commit(int(entry.slots[i]), entry.sampled[i, :n])
+                    applied += 1
+        return applied
+
+    @property
+    def pending(self) -> int:
+        """Commits queued but not yet applied."""
+        return len(self._pending)
+
+
 def build_decode_step_inputs(
     idx_mapping_np: np.ndarray,
     num_scheduled_tokens_np: np.ndarray,
     num_computed_tokens_np: np.ndarray,
-    all_token_ids_np: np.ndarray,
+    history_window_np: np.ndarray,
+    history_len_np: np.ndarray,
     draft_values_np: np.ndarray | None,
     draft_row_idx: np.ndarray | None,
     *,
@@ -416,27 +626,36 @@ def build_decode_step_inputs(
       deltas are the same number (the accepted rows). So a request carries
       exactly one more stored token than it has computed tokens, and the stored
       token the next step feeds first is the one at index
-      ``num_computed_tokens`` of ``all_token_ids`` -- which the GPU wrote into
-      the UVA mirror at the end of the previous step.
+      ``num_computed_tokens`` -- the newest committed token, held here in
+      ``history_window_np[slot, -1]``.
     * **The context window is the ``ngram_context_len`` tokens strictly before
       that index**, EOS-filled on the left. That is ``_prepare_ngram_context``
       reproduced: ``context_end = num_computed_tokens``, offsets
-      ``arange(-context_len, 0)``, ``where(idx >= 0, token, eos)``. Reading it
-      from ``all_token_ids_np`` rather than ``.gpu`` is the whole point -- same
-      pages, no stream-ordered read.
+      ``arange(-context_len, 0)``, ``where(idx >= 0, token, eos)``. Both come
+      from :class:`HostTokenHistory` rather than from
+      ``req_states.all_token_ids``: that buffer's generated region is written by
+      a GPU kernel that is not ordered before this host read, so reading it
+      mid-decode yields zeros for exactly the newest cells. See the module
+      docstring; the first differential boot proved it.
     * **Rows 1..q-1 are this step's drafts** and are deliberately *not* in
       ``all_token_ids`` (they are speculative, only the accepted prefix is
       committed). They come from the pinned mirror staged at the previous step's
       epilogue, addressed by the row index that mirror published -- never by
       batch position.
 
-    The one thing this function cannot check is that ``num_computed_tokens_np``
-    equals the device's ``num_computed_tokens``: the two are updated by different
-    code (the scheduler here, ``_post_update_kernel`` there) and
-    ``states.py`` calls the host one an *optimistic upper bound*. A disagreement
-    would shift every id this function produces and nothing here would notice,
-    so the consumer must run in differential mode (compare against the device's
-    own ids) before this path is trusted for serving.
+    What the exact-length check proves. ``num_computed_tokens_np`` is updated by
+    the scheduler here and by ``_post_update_kernel`` on the device, and
+    ``states.py`` calls the host one an *optimistic upper bound*; until P1.6
+    nothing here could notice a disagreement, which is why differential mode
+    (mode 2) was mandatory. ``history_len_np[slot]`` counts accepted tokens by a
+    third path -- the same ``num_sampled`` the post-update kernel consumes, summed
+    host-side -- so requiring ``history_len == num_computed + 1`` makes two
+    independently-maintained counters prove each other's arithmetic before a
+    single id is built. Disagreement of either kind, lag or lead, is a refusal.
+
+    Differential mode is still the gate on this function: agreeing counters is
+    not the same as agreeing ids, and only a comparison against the device's own
+    ``_compute_ngram_ids`` output can show the reproduction is exact.
 
     Raises:
         HostIdsRefused: any batch shape this function has not been shown to
@@ -457,8 +676,28 @@ def build_decode_step_inputs(
             f"num_scheduled_tokens has {num_scheduled_tokens_np.size} "
             f"entries for {num_reqs} requests",
         )
-    if all_token_ids_np.ndim != 2:
-        raise HostIdsRefused("layout", "all_token_ids_np must be 2D")
+    if history_window_np.ndim != 2:
+        raise HostIdsRefused("layout", "history_window_np must be 2D")
+    num_slots, width = (
+        int(history_window_np.shape[0]),
+        int(history_window_np.shape[1]),
+    )
+    if width < ngram_context_len + 1:
+        # The window has to hold the context *and* the token at the current
+        # position. A narrower window means the producer and this reader
+        # disagree about what ``ngram_context_len`` counts, which is the same
+        # class of mistake as the column identity in compute_ngram_ids_host:
+        # refuse, do not compute from a shifted window.
+        raise HostIdsRefused(
+            "window-width",
+            f"history window is {width} wide, need ngram_context_len + 1 "
+            f"= {ngram_context_len + 1}",
+        )
+    if int(history_len_np.size) < num_slots:
+        raise HostIdsRefused(
+            "layout",
+            f"history_len has {history_len_np.size} entries for {num_slots} slots",
+        )
 
     slots = np.asarray(idx_mapping_np, dtype=np.int64)
     if (slots < 0).any():
@@ -480,16 +719,26 @@ def build_decode_step_inputs(
     # previous step's batch may be larger, smaller, or shifted relative to this
     # one, and a slot appears at most once per batch, so a scatter into a
     # max_num_reqs-sized table is exact and costs one fill per step.
-    row_of_slot = np.full(int(all_token_ids_np.shape[0]), -1, dtype=np.int64)
+    row_of_slot = np.full(num_slots, -1, dtype=np.int64)
     staged_slots = np.asarray(draft_row_idx, dtype=np.int64)
     if staged_slots.size and int(staged_slots.max()) >= row_of_slot.size:
         raise HostIdsRefused("layout", "staged row index out of range")
     row_of_slot[staged_slots] = np.arange(staged_slots.size, dtype=np.int64)
 
     positions = np.asarray(num_computed_tokens_np, dtype=np.int64)[slots]
-    if (positions < 0).any() or (positions >= all_token_ids_np.shape[1]).any():
-        # Also catches a wildly optimistic host mirror of the device counter.
+    if (positions < 0).any():
         raise HostIdsRefused("position-out-of-range", f"positions {positions.tolist()}")
+    lengths = np.asarray(history_len_np, dtype=np.int64)[slots]
+    if not bool((positions == lengths - 1).all()):
+        # The window holds tokens 0..length-1 of the request, so the position
+        # this step reads must be length-1. A lag means an un-drained commit or a
+        # host counter that raced ahead of the device; a lead means the opposite.
+        # Either way every id would be built from a shifted context, which is
+        # unobservable downstream and therefore worth refusing a step over.
+        raise HostIdsRefused(
+            "history-length",
+            f"positions {positions.tolist()} != committed-1 {(lengths - 1).tolist()}",
+        )
 
     total_tokens = int(queries.sum())
     input_ids = np.empty(total_tokens, dtype=np.int64)
@@ -509,16 +758,19 @@ def build_decode_step_inputs(
             # safe answer: the device would use this step's real drafts.
             raise HostIdsRefused("row-missing", f"slot {slot} had no staged draft")
 
-        start_of_context = pos - ngram_context_len
-        if start_of_context >= 0:
-            ngram_context[i] = all_token_ids_np[slot, start_of_context:pos]
-        elif pos > 0:
-            # Left-EOS-fill, exactly the device's where(idx >= 0, token, eos).
-            ngram_context[i, ngram_context_len - pos :] = all_token_ids_np[slot, 0:pos]
+        # ``min(ngram_context_len, pos)`` cells of the window are real tokens;
+        # the rest of the context is the device's eos fill (its
+        # ``where(idx >= 0, token, eos)`` over ``context_end + offsets``).
+        real = min(ngram_context_len, pos)
+        if real:
+            window_row = history_window_np[slot]
+            ngram_context[i, ngram_context_len - real :] = window_row[
+                width - 1 - real : width - 1
+            ]
 
         start = int(query_start_loc[i])
         end = int(query_start_loc[i + 1])
-        input_ids[start] = all_token_ids_np[slot, pos]
+        input_ids[start] = history_window_np[slot, width - 1]
         input_ids[start + 1 : end] = draft_values_np[row, : end - start - 1]
 
     return input_ids, query_start_loc, ngram_context
@@ -527,6 +779,7 @@ def build_decode_step_inputs(
 __all__ = [
     "PADDING_SENTINEL",
     "HostIdsRefused",
+    "HostTokenHistory",
     "build_decode_step_inputs",
     "compute_ngram_ids_host",
     "gen_verdict",

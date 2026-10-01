@@ -647,6 +647,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             self.model_state.set_host_draft_source(self.draft_tokens_handler)
 
+        # P1.6: the same producer also needs the epilogue's accepted-token handoff.
+        # Resolved to a bound method once rather than looked up per step, and left
+        # as None for every model state that does not define it, so a non-Qwen4Exp
+        # boot pays nothing at the end of a step.
+        self._ple_stage_host_tokens = getattr(
+            self.model_state, "stage_host_tokens", None
+        )
+
         self.decode_query_len = (
             self.num_speculative_steps
             + self.model_state.num_new_sampled_tokens_per_step
@@ -2169,6 +2177,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
         )
+        # P1.6: hand the host PLE mirror the tokens this step committed. This is
+        # the same device tensor ``_post_update_kernel`` appends from, copied to
+        # host memory a few lines above for output processing, so the mirror costs
+        # no extra D2H, no extra stream and no wait: the commit carries the copy
+        # event and the consumer only ever polls it. No-op unless
+        # VLLM_GFX906_PLE_HOSTIDS is set.
+        stage_host_tokens = self._ple_stage_host_tokens
+        if stage_host_tokens is not None:
+            stage_host_tokens(
+                input_batch.idx_mapping_np[: input_batch.num_reqs],
+                async_output.sampled_token_ids,
+                async_output.num_sampled_tokens_np,
+                async_output.copy_event,
+            )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
