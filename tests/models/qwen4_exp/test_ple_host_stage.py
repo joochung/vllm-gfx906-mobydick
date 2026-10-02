@@ -1725,6 +1725,59 @@ def test_the_refusal_names_the_position_and_both_values(caplog) -> None:
     assert "handed over no device window" in text, text
 
 
+def test_the_refusal_prints_both_id_arrays_so_rows_can_be_attributed(caplog) -> None:
+    """P1.13: a refusal has to name rows, not only a position.
+
+    Boot #11's single sign of the per-pass patchwork was
+    ``input_ids differ at 0 of 8 ... (2 of 8 positions)``. That proves the ids buffer
+    the op read is not the one the worker staged, but it cannot say *which row* is
+    foreign, and "which row was authored by which pass" is the only question the
+    differential has left. Rows are contiguous groups of ``heads_per_ngram`` in the
+    flat array, so printing both arrays turns the refusal into the map -- and it is
+    free at the only size this path runs (a compared step is pure decode, so the
+    array is ``requests * (num_spec + 1)`` long).
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    ran_ids = np.arange(ROWS, dtype=np.int64) + 100
+    emb._host_check_inputs = (
+        ran_ids,
+        np.array([0, 3, 6], dtype=np.int64),
+        np.zeros((ROWS, CTX), dtype=np.int64),
+    )
+    other = ran_ids.copy()
+    other[1] = 4
+    other[4] = 7
+    emb._host_check_dev_inputs = (
+        torch.from_numpy(other),
+        torch.from_numpy(np.array([0, 3, 6], dtype=np.int64)),
+        None,
+    )
+
+    emb.compare_host_ids(torch.from_numpy(host_ids.copy()), emb._host_check_dev_inputs)
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "(2 of 6 positions)" in text, text
+    assert "device_ids=[100, 4, 102, 103, 7, 105]" in text, text
+    assert "host_ids=[100, 101, 102, 103, 104, 105]" in text, text
+
+
+def test_the_id_array_render_is_bounded_and_says_so() -> None:
+    """A diagnostic on this path must not be able to grow with the batch.
+
+    The cap is only honest if the line admits it fired: a truncation that looks like
+    the whole array is worse than no array, because the reader counts rows in what
+    they can see.
+    """
+    short = ple_layer_module._bounded_ids(np.arange(6))
+    assert short == "[0, 1, 2, 3, 4, 5]", short
+    long_ = ple_layer_module._bounded_ids(np.arange(20), cap=16)
+    assert long_.endswith(", ... +4 more]"), long_
+    assert ", 16]" not in long_, long_
+
+
 def test_a_padded_query_boundary_beyond_the_host_rows_is_not_a_disagreement() -> None:
     """The gate has to be able to go green, or every refusal test is vacuous.
 

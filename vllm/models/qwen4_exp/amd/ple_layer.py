@@ -473,6 +473,24 @@ class MmapShardedNGramEmbedding(nn.Module):
         out.index_copy_(0, order, gathered)
 
 
+def _bounded_ids(arr, cap: int = 16) -> str:
+    """Render an ids array for a log line, with any truncation visible.
+
+    A refusal that names only the first differing pair proves the buffer is not the
+    host's, but not *which row* is foreign -- and under a drafter "which row, which
+    pass" is the only question left (boot #11's whole contribution was a refusal that
+    could not be attributed that far).  Rows are contiguous groups of
+    ``heads_per_ngram`` in the flat array, so the array is the map.  The cap and the
+    explicit ``+N more`` marker are here because a log line on this path must not be
+    able to grow with the batch, and a dump that silently stops at a limit reads as a
+    complete one.
+    """
+    flat = [int(v) for v in np.asarray(arr).reshape(-1).tolist()]
+    if len(flat) <= cap:
+        return str(flat)
+    return str(flat[:cap])[:-1] + f", ... +{len(flat) - cap} more]"
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -1410,7 +1428,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             detail = (
                 f"input_ids differ at {first} of {n}: device={int(dev_ids[first])} "
                 f"host={int(h_ids[first])} "
-                f"({int(ids_diff.sum())} of {n} positions)"
+                f"({int(ids_diff.sum())} of {n} positions) "
+                f"device_ids={_bounded_ids(dev_ids)} "
+                f"host_ids={_bounded_ids(h_ids)}"
             )
         else:
             first = int(np.argmax(qsl_diff))
