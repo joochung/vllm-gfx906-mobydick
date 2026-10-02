@@ -284,6 +284,60 @@ def ple_hostids_async_conflict(
     )
 
 
+ENV_ALLOW_HOSTIDS_MTP = "VLLM_GFX906_ALLOW_HOSTIDS_MTP"
+"""Set to 1 to run VLLM_GFX906_PLE_HOSTIDS with speculative decoding anyway."""
+
+
+def ple_hostids_mtp_conflict(
+    num_speculative_tokens: int, environ: dict[str, str] | None = None
+) -> str | None:
+    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` cannot be correct under MTP, or None.
+
+    With ``num_speculative_tokens = k`` the PLE op runs ``k + 1`` times per step --
+    the main pass plus one pass per drafter iteration -- and each pass writes only
+    the rows it computed into one static ids buffer sized to the capture size. The
+    buffer is therefore a patchwork of passes, not the output of any single query.
+    Measured on this box (2026-10-01 22:20:51, boot ``vllm.log.20261001-215123``,
+    all four TP workers, inverted exactly by
+    ``scripts/invert-mismatch-2220b.py``): the host
+    staged a step whose query was ``[760, 1156, 2640, 343]`` while rows 2-3 of the
+    device's ids buffer hash to ``[*, 4, 2640, 343]`` -- a different pass's draft at
+    row 1 -- and row 1 of the same buffer agrees with the *host*, which no single
+    compute can do. So rows 1 and 2 were authored by different passes.
+
+    That is a correctness problem for the staged path, not just for the comparison:
+    the staged branch is taken on row-count agreement (``staged == n``), so a
+    drafter pass with the same row count and different tokens consumes embeddings
+    the host gathered for another pass's query. The ids stay in range, the gather
+    hits real rows, and the model is handed an embedding computed from the wrong
+    context -- the same silent-wrong-answer class as a captured graph replaying a
+    stale PLE embedding (mtp-cudagraph-profile-crash.md 13.2). The generation
+    tripwire cannot see it either, because it checks the draft provenance and the
+    row count, and here both agree.
+
+    Refusing at config time rather than shipping a knob that can be silently wrong
+    is the house pattern (see ``ple_hostids_async_conflict``). A differential boot
+    gets a valid answer by running without ``--speculative-config``: one PLE pass
+    per step makes the ids buffer coherent again.
+    """
+    env = os.environ if environ is None else environ
+    if num_speculative_tokens < 1 or env.get(ENV_PLE_HOSTIDS, "0") in ("0", ""):
+        return None
+    if env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
+        return None
+    return (
+        f"{ENV_PLE_HOSTIDS} cannot be correct with speculative decoding: "
+        f"num_speculative_tokens={num_speculative_tokens} means the PLE op runs "
+        f"{num_speculative_tokens + 1} times per step and each pass overwrites "
+        "only the rows it computed in one static ids buffer, so the buffer is a "
+        "patchwork of passes; a pass whose row count matches the staged one "
+        "consumes embeddings gathered for a different query and gets a plausible "
+        "answer built from the wrong tokens. Run the differential on a boot "
+        "without --speculative-config, unset the variable, or set "
+        f"{ENV_ALLOW_HOSTIDS_MTP}=1 to accept that risk deliberately."
+    )
+
+
 def gdn_async_ordering_risk(cfg: "VllmConfig") -> str | None:
     """Return why async scheduling is unsafe for this config, or None.
 
@@ -1463,6 +1517,16 @@ class VllmConfig:
             )
         ) is not None:
             raise ValueError(hostids_conflict)
+
+        # GFX906: and it cannot be correct under MTP either, because the ids
+        # buffer it compares against (and the staged rows it would serve) are
+        # per-pass, not per-step. Same reason, same shape of refusal.
+        if self.speculative_config is not None:
+            mtp_conflict = ple_hostids_mtp_conflict(
+                self.speculative_config.num_speculative_tokens or 0
+            )
+            if mtp_conflict is not None:
+                raise ValueError(mtp_conflict)
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
