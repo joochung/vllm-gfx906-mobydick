@@ -285,7 +285,9 @@ def ple_hostids_async_conflict(
 
 
 ENV_ALLOW_HOSTIDS_MTP = "VLLM_GFX906_ALLOW_HOSTIDS_MTP"
-"""Set to 1 to run VLLM_GFX906_PLE_HOSTIDS with speculative decoding anyway."""
+"""Set to 1 to run the PLE host-ids *differential* (``VLLM_GFX906_PLE_HOSTIDS=2``)
+under speculative decoding. It does not open mode 1: serving host rows that were
+gathered for a different pass has no acceptable risk level to accept."""
 
 
 def ple_hostids_mtp_conflict(
@@ -316,25 +318,74 @@ def ple_hostids_mtp_conflict(
     row count, and here both agree.
 
     Refusing at config time rather than shipping a knob that can be silently wrong
-    is the house pattern (see ``ple_hostids_async_conflict``). A differential boot
-    gets a valid answer by running without ``--speculative-config``: one PLE pass
-    per step makes the ids buffer coherent again.
+    is the house pattern (see ``ple_hostids_async_conflict``).
+
+    The remedy this guard first printed -- "run the differential on a boot without
+    ``--speculative-config``" -- was measured to be wrong on 2026-10-02, and a
+    guard's remedy is part of the guard: it cost five boot attempts across two
+    boots (``234242``: two APIServer pids; ``065905``: three), all five dying at
+    the same line. A drafter-off boot cannot answer the question the differential
+    asks, twice over. (1) It compares nothing: the host mirror's only window into
+    the token stream is ``draft_tokens_handler`` (``gpu/model_runner.py`` binds
+    ``_host_drafts`` from it, because P1.6 reuses the one per-step host copy that
+    is already being paid), so with no drafter every step refuses with
+    ``no-draft-source`` -- ``logs/vllm.log.20261002-065905``, all four TP workers,
+    during ``profile_run``. (2) It does not compile: ``ConstraintViolationError:
+    L['input_ids'].size()[0] ... specialized to be a constant (4096)`` at
+    ``profile_run`` -> ``aot_compile`` -> ``build_guards``; the only two logs in
+    this box's corpus that contain the exception at all are the two drafter-off
+    ``HOSTIDS=2`` boots (``20261001-234242``, ``20261002-065905``), and the error
+    is deterministic so retrying does not help.
+
+    Differential mode under MTP with the override is therefore not merely the
+    least-bad option, it is the only configuration in which a comparison can
+    happen -- and it is safe in a way mode 1 is not:
+    ``ple_layer.Qwen4ExpPLELayer.stage_host_step(gather=False)`` returns before
+    ``_host_stage_rows``, ``_pinned_output`` and the generation counter are
+    touched, so mode 2 cannot take the staged branch. It can only compare, and the
+    input-agreement gate refuses the passes whose arrays do not describe the same
+    work. Mode 1, which serves the host's rows to the model, gets no override.
     """
     env = os.environ if environ is None else environ
-    if num_speculative_tokens < 1 or env.get(ENV_PLE_HOSTIDS, "0") in ("0", ""):
+    mode = env.get(ENV_PLE_HOSTIDS, "0")
+    if num_speculative_tokens < 1 or mode in ("0", ""):
         return None
-    if env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
+    # The override opens differential mode only. Under MTP the host cannot say
+    # which pass it staged its rows for, so for mode 1 "I accept that risk" is not
+    # an informed answer: an escape hatch onto a silent-wrong-answer path is the
+    # bug with a permission slip, not a guard.
+    if mode == "2" and env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
         return None
-    return (
+    mechanism = (
         f"{ENV_PLE_HOSTIDS} cannot be correct with speculative decoding: "
         f"num_speculative_tokens={num_speculative_tokens} means the PLE op runs "
         f"{num_speculative_tokens + 1} times per step and each pass overwrites "
         "only the rows it computed in one static ids buffer, so the buffer is a "
-        "patchwork of passes; a pass whose row count matches the staged one "
-        "consumes embeddings gathered for a different query and gets a plausible "
-        "answer built from the wrong tokens. Run the differential on a boot "
-        "without --speculative-config, unset the variable, or set "
-        f"{ENV_ALLOW_HOSTIDS_MTP}=1 to accept that risk deliberately."
+        "patchwork of passes. "
+    )
+    if mode == "2":
+        return mechanism + (
+            "Differential mode only compares and never serves host rows, so under "
+            "MTP the patchwork is a question you can ask instead of an answer you "
+            f"serve: set {ENV_ALLOW_HOSTIDS_MTP}=1 to run it, and the "
+            "input-agreement gate refuses the passes it cannot attribute. Do NOT "
+            "drop --speculative-config instead -- that route does not work on this "
+            "engine (measured 2026-10-02): with no drafter the host has no token "
+            "source, so every step refuses with 'no-draft-source' and there is "
+            "nothing to compare, and drafter-off boots fail to compile "
+            "(ConstraintViolationError: input_ids specialized to 4096). "
+            "logs/vllm.log.20261001-234242, logs/vllm.log.20261002-065905."
+        )
+    return mechanism + (
+        "This is mode 1, which serves the host's rows: a pass whose row count "
+        "matches the staged one consumes embeddings gathered for a different query "
+        "and hands the model a plausible answer built from the wrong tokens, and "
+        "the host cannot say which pass it staged for -- so there is no override "
+        f"for it. Run the comparison instead: {ENV_PLE_HOSTIDS}=2 with "
+        f"{ENV_ALLOW_HOSTIDS_MTP}=1, or unset {ENV_PLE_HOSTIDS}. Dropping "
+        "--speculative-config does not work on this engine either (measured "
+        "2026-10-02): with no drafter the host has no token source, so every step "
+        "refuses with 'no-draft-source', and drafter-off boots do not compile."
     )
 
 
