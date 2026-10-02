@@ -381,12 +381,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
             # both sides are in scope. forward() cannot do it: torch.compile runs
             # that body at trace time, so anything stashed there is a trace-time
             # value. The runner's own arrays are padded, so the dump slices them
-            # to the host's lengths. No ctx counterpart is passed: the rows that
-            # need no draft columns agree, which is what exonerates the window.
+            # to the host's lengths.
+            #
+            # The window is handed over as a reference to the state's own buffer,
+            # not as a copy, and that is the whole reason it can be compared at all:
+            # prepare_inputs() fills ``ngram_context`` via ``_prepare_ngram_context``
+            # and *then* calls this staging function, so by the time the op reads the
+            # buffer back it holds this step's window -- the same cells the forward
+            # was handed a view of. An earlier version of this file claimed the
+            # worker had no device-side counterpart for the window and passed None;
+            # boot #8's inversion put the one wrong term exactly in the cell that
+            # window feeds, so the claim went looking for its evidence and failed.
             d_ids = getattr(input_batch, "input_ids", None)
             d_qsl = getattr(input_batch, "query_start_loc", None)
+            d_ctx = getattr(self, "ngram_context", None)
             if d_ids is not None and d_qsl is not None:
-                device_inputs = (d_ids, d_qsl, None)
+                device_inputs = (d_ids, d_qsl, d_ctx)
         for layer in self._ple_host_layers:
             try:
                 layer.stage_host_step(

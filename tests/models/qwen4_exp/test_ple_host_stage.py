@@ -109,6 +109,7 @@ class StagingEmbedding:
     check_host_gen = Qwen4ExpNGramEmbedding.check_host_gen
     _fire_gen = Qwen4ExpNGramEmbedding._fire_gen
     _inputs_agree = Qwen4ExpNGramEmbedding._inputs_agree
+    _ctx_leg = Qwen4ExpNGramEmbedding._ctx_leg
     _note_input_refusal = Qwen4ExpNGramEmbedding._note_input_refusal
 
     def __init__(self, rows: int = ROWS, capacity: int = CAPACITY) -> None:
@@ -159,6 +160,11 @@ class StagingEmbedding:
         # were both observers of a region the AOT cache decides how to run.
         self._host_input_checks = 0
         self._host_input_skips = 0
+        # P1.11: steps where the device window was never handed over, so the third
+        # leg stayed dark. Mirrors the production __init__ for the same reason the
+        # other counters do -- the gate prints it, so a stand-in without it is a
+        # stand-in whose log lines cannot be rendered.
+        self._host_ctx_unchecked = 0
 
     @property
     def ngram_embedding(self):  # noqa: ANN201
@@ -881,18 +887,21 @@ def _agree_inputs(emb, *, rows: int = ROWS) -> None:
     """
     host_ids = np.arange(rows, dtype=np.int64) + 100
     host_qsl = np.array([0, rows // 2, rows], dtype=np.int64)
-    emb._host_check_inputs = (
-        host_ids,
-        host_qsl,
-        np.zeros((rows, CTX), dtype=np.int64),
-    )
+    host_ctx = np.zeros((rows, CTX), dtype=np.int64)
+    emb._host_check_inputs = (host_ids, host_qsl, host_ctx)
     pad = max(0, CAPACITY - host_qsl.shape[0])
     emb._host_check_dev_inputs = (
         torch.from_numpy(host_ids.copy()),
         torch.from_numpy(
             np.concatenate([host_qsl, np.full(pad, rows, dtype=np.int64)])
         ),
-        None,
+        # P1.11: a window the device agrees with, padded to buffer capacity the way
+        # ``Qwen4ExpModelState.ngram_context`` is. Handing None here instead would
+        # exercise the unchecked leg, not the compared one, and every green test in
+        # this file would silently be testing two legs out of three.
+        torch.from_numpy(
+            np.concatenate([host_ctx, np.zeros((CAPACITY - rows, CTX), np.int64)])
+        ),
     )
 
 
@@ -1705,9 +1714,11 @@ def test_the_refusal_names_the_position_and_both_values(caplog) -> None:
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "SKIPPED a comparison" in text, text
     assert "input_ids differ at 1 of 6: device=4 host=101" in text, text
-    # The other half of the honesty rule: ctx is never compared, and the line says
-    # so instead of implying the whole input surface was checked.
-    assert "ngram context is never compared" in text, text
+    # The other half of the honesty rule: the line says what the gate checked. It
+    # used to confess that the window was never compared; P1.11 compares it when the
+    # worker hands it over, and counts the steps where it does not.
+    assert "ngram context is never compared" not in text, text
+    assert "handed over no device window" in text, text
 
 
 def test_a_padded_query_boundary_beyond_the_host_rows_is_not_a_disagreement() -> None:
@@ -1836,3 +1847,355 @@ def test_the_device_query_boundaries_are_printed_whole(caplog) -> None:
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "qsl host=[0, 3, 6] device=[0, 3, 6, 6, 6]" in text, text
     assert emb._host_input_checks == 1
+
+
+# ---------------------------------------------------------------------------
+# P1.11: the window leg
+#
+# Boot #8's CRT inversion put the single wrong term exactly in the cell the
+# per-request ngram window feeds: the host mirrored 1156 where the device read 4.
+# Every other input agreed, and the gate could not say anything about the window
+# because it had convinced itself the worker had no device-side counterpart for
+# it. It has one -- Qwen4ExpModelState owns the buffer, fills it, and hands a view
+# of it to the forward -- so these tests pin the third leg: window agreement is
+# required for a comparison to run, a window refusal is refused rather than
+# blamed, and a window nobody handed over is announced instead of assumed.
+# ---------------------------------------------------------------------------
+
+
+def _window_case(
+    emb: StagingEmbedding,
+    *,
+    host_ctx: np.ndarray,
+    dev_ctx: Any,
+    qsl: Any = None,
+    ids_differ: bool = False,
+) -> None:
+    """Line up ids and qsl so only the window can disagree.
+
+    The gate checks ids and query boundaries first and returns on the first
+    disagreement, so a window test that also had a token difference would be
+    testing the token check. Everything here is equal except what is passed in.
+    """
+    ids = np.arange(ROWS, dtype=np.int64) + 100
+    bounds = np.array([0, 3, 6], dtype=np.int64) if qsl is None else qsl
+    ngram = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    if ids_differ:
+        ngram = ngram.copy()
+        ngram[2, 0] = -1
+    emb._host_check_ids = torch.from_numpy(ngram)
+    emb._host_check_rows = ROWS
+    emb._host_check_inputs = (ids, bounds, host_ctx)
+    emb._host_check_dev_inputs = (
+        torch.from_numpy(ids.copy()),
+        torch.from_numpy(np.asarray(bounds, dtype=np.int64)),
+        dev_ctx,
+    )
+
+
+def test_a_window_the_device_does_not_have_refuses_the_comparison() -> None:
+    """One cell of the window differs: the host mirrored a different prompt.
+
+    The ids the host computed are then a function of tokens the device never read,
+    so calling the difference a mirror bug would be blaming the wrong suspect --
+    which is precisely the mistake the boot #6 analysis almost made.
+    """
+    emb = StagingEmbedding()
+    host_ctx = np.zeros((ROWS, CTX), dtype=np.int64)
+    dev_ctx = np.zeros((CAPACITY, CTX), dtype=np.int64)
+    dev_ctx[1, 0] = 4  # the boot #8 shape: a stale cell where the host has a token
+    _window_case(emb, host_ctx=host_ctx, dev_ctx=torch.from_numpy(dev_ctx))
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    assert emb._host_input_skips == 1, "the window leg did not refuse"
+    assert emb._host_id_mismatches == 0, "a refused comparison became a verdict"
+    assert emb._host_id_matches == 0
+    assert emb._hostids_disabled is False
+
+
+def test_the_window_refusal_names_the_request_cell_and_both_values(
+    caplog,
+) -> None:
+    """A refusal a reader cannot check is a refusal that has to be re-proven.
+
+    The window is per request, so the position has to be (request, cell) and not a
+    flat index: a flat index would be read as a token row, and the two domains are
+    already the most confused pair in this feature.
+    """
+    emb = StagingEmbedding()
+    host_ctx = np.zeros((ROWS, CTX), dtype=np.int64)
+    host_ctx[1, 0] = 1156
+    dev_ctx = host_ctx.copy()
+    dev_ctx[1, 0] = 4
+    _window_case(emb, host_ctx=host_ctx, dev_ctx=torch.from_numpy(dev_ctx))
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ngram_context differs at request 1 cell 0: host=1156 device=4" in text, text
+
+
+def test_a_window_nobody_handed_over_still_compares_ids_and_says_so(
+    caplog,
+) -> None:
+    """The third leg being dark is not the same as the third leg passing.
+
+    An integration that does not hand over the buffer (a stub, or an older caller)
+    must still get the ids and query verdict -- refusing everything would turn a
+    missing diagnostic into a disabled feature. But the step is counted, and the
+    first one is logged, so nobody reads a green gate as a full one.
+    """
+    emb = StagingEmbedding()
+    _window_case(emb, host_ctx=np.zeros((ROWS, CTX), dtype=np.int64), dev_ctx=None)
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    assert emb._host_input_checks == 1, "the ids verdict was withdrawn with the window"
+    assert emb._host_id_mismatches == 0
+    assert emb._host_ctx_unchecked == 1
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "the ngram context is NOT compared" in text, text
+
+
+def test_a_window_with_fewer_requests_than_the_host_refuses(
+    caplog,
+) -> None:
+    """A window for three requests cannot describe a step of six.
+
+    Slicing it to the host's length would compare a prefix of something else and
+    call the result agreement -- the same rule the ids buffer applies.
+    """
+    emb = StagingEmbedding()
+    _window_case(
+        emb,
+        host_ctx=np.zeros((ROWS, CTX), dtype=np.int64),
+        dev_ctx=torch.zeros((3, CTX), dtype=torch.long),
+    )
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    assert emb._host_input_skips == 1
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "device ngram_context describes 3 requests, the host step has 6" in text
+
+
+def test_a_window_of_a_different_width_refuses() -> None:
+    """A three-cell window is a different ngram_size, not a longer window."""
+    emb = StagingEmbedding()
+    _window_case(
+        emb,
+        host_ctx=np.zeros((ROWS, CTX), dtype=np.int64),
+        dev_ctx=torch.zeros((CAPACITY, CTX + 1), dtype=torch.long),
+    )
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    assert emb._host_input_skips == 1
+
+
+def test_all_three_legs_agree_and_no_leg_calls_itself_unchecked() -> None:
+    """The green path has to be reachable with all three legs present.
+
+    Without this, every refusal test above could be passing because the gate
+    refuses everything -- the failure mode that makes a red control worthless.
+    """
+    emb = StagingEmbedding()
+    _agree_inputs(emb)
+    # The helper states what both sides read; this is the staged ids buffer the
+    # compare runs against, and the row count that says a step is pending. Without
+    # them compare_host_ids returns before the gate, which is how this test first
+    # failed: a green path that never reached the gate.
+    emb._host_check_ids = torch.from_numpy(
+        np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    )
+    emb._host_check_rows = ROWS
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    assert emb._host_input_checks == 1
+    assert emb._host_input_skips == 0
+    assert emb._host_ctx_unchecked == 0, "the window leg reported itself unchecked"
+    assert emb._host_id_mismatches == 0
+    assert emb._host_id_matches == 1, "agreement on inputs did not become a match"
+
+
+def test_the_dump_prints_the_window_the_device_read(caplog) -> None:  # noqa: ANN
+    """ "A dump now shows the window the mismatching rows extended into.
+
+    Boot #8's line printed ``ctx host=[248068, 198] device=n/a``, so the analysis
+    had to invert the ids by hand to learn what the device had used for the
+    left-context term. Note what this line can and cannot show: a dump only ever
+    runs on a comparison the gate attributed, and after P1.11 the gate attributes
+    one only when the windows already matched -- so the two halves print equal by
+    construction. The point is not that they differ, it is that the reader can see
+    the cells the device read instead of taking the host's word for them, and that
+    a missing side still says which one is missing. The window is printed whole
+    (every request, both cells) because it is per request and tiny; slicing it by
+    token row would be a category error.
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[2, 0] = -1
+    host_ctx = np.zeros((2, CTX), dtype=np.int64)
+    host_ctx[0] = [248068, 198]
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    ran_ids = np.arange(ROWS, dtype=np.int64) + 100
+    emb._host_check_inputs = (ran_ids, np.array([0, 3, 6], dtype=np.int64), host_ctx)
+
+    emb.compare_host_ids(
+        torch.from_numpy(dev_ids),
+        (
+            torch.from_numpy(ran_ids),
+            torch.from_numpy(np.array([0, 3, 6], dtype=np.int64)),
+            torch.from_numpy(host_ctx.copy()),
+        ),
+    )
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ctx host=[[248068, 198], [0, 0]]" in text, text
+    assert "device=[[248068, 198], [0, 0]]" in text, text
+    assert "no device window handed over" not in text, text
+    assert "input gate: agreed" in text, text
+
+
+def test_an_unattributed_window_mismatch_never_reaches_the_dump(caplog) -> None:  # noqa: ANN
+    """The refuse-not-disable rule, seen from the dump's side.
+
+    A window disagreement means the host mirrored a different prompt, so printing
+    the ids diff next to it would put a formula-looking diagnosis beside a sentence
+    that says the inputs were different. The comparison is refused and the ids are
+    never printed at all.
+    """
+    emb = StagingEmbedding()
+    host_ctx = np.zeros((2, CTX), dtype=np.int64)
+    host_ctx[0] = [248068, 198]
+    dev_ctx = host_ctx.copy()
+    dev_ctx[0] = [248068, 4]
+    _window_case(
+        emb,
+        host_ctx=host_ctx,
+        dev_ctx=torch.from_numpy(dev_ctx),
+        ids_differ=True,
+    )
+
+    emb.compare_host_ids(
+        torch.from_numpy(np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)),
+        emb._host_check_dev_inputs,
+    )
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "first mismatch" not in text, text
+    assert "ctx host=" not in text, text
+    assert emb._host_id_mismatches == 0
+
+
+def test_the_worker_hands_the_device_window_over_at_staging_time(monkeypatch) -> None:  # noqa: ANN
+    """P1.11 lives or dies in ``model_state``, not in the gate.
+
+    Every other test in this file drives ``compare_host_ids`` with a device tuple it
+    built itself, so a production caller that still passed ``None`` for the window
+    would leave this file entirely green while the leg stayed dark on every boot --
+    the phantom-knob failure mode, this time inside our own harness. So this calls
+    the real staging function, with a stand-in ``self``, and asserts the object the
+    layer is handed is the state's own buffer, by identity: a copy would be the
+    previous step's window, and the comparison would be quietly wrong.
+    """
+    import types
+
+    from vllm.models.qwen4_exp.amd import model_state as ms
+    from vllm.models.qwen4_exp.amd import ple_hostids as ph
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.staged: list[Any] = []
+
+        def check_host_gen(self) -> None:
+            return None
+
+        def note_draft_provenance(self, values, row_idx, gen) -> None:  # noqa: ANN
+            return None
+
+        def stage_host_step(self, ids, qsl, ctx, *, gather, device_inputs) -> None:  # noqa: ANN
+            self.staged.append((gather, device_inputs))
+
+    class History:
+        pending: list[Any] = []
+        window = np.zeros((4, 8), dtype=np.int64)
+        length = 0
+
+        def drain(self) -> None:
+            return None
+
+    class Drafts:
+        def wait_host_draft_tokens(self):  # noqa: ANN
+            return np.zeros((2, 3), dtype=np.int64), np.array([0, 1], dtype=np.int64), 1
+
+    layer = Recorder()
+    window_buf = torch.zeros((4, CTX), dtype=torch.long)
+    self_ = types.SimpleNamespace(
+        uses_ngram_embedding=True,
+        ngram_context_len=CTX,
+        ngram_eos_token_id=EOS,
+        _ple_host_layers=[layer],
+        _ple_host_gen_layers=[layer],
+        _host_drafts=Drafts(),
+        _ple_host_history=History(),
+        _last_draft_gen=0,
+        _ple_host_steps=0,
+        # The state's own device buffer. Identity is the assertion below, so this
+        # has to be one object, not something that merely equals it.
+        ngram_context=window_buf,
+        _note_host_refusal=lambda reason: None,
+        disable_host_staging=lambda why: None,
+    )
+    monkeypatch.setattr(ph, "hostids_mode", lambda: 2)
+    monkeypatch.setattr(
+        ms,
+        "build_decode_step_inputs",
+        lambda *a, **k: (
+            np.arange(6, dtype=np.int64),
+            np.array([0, 3, 6], dtype=np.int64),
+            np.zeros((2, CTX), dtype=np.int64),
+        ),
+    )
+
+    ms.Qwen4ExpModelState._stage_host_ple_ids(
+        self_,
+        types.SimpleNamespace(
+            num_reqs=2,
+            input_ids=torch.zeros(CAPACITY, dtype=torch.long),
+            query_start_loc=torch.zeros(3, dtype=torch.long),
+            idx_mapping_np=np.array([0, 1], dtype=np.int64),
+            num_scheduled_tokens=[3, 3],
+        ),
+        types.SimpleNamespace(num_computed_tokens_np=np.array([4, 4], dtype=np.int64)),
+    )
+
+    assert len(layer.staged) == 1, "the staging loop never ran"
+    gather, device_inputs = layer.staged[0]
+    assert gather is False, "mode 2 must not gather"
+    assert device_inputs is not None, "no device inputs were handed over"
+    assert device_inputs[2] is window_buf, (
+        "the gate was not handed the state's own ngram_context buffer"
+    )

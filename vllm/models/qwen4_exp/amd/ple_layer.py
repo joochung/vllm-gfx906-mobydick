@@ -635,6 +635,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # diagnostic has no business being the reason a serving boot dies.
         self._host_input_checks = 0
         self._host_input_skips = 0
+        # Steps where the device's ngram context was not handed over, so the gate
+        # compared ids and query_start_loc and the third leg stayed dark. Counted
+        # because a leg nobody checks reads as a leg that passed: this number is
+        # printed with every refusal and with the self-disable.
+        self._host_ctx_unchecked = 0
         # The op that compares ids is a separate custom op and receives only the
         # ids, so forward hands the device's inputs over through this attribute.
         self._host_check_dev_inputs: (
@@ -1122,8 +1127,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
             def _np(t: Any) -> Any:
                 # A None member means "this side has no device counterpart worth
-                # reading"; the ctx window in particular was already exonerated
-                # by the rows that matched, so it is not worth a second sync.
+                # reading" -- which since P1.11 only happens when the integration
+                # did not hand the window over, never because reading it was skipped.
                 if t is None:
                     return None
                 return t.detach().cpu().numpy()
@@ -1152,14 +1157,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     else "device=n/a"
                 )
             )
-            parts.append(
-                f"ctx host={h_ctx[: max(1, rows)].reshape(-1).tolist()} "
-                + (
-                    f"device={dev_ctx[: max(1, rows)].reshape(-1).tolist()}"
-                    if dev_ctx is not None
-                    else "device=n/a(host rows that need no draft agreed)"
-                )
+            # The window is per REQUEST, not per token: [num_reqs, ngram_size - 1].
+            # Slicing it by token-row index would be a category error, so print the
+            # whole thing -- at most max_num_seqs x 2 numbers -- and name the side
+            # that is missing instead of letting a bare "n/a" read as "agreed".
+            host_ctx_txt = (
+                "n/a(no host window staged)" if h_ctx is None else str(h_ctx.tolist())
             )
+            dev_ctx_txt = "n/a(no device window handed over)"
+            if dev_ctx is not None:
+                dev_ctx_txt = str(
+                    dev_ctx.tolist()
+                    if h_ctx is None
+                    else dev_ctx[: h_ctx.shape[0]].tolist()
+                )
+            parts.append(f"ctx host={host_ctx_txt} device={dev_ctx_txt}")
         draft = self._host_check_draft
         if draft is not None:
             values, row_index, gen = draft
@@ -1223,11 +1235,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         small sync per compared step, in differential mode only, which is a mode
         that exists in order to pay for measurements.
 
-        The ngram context is deliberately not compared. It is built inside the
-        model's forward from the runner's window, and the worker has no device-side
-        counterpart to hand back, so the honest statement is that the ctx rows are
-        unverified here -- which is why the refusal line says so instead of implying
-        the whole input surface was checked.
+        The third leg is the ngram context, and it is compared (P1.11). The claim
+        this function used to make -- that the worker has no device-side
+        counterpart of the window to hand back -- was wrong: ``Qwen4ExpModelState``
+        *owns* that buffer (``model_state.py:62``), fills it in
+        ``_prepare_ngram_context`` and hands a view of it to the forward at
+        ``model_state.py:522``. Staging runs after the fill and nothing rewrites it
+        before the op, so the reference handed over at staging time names the exact
+        cells the compute read, and copying it back here reads those cells.
+
+        The device buffer is padded to ``max_num_reqs`` just like the ids buffer,
+        so only the host's rows are compared. When no device context arrives the
+        ids and qsl verdict still stands, but the leg is counted in
+        ``_host_ctx_unchecked`` and said out loud: a leg nobody checks reads as a
+        leg that passed.
         """
         host = self._host_check_inputs
         if host is None or device_inputs is None:
@@ -1238,14 +1259,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
             return None
         d_ids, d_qsl = device_inputs[0], device_inputs[1]
+        d_ctx = device_inputs[2] if len(device_inputs) > 2 else None
         if d_ids is None or d_qsl is None:
             self._note_input_refusal("device inputs incomplete (no ids or no qsl)")
             return None
         h_ids = np.asarray(host[0]).reshape(-1)
         h_qsl = np.asarray(host[1]).reshape(-1)
+        h_ctx = None if host[2] is None else np.asarray(host[2])
+        dev_ctx: np.ndarray | None = None
         try:
             dev_ids = d_ids.detach().cpu().numpy().reshape(-1)
             dev_qsl = d_qsl.detach().cpu().numpy().reshape(-1)
+            if d_ctx is not None:
+                dev_ctx = d_ctx.detach().cpu().numpy()
         except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
             self._note_input_refusal(
                 f"reading the device inputs raised {type(exc).__name__}"
@@ -1266,6 +1292,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ids_diff = dev_ids[:n] != h_ids[:n]
         qsl_diff = dev_qsl[:m] != h_qsl[:m]
         if not ids_diff.any() and not qsl_diff.any():
+            # P1.11: ids and query boundaries matching is not yet "the device read
+            # what the host mirrored". A row's higher-order ngrams extend into the
+            # per-request window, so a window that differs by one cell makes the
+            # host's ids a function of a different prompt -- and that is the one
+            # input the host mirror builds independently of the runner's arrays.
+            verdict, why = self._ctx_leg(h_ctx, dev_ctx)
+            if verdict is False:
+                self._note_input_refusal(why)
+                return False
+            if verdict is None:
+                self._host_ctx_unchecked += 1
+                if self._host_ctx_unchecked == 1:
+                    logger.info(
+                        "PLE HOSTIDS: the ngram context is NOT compared on '%s' (%s). "
+                        "ids and query_start_loc are still compared, so this gate is "
+                        "not blind -- but a step counted here cannot attribute a "
+                        "mismatch to the window. (%d steps so far)",
+                        self.layer_name,
+                        why,
+                        self._host_ctx_unchecked,
+                    )
             self._host_input_checks += 1
             return True
         if ids_diff.any():
@@ -1285,6 +1332,62 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._note_input_refusal(detail)
         return False
 
+    def _ctx_leg(
+        self,
+        host_ctx: np.ndarray | None,
+        dev_ctx: np.ndarray | None,
+    ) -> tuple[bool | None, str]:
+        """Compare the window the device built to the window the host mirrored.
+
+        Returns ``(True, why)`` when they agree, ``(False, why)`` when they do not
+        (which makes the comparison unattributable, so the gate refuses), and
+        ``(None, why)`` when one side was never handed over.
+
+        Both sides are ``[num_reqs, ngram_size - 1]`` and they are two independent
+        implementations of the same window: the host's comes out of
+        ``HostTokenHistory`` in ``build_decode_step_inputs``, the device's is
+        ``_prepare_ngram_context`` gathering ``req_states.all_token_ids.gpu`` at
+        ``req_states.num_computed_tokens.gpu``. Boot #8's inversion put the single
+        wrong term exactly in the cell this window feeds, which is why the leg is
+        worth a copy.
+
+        The device side arrives as a numpy array because the caller already paid
+        the blocking copy inside the op, next to the two it was paying anyway.
+        """
+        if host_ctx is None or host_ctx.ndim != 2:
+            return None, f"the host step has no 2D ngram context (got {host_ctx})"
+        if dev_ctx is None:
+            return None, "the worker handed over no device ngram_context"
+        if dev_ctx.ndim != 2:
+            return False, (
+                f"device ngram_context is {dev_ctx.ndim}D, expected 2D "
+                "[num_reqs, context_len]"
+            )
+        if dev_ctx.shape[1] != host_ctx.shape[1]:
+            return False, (
+                f"ngram_context is {dev_ctx.shape[1]} cells wide on the device and "
+                f"{host_ctx.shape[1]} on the host"
+            )
+        if host_ctx.shape[0] > dev_ctx.shape[0]:
+            # Same rule as the ids buffer: a device window with fewer requests than
+            # the host staged does not describe this step, and slicing it to the
+            # host's length would compare a prefix of something else.
+            return False, (
+                f"device ngram_context describes {dev_ctx.shape[0]} requests, the "
+                f"host step has {host_ctx.shape[0]}"
+            )
+        head = dev_ctx[: host_ctx.shape[0]]
+        if (host_ctx != head).any():
+            where = int(np.flatnonzero((host_ctx != head).ravel())[0])
+            req, cell = divmod(where, host_ctx.shape[1])
+            return False, (
+                f"ngram_context differs at request {int(req)} cell {int(cell)}: "
+                f"host={int(host_ctx[req][cell])} "
+                f"device={int(head[req][cell])} "
+                f"(host={host_ctx.tolist()} device={head.tolist()})"
+            )
+        return True, "ngram_context agrees"
+
     def _note_input_refusal(self, why: str) -> None:
         """Count a refused comparison, and say so once and then every 32nd."""
         self._host_input_skips += 1
@@ -1293,11 +1396,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "PLE HOSTIDS: SKIPPED a comparison for '%s' -- %s. This says "
                 "nothing about the host mirror: the device read different inputs "
                 "than the ones staged, so there is no comparison to make. "
-                "(%d skipped; the ngram context is never compared -- the worker "
-                "has no device-side counterpart for it.)",
+                "(%d skipped; %d steps went uncompared because the worker handed "
+                "over no device window.)",
                 self.layer_name,
                 why,
                 self._host_input_skips,
+                self._host_ctx_unchecked,
             )
 
     def compare_host_ids(
