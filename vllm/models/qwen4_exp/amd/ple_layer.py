@@ -614,32 +614,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # itself is now known to match the device (tools/gfx906/cpu-diff-ngram.py).
         self._host_check_inputs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._host_check_draft: tuple[np.ndarray, np.ndarray, int] | None = None
-        # Invocation stamps (P1.9). ``_impl_calls`` counts every entry into the
-        # custom op, which is the only thing that can tell a staged step from a
-        # consumed one: the compare is only sound for the invocation that
-        # immediately follows the stage. ``_stage_seq`` numbers the stages
-        # themselves so a dump can say which stage a compare consumed, and
-        # ``_host_cross_step_skips`` counts the comparisons refused for want of
-        # that adjacency. The 15:37 boot is the reason: rows 0,1 agreed and rows
-        # 2,3 carried a token that appears nowhere in the step, which is not a
-        # possible output of any single input array (proven by CRT inversion of
-        # the printed ids), so the two halves came from different computes.
-        self._impl_calls = 0
-        self._stage_seq = 0
-        self._stage_at_impl = -1
-        self._host_cross_step_skips = 0
-        # The compute's OWN input arrays, snapshotted by a node inside the
-        # compiled region (mode 2 only). Reading the runner's buffers at compare
-        # time is not the same measurement: the ids were produced by a graph
-        # replay from the graph's view of those buffers, at a point in the step
-        # this Python code cannot see. A copy enqueued there runs on every replay,
-        # so what lands in these pinned rows is what the hash actually consumed.
-        self._ids_snapshot: torch.Tensor | None = None
-        self._qsl_snapshot: torch.Tensor | None = None
-        self._pinned_ids_snapshot: torch.Tensor | None = None
-        self._pinned_qsl_snapshot: torch.Tensor | None = None
-        self._ids_ptr_last = -1
-        self._host_snap: tuple[np.ndarray, np.ndarray] | None = None
+        # Input-agreement gate (P1.10b). ``_host_input_checks`` counts the
+        # comparisons that went through because the device's own copy of the
+        # inputs matched what the host mirrored; ``_host_input_skips`` counts the
+        # ones refused because they did not, or because the question could not be
+        # asked. Refusals are counted separately from mismatches on purpose: a
+        # comparison the harness cannot attribute says nothing about the mirror,
+        # and a number that mixes the two would let the harness's blind spots be
+        # read as evidence against the host path.
+        #
+        # There is deliberately no P1.9 here. The snapshot copies that used to sit
+        # in ``forward`` are gone: forward IS the compiled region, so a Python
+        # guard there is evaluated at trace time and the artifact that a stable
+        # AOT cache key keeps loading decides what runs -- the key of this model
+        # did not change for eight days across dozens of source edits, so the
+        # copies were compiled out of the boot that was supposed to read them. The
+        # 23:42 boot is the one time they did get compiled in (drafter-off produced
+        # a fresh key) and it died of an illegal device access at the graph-memory
+        # profiling teardown; a pre-existing crash class hits the same path, but a
+        # diagnostic has no business being the reason a serving boot dies.
+        self._host_input_checks = 0
+        self._host_input_skips = 0
         # The op that compares ids is a separate custom op and receives only the
         # ids, so forward hands the device's inputs over through this attribute.
         self._host_check_dev_inputs: (
@@ -918,13 +913,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self._host_check_ids = torch.empty_like(self._pinned_ngram_ids)
             self._host_check_ids[:rows].numpy()[:] = ids
             self._host_check_rows = rows
-            # Invocation stamp (P1.9): this stage belongs to the NEXT entry into
-            # the op, and only to that one. Anything that enters the op in
-            # between -- a second PLE call in the step, a step that staged and
-            # never reached this op -- makes the gap != 1 and the comparison is
-            # refused rather than believed.
-            self._stage_seq += 1
-            self._stage_at_impl = self._impl_calls
             # References, not copies: ``build_decode_step_inputs`` allocates these
             # fresh per step, and the compare happens inside the very op of this
             # step, before anything else can recycle them.
@@ -985,97 +973,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._gen_device = torch.zeros(
             1, dtype=torch.long, device=self.layer_multipliers.device
         )
-
-    def _alloc_snap_scratch(self) -> None:
-        """Device scratch holding the compute's own input arrays (mode 2 only).
-
-        Allocated with the weights, because a capture must never have to allocate
-        the buffer a captured node writes into. Nothing is allocated unless the
-        knob is at 2: with it off or at 1 these would be bytes and a per-step copy
-        that no one reads.
-        """
-        if ple_hostids.hostids_mode() != 2:
-            return
-        device = self.layer_multipliers.device
-        self._ids_snapshot = torch.zeros(
-            self._pinned_ngram_ids.shape[0], dtype=torch.long, device=device
-        )
-        self._qsl_snapshot = torch.zeros(
-            self.padded_buffer.shape[0] + 1, dtype=torch.long, device=device
-        )
-        # The pinned host buffers are allocated from the *shape*, never with
-        # zeros_like() on the device tensors: zeros_like inherits the CUDA placement
-        # and pin_memory() then raises "cannot pin 'torch.cuda.LongTensor' only dense
-        # CPU tensors can be pinned". That is exactly how every HOSTIDS=2 boot died on
-        # 2026-10-01 (17:49, 17:56) inside load_weights, before the engine came up --
-        # and it survived the test suite because the ON path of this method had no
-        # test at all, only the off path did. See
-        # test_alloc_snap_scratch_pins_cpu_even_when_the_compute_device_is_not.
-        self._pinned_ids_snapshot = torch.zeros(
-            self._ids_snapshot.shape, dtype=torch.long, device="cpu"
-        ).pin_memory()
-        self._pinned_qsl_snapshot = torch.zeros(
-            self._qsl_snapshot.shape, dtype=torch.long, device="cpu"
-        ).pin_memory()
-
-    def _snapshot_compute_inputs(
-        self, input_ids: torch.Tensor, query_start_loc: torch.Tensor
-    ) -> None:
-        """Record, as graph nodes, the arrays this compute is consuming.
-
-        Called from ``forward`` *inside* the compiled region, before the split op,
-        so the copies become nodes of the same graph that produced the ids and run
-        on every replay. This is the difference between "what the hash read" and
-        "what the runner's buffers say when Python looks at them later", which is
-        what P1.8 was reading. A frozen or replayed graph is invisible to that
-        later look, which is why the 15:37 dump printed identical inputs on both
-        sides of a mismatch that is arithmetically impossible for identical inputs.
-        """
-        snap = self._ids_snapshot
-        if snap is None or self._hostids_disabled:
-            return
-        ids = input_ids.reshape(-1)
-        # Clamped, not sliced. ``snap[:n]`` silently shortens the destination when
-        # n exceeds it, and ``copy_`` then raises on a shape mismatch -- inside the
-        # compiled region, where a raise is a dead boot and not a missing
-        # diagnostic. The buffers are sized from max_num_batched_tokens and
-        # max_num_seqs, and a captured graph hands forward capacity-padded arrays
-        # (boot #4's own dump printed qsl=[0, 3, 6, 6, 6] for three requests), so
-        # "too long" is expected, not exceptional; the prefix that fits is exactly
-        # the part worth reading.
-        n = min(ids.numel(), snap.numel())
-        snap[:n].copy_(ids[:n])
-        qsl_snap = self._qsl_snapshot
-        if qsl_snap is not None:
-            m = min(query_start_loc.numel(), qsl_snap.numel())
-            qsl_snap[:m].copy_(query_start_loc[:m])
-
-    def _read_input_snapshot(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Pull the snapshot into host memory and return numpy views.
-
-        Legal outside a capture, which is where the custom op runs, and ordered:
-        the copies above sit ahead of the op on the same stream, and the op has
-        already done a blocking D2H of the ids by the time this is called, so the
-        snapshot rows this step's graph wrote cannot still be in flight.
-        """
-        pinned = self._pinned_ids_snapshot
-        if pinned is None or self._ids_snapshot is None:
-            return None
-        pinned.copy_(self._ids_snapshot, non_blocking=False)
-        qsl_pinned = self._pinned_qsl_snapshot
-        if qsl_pinned is not None and self._qsl_snapshot is not None:
-            qsl_pinned.copy_(self._qsl_snapshot, non_blocking=False)
-            return pinned.numpy(), qsl_pinned.numpy()
-        return pinned.numpy(), None
-
-    def _begin_invocation(self) -> None:
-        """Count one entry into the PLE custom op.
-
-        The impl calls this first thing; a test that drives
-        :meth:`compare_host_ids` directly must call it too, because the point of
-        the counter is that a comparison belongs to an invocation.
-        """
-        self._impl_calls += 1
 
     def _gen_scratch(self, device: torch.device) -> torch.Tensor:
         """The device scratch the graph copies the generation into.
@@ -1290,45 +1187,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # actually read. Saying whether the two agree is the whole point: if they
         # differ, an inputs-identical mismatch is explained, and if they agree,
         # the input side is closed and the arithmetic is the suspect again.
-        parts.append(
-            f"op entry={self._impl_calls} stage seq={self._stage_seq} "
-            f"ids rows={int(dev.shape[0]) if dev.ndim == 2 else dev.shape[0]}"
-        )
-        snap = self._host_snap
-        if snap is None:
-            parts.append(
-                "compute inputs=none(snapshot not allocated; mode 2 allocates it "
-                "with the weights)"
-            )
-        else:
-            snap_ids, snap_qsl = snap
-            n = min(rows, int(snap_ids.shape[0]))
-            parts.append(f"compute ids(snapshot)={snap_ids[:n].tolist()}")
-            parts.append(
-                "compute qsl(snapshot)="
-                + (
-                    str(snap_qsl.tolist())
-                    if snap_qsl is not None
-                    else "n/a(qsl scratch not allocated)"
-                )
-            )
-            if inputs is not None:
-                h_ids = inputs[0]
-                m = min(n, int(np.asarray(h_ids).shape[0]))
-                same = bool(
-                    np.array_equal(np.asarray(snap_ids[:m]), np.asarray(h_ids[:m]))
-                )
-                bits = ""
-                if not same:
-                    first = int(
-                        np.argmax(np.asarray(snap_ids[:m]) != np.asarray(h_ids[:m]))
-                    )
-                    bits = (
-                        f" first differing index {first}: "
-                        f"snapshot={int(snap_ids[first])} "
-                        f"host={int(np.asarray(h_ids)[first])}"
-                    )
-                parts.append(f"snapshot matches host inputs: {same}{bits}")
+        parts.append(f"ids rows={int(dev.shape[0]) if dev.ndim == 2 else dev.shape[0]}")
+        # An ids mismatch only reaches this dump through the input-agreement gate,
+        # which is what makes it worth the sync: the device demonstrably read the
+        # tokens the host mirrored, so the arithmetic is the only thing left to
+        # explain the disagreement. Say so, because a dump that reads as complete
+        # when the attribution step is what changed is how a harness bug gets
+        # charged to the mirror for the third time.
+        parts.append("input gate: agreed (device read the staged tokens)")
         for r in bad[:2]:
             # Print the HEADS THAT ACTUALLY DIFFER, not the first four. The 14:54
             # boot truncated every row to [:4], so its second bad row looked
@@ -1339,6 +1205,100 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             parts.append(f"host row{r}={host[r, shown].tolist()}")
             parts.append(f"dev  row{r}={dev[r, shown].tolist()}")
         return "; ".join(parts)
+
+    def _inputs_agree(self, device_inputs: tuple[Any, ...] | None) -> bool | None:
+        """Did the device read the tokens the host mirrored?
+
+        True makes the comparison that follows attributable. False means the
+        arrays the compute hashed are not the arrays the host built, so a mismatch
+        would be a description of the harness and not of the mirror. None means the
+        question could not be asked at all, which is treated exactly like False:
+        a comparison nobody can attribute must not be reported as a verdict in
+        either direction, and it must certainly not disable the host path.
+
+        The device half arrives as tensor *references* handed over by the stager in
+        the worker -- the runner's own buffers, which the compute read out of. The
+        D2H below is blocking, and legal: the op impl is the split point, so this is
+        eager code running after the compiled piece on the same stream. It costs one
+        small sync per compared step, in differential mode only, which is a mode
+        that exists in order to pay for measurements.
+
+        The ngram context is deliberately not compared. It is built inside the
+        model's forward from the runner's window, and the worker has no device-side
+        counterpart to hand back, so the honest statement is that the ctx rows are
+        unverified here -- which is why the refusal line says so instead of implying
+        the whole input surface was checked.
+        """
+        host = self._host_check_inputs
+        if host is None or device_inputs is None:
+            self._note_input_refusal(
+                "inputs missing on the "
+                + ("host" if host is None else "device")
+                + " side"
+            )
+            return None
+        d_ids, d_qsl = device_inputs[0], device_inputs[1]
+        if d_ids is None or d_qsl is None:
+            self._note_input_refusal("device inputs incomplete (no ids or no qsl)")
+            return None
+        h_ids = np.asarray(host[0]).reshape(-1)
+        h_qsl = np.asarray(host[1]).reshape(-1)
+        try:
+            dev_ids = d_ids.detach().cpu().numpy().reshape(-1)
+            dev_qsl = d_qsl.detach().cpu().numpy().reshape(-1)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
+            self._note_input_refusal(
+                f"reading the device inputs raised {type(exc).__name__}"
+            )
+            return None
+        if dev_ids.shape[0] < h_ids.shape[0]:
+            # The runner's array is the padded one, so it is at least as long as the
+            # host's rows whenever both describe this step. Shorter means the two
+            # sides are not describing the same work at all, and comparing a prefix
+            # of that would be a green light invented by the slicing.
+            self._note_input_refusal(
+                f"device ids shorter than the staged rows "
+                f"({dev_ids.shape[0]} < {h_ids.shape[0]})"
+            )
+            return False
+        n = int(h_ids.shape[0])
+        m = int(min(h_qsl.shape[0], dev_qsl.shape[0]))
+        ids_diff = dev_ids[:n] != h_ids[:n]
+        qsl_diff = dev_qsl[:m] != h_qsl[:m]
+        if not ids_diff.any() and not qsl_diff.any():
+            self._host_input_checks += 1
+            return True
+        if ids_diff.any():
+            first = int(np.argmax(ids_diff))
+            detail = (
+                f"input_ids differ at {first} of {n}: device={int(dev_ids[first])} "
+                f"host={int(h_ids[first])} "
+                f"({int(ids_diff.sum())} of {n} positions)"
+            )
+        else:
+            first = int(np.argmax(qsl_diff))
+            detail = (
+                f"query_start_loc differs at {first} of {m}: "
+                f"device={int(dev_qsl[first])} host={int(h_qsl[first])} "
+                f"(device={dev_qsl[:m].tolist()} host={h_qsl[:m].tolist()})"
+            )
+        self._note_input_refusal(detail)
+        return False
+
+    def _note_input_refusal(self, why: str) -> None:
+        """Count a refused comparison, and say so once and then every 32nd."""
+        self._host_input_skips += 1
+        if self._host_input_skips == 1 or self._host_input_skips % 32 == 0:
+            logger.info(
+                "PLE HOSTIDS: SKIPPED a comparison for '%s' -- %s. This says "
+                "nothing about the host mirror: the device read different inputs "
+                "than the ones staged, so there is no comparison to make. "
+                "(%d skipped; the ngram context is never compared -- the worker "
+                "has no device-side counterpart for it.)",
+                self.layer_name,
+                why,
+                self._host_input_skips,
+            )
 
     def compare_host_ids(
         self,
@@ -1362,33 +1322,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._host_check_dev_inputs = None
         if rows < 0 or rows != device_ids.shape[0]:
             return
-        # Same-step gate (P1.9). A comparison is only evidence if the ids in
-        # ``device_ids`` came from the compute that this stage described, and the
-        # only thing that can prove that from here is that the stage was
-        # immediately followed by this entry into the op. Row counts cannot: the
-        # 15:37 boot had 4 rows on both sides and an array that is not the output
-        # of ANY single input (rows 0,1 and rows 2,3 invert to different token
-        # streams), which is what an adjacency check is for and shape is not.
-        gap = self._impl_calls - self._stage_at_impl
-        if self._stage_at_impl < 0 or gap != 1:
-            self._host_cross_step_skips += 1
-            if (
-                self._host_cross_step_skips == 1
-                or self._host_cross_step_skips % 32 == 0
-            ):
-                logger.info(
-                    "PLE HOSTIDS: SKIPPED a comparison for '%s' -- stage seq %d "
-                    "was stamped at op entry %d and this is op entry %d (gap %d), "
-                    "so these ids do not belong to the staged step (%d skipped).",
-                    self.layer_name,
-                    self._stage_seq,
-                    self._stage_at_impl,
-                    self._impl_calls,
-                    gap,
-                    self._host_cross_step_skips,
-                )
+        # Input-agreement gate (P1.10b): ask the attribution question directly
+        # instead of inferring it from how often the op has been entered.
+        #
+        # The P1.9 gate counted entries into this op and required the stage to sit
+        # immediately before one. That does not measure what it claimed under
+        # piecewise graphs: the main pass replays without entering the op at all,
+        # so only the drafter passes bump the counter, and "gap == 1" was a
+        # statement about eager entries rather than about steps.
+        #
+        # What the comparison actually needs is narrower and checkable: the arrays
+        # the compute hashed must be the arrays the host mirrored. If they differ,
+        # whatever the ids say, the two halves describe different work -- which is
+        # exactly the shape boot #6's dump had, down to row 1 agreeing with the
+        # staged token stream and row 2 inverting (by CRT, exactly) to a different
+        # token at the same position. With num_speculative_tokens=k the PLE op runs
+        # k+1 times per step and each pass rewrites only its own rows of one static
+        # buffer, so under a drafter the device's copy is a patchwork and this gate
+        # refuses. A refusal is not a verdict about the mirror; it is the harness
+        # declining to guess.
+        if self._inputs_agree(dev_inputs) is not True:
             return
-        self._host_snap = self._read_input_snapshot()
         assert self._host_check_ids is not None
         host = self._host_check_ids[:rows].numpy()
         dev = device_ids.numpy()
@@ -1458,26 +1412,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_size=self.ngram_size,
             heads_per_ngram=self.heads_per_ngram,
         )
-        # Differential mode: record what THIS compute consumed, as part of the
-        # same graph. Placed after the ids and before the split op so the copies
-        # sit ahead of the op on the stream, which is what lets the op read them
-        # without waiting. No-op unless the knob is at 2.
-        self._snapshot_compute_inputs(input_ids, query_start_loc)
-        if self._host_check_rows >= 0 and self._host_check_dev_inputs is None:
-            # Fallback for a caller that staged without device inputs (the unit
-            # tests drive forward() directly). On the real path staging already
-            # filled this in, and it must not be overwritten: under torch.compile
-            # this body runs at trace time only, so a value set here is a
-            # trace-time value, not this step's.
-            # Differential mode only, and only for the step that staged: the
-            # comparison happens inside the custom op, which is handed the ids and
-            # nothing else. Not a graph node -- under replay forward does not run,
-            # and neither does any comparison.
-            self._host_check_dev_inputs = (
-                input_ids,
-                query_start_loc,
-                ngram_context,
-            )
+        # Nothing from the differential harness lives here any more (P1.10b). This
+        # body is the compiled region: under torch.compile it runs at TRACE time
+        # only, so an attribute stashed here holds a trace-time value while the op
+        # impl that reads it runs eager on every later step. The provenance the
+        # comparison needs is captured by the stager in the worker, which is plain
+        # Python and sees the batch this step will actually consume.
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.runtime_dtype,
@@ -1560,7 +1500,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # fails or lands in that graph's private pool, where the other graphs and
         # the host's read-back would not see it.
         self._alloc_gen_scratch()
-        self._alloc_snap_scratch()
         return loaded
 
 
@@ -2217,11 +2156,6 @@ def qwen4_exp_amd_ple_ngram_embedding(
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     ple_embedding = layer.ple_embedding
-    # Every entry into this op is one candidate consumer of a staged step, so
-    # the count that decides whether a comparison is same-step has to be bumped
-    # here and not inside the comparison: an entry that never compares is
-    # exactly the event that makes a later comparison cross-step.
-    ple_embedding._begin_invocation()
     n = ngram_ids.shape[0]
     # E1 Phase 0 ceiling probe: while a capture is in progress, record only the
     # H2D and return. See _capture_probe_enabled() for why a captured gather is

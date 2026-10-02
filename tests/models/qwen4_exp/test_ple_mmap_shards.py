@@ -325,10 +325,6 @@ class _Stub:
     # Real method, not a no-op: load_weights allocates the generation tripwire's
     # device mirror, and that allocation is a claim worth testing behaviourally.
     _alloc_gen_scratch = ple.Qwen4ExpNGramEmbedding._alloc_gen_scratch
-    # Same contract as above, P1.9: load_weights now also allocates the input
-    # snapshot scratch, but only in differential mode -- which is what the test
-    # below pins.
-    _alloc_snap_scratch = ple.Qwen4ExpNGramEmbedding._alloc_snap_scratch
 
     def __init__(self, split_ngram_parts=NUM_SHARDS, dim=DIM):
         self.split_ngram_parts = split_ngram_parts
@@ -340,12 +336,6 @@ class _Stub:
         )
         # Production __init__ sets this to None; load_weights is what fills it in.
         self._gen_device: torch.Tensor | None = None
-        # Same for the P1.9 input snapshot: the attributes exist from __init__ and
-        # load_weights decides whether to fill them in.
-        self._ids_snapshot: torch.Tensor | None = None
-        self._qsl_snapshot: torch.Tensor | None = None
-        self._pinned_ids_snapshot: torch.Tensor | None = None
-        self._pinned_qsl_snapshot: torch.Tensor | None = None
 
 
 def _load(stub, weights):
@@ -408,27 +398,6 @@ def test_load_weights_allocates_the_generation_scratch():
     assert scratch.numel() == 1
     assert int(scratch[0]) == 0, "the scratch must start as 'never written'"
     assert scratch.device == stub.layer_multipliers.device
-
-
-def test_load_weights_allocates_no_snapshot_scratch_with_the_knob_off(monkeypatch):
-    """Every perf knob owes its absence a cost of zero (P1.9).
-
-    The snapshot is a device buffer plus a per-step copy, and differential mode is
-    the only reader. If the allocation were unconditional, a serving boot with the
-    knob off would pay bytes and a D2H for a diagnostic it never asked for, and
-    nothing would ever notice.
-    """
-    monkeypatch.delenv("VLLM_GFX906_PLE_HOSTIDS", raising=False)
-    monkeypatch.setattr(ple.ple_hostids, "hostids_mode", lambda: 0)
-    stub = _Stub()
-
-    _load(stub, [("ngram_heads_offsets", torch.zeros(2, dtype=torch.long))])
-
-    assert stub._gen_device is not None, "the tripwire scratch is not the thing here"
-    assert stub._ids_snapshot is None, "differential scratch allocated with knob off"
-    assert stub._pinned_ids_snapshot is None, "pinned differential scratch allocated"
-    assert stub._qsl_snapshot is None
-    assert stub._pinned_qsl_snapshot is None
 
 
 def test_load_weights_rejects_buffer_shape_mismatch():

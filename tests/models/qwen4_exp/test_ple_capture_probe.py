@@ -27,7 +27,6 @@ sys.path.insert(0, "/ai/engines/gfx906/unverbraucht/worktrees/prof-async-guard")
 
 from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module  # noqa: E402
 from vllm.models.qwen4_exp.amd.ple_layer import (  # noqa: E402
-    Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
     qwen4_exp_amd_ple_ngram_embedding,
 )
@@ -66,13 +65,6 @@ class FakePLEEmbedding:
             (ROWS, NGRAM_HEADS), SENTINEL, dtype=torch.long
         )
         self._pinned_output = torch.zeros((ROWS, EMBED_DIM), dtype=torch.float16)
-        # The op counts every entry into itself (P1.9), so anything standing in
-        # for the embedding has to answer that call. Borrowed, not stubbed: the
-        # counting is behaviour, and a fake that returned a constant would let a
-        # broken counter through every test in this file.
-        self._impl_calls = 0
-
-    _begin_invocation = Qwen4ExpNGramEmbedding._begin_invocation
 
     # The op calls ``ple_embedding.ngram_embedding(ids)``.
     @property
