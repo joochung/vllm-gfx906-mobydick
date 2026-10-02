@@ -110,6 +110,7 @@ class StagingEmbedding:
     _fire_gen = Qwen4ExpNGramEmbedding._fire_gen
     _inputs_agree = Qwen4ExpNGramEmbedding._inputs_agree
     _ctx_leg = Qwen4ExpNGramEmbedding._ctx_leg
+    _packed_dump = Qwen4ExpNGramEmbedding._packed_dump
     _note_input_refusal = Qwen4ExpNGramEmbedding._note_input_refusal
 
     def __init__(self, rows: int = ROWS, capacity: int = CAPACITY) -> None:
@@ -137,7 +138,10 @@ class StagingEmbedding:
         self._host_stage_steps = 0
         self._host_id_mismatches = 0
         self._host_id_matches = 0
-        self._host_check_inputs: tuple[Any, Any, Any] | None = None
+        self._host_check_inputs: tuple[Any, ...] | None = None
+        # The compute's own packed workspace, as the real layer holds it: written
+        # only by _compute_ngram_ids, which P1.12 reads at dump time.
+        self.padded_buffer = torch.full((4, 64), EOS, dtype=torch.long)
         self._host_check_draft: tuple[Any, Any, int] | None = None
         self._host_check_dev_inputs: Any = None
         self._rows = rows
@@ -2199,3 +2203,119 @@ def test_the_worker_hands_the_device_window_over_at_staging_time(monkeypatch) ->
     assert device_inputs[2] is window_buf, (
         "the gate was not handed the state's own ngram_context buffer"
     )
+
+
+# ---------------------------------------------------------------------------
+# P1.12 -- the dump reads the compute's own packed workspace
+# ---------------------------------------------------------------------------
+#
+# Why this leg exists: the q=3 boot (2026-10-02 11:53) is the first step where
+# ids, query_start_loc AND the ngram window were all proven identical on both
+# sides, and a faithful CPU replay of _compute_ngram_ids on those exact inputs
+# reproduced the HOST ids exactly -- not the device's. So the arrays the caller
+# can see do not explain the array the device produced, and what is left is
+# padded_buffer: the compute's own scratch, written from input_ids inside the
+# compiled piece and by nobody else. Its address space is the only remaining
+# witness.
+
+
+def _mismatch_row2_with_workspace(
+    emb: StagingEmbedding, packed_cell: int, *, four: bool = True
+) -> None:
+    """Drive one attributed mismatch at row 2 with a workspace under our control.
+
+    Row 2 of a ``[0, 3, 6]`` batch is request 0, column 2, so -- by the same
+    ``context = cat([ngram_context, packed])`` and ``adjusted_columns`` arithmetic
+    the compute uses -- the ngram=2 group reads its left context from
+    ``packed[0, 1]`` and the ngram=3 group from ``packed[0, 0]``.
+    """
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    dev_ids = host_ids.copy()
+    dev_ids[2, 0] = -1
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    ids_arr = np.array([10, 11, 12, 14, 15, 16], dtype=np.int64)
+    qsl_arr = np.array([0, 3, 6], dtype=np.int64)
+    ctx_arr = np.arange(ROWS * CTX, dtype=np.int64).reshape(ROWS, CTX)
+    packed = torch.full((4, 64), EOS, dtype=torch.long)
+    packed[0, 0], packed[0, 1], packed[0, 2] = 10, packed_cell, 12
+    packed[1, 0], packed[1, 1], packed[1, 2] = 14, 15, 16
+    emb._host_check_inputs = (
+        (ids_arr, qsl_arr, ctx_arr, packed) if four else (ids_arr, qsl_arr, ctx_arr)
+    )
+    emb.compare_host_ids(
+        torch.from_numpy(dev_ids),
+        (
+            torch.from_numpy(ids_arr),
+            torch.from_numpy(qsl_arr),
+            torch.from_numpy(ctx_arr),
+        ),
+    )
+
+
+def test_the_dump_names_the_workspace_cell_that_fed_the_differing_row(
+    caplog,
+) -> None:
+    """The dump must say which cell of the compute's scratch fed the bad row.
+
+    "The inputs agreed and the ids still differ" is only actionable if the line
+    also reports what the hash read out of its own workspace at that position:
+    the token means the arithmetic is the suspect, anything else means the
+    compute consumed an ids tensor that is not the one the op was handed.
+    """
+    emb = StagingEmbedding()
+    with caplog.at_level("WARNING"):
+        _mismatch_row2_with_workspace(emb, 11)
+    assert emb._hostids_disabled is True, "the comparison never reached its dump"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "packed device=" in text, text
+    assert "row2ngram2=packed[0,1]=11" in text, text
+    assert "row2ngram3=packed[0,0]=10" in text, text
+
+
+def test_the_packed_leg_reports_the_workspace_and_not_the_hope(caplog) -> None:
+    """Red control for the leg above: mutate the cell, the line must change.
+
+    A leg that prints a value derived from the caller's arrays would pass the
+    test above and tell us nothing at 3 a.m. This one only earns its keep by
+    tracking what the scratch actually holds.
+    """
+    emb = StagingEmbedding()
+    with caplog.at_level("WARNING"):
+        _mismatch_row2_with_workspace(emb, 3)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "row2ngram2=packed[0,1]=3" in text, text
+    assert "row2ngram2=packed[0,1]=11" not in text, text
+
+
+def test_the_packed_leg_names_its_own_absence(caplog) -> None:
+    """A leg that could not run must not read as a leg that agreed."""
+    emb = StagingEmbedding()
+    with caplog.at_level("WARNING"):
+        _mismatch_row2_with_workspace(emb, 11, four=False)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "packed=n/a(stager handed no workspace)" in text, text
+
+
+def test_staging_hands_the_dump_the_layer_s_own_workspace(hostids_env) -> None:
+    """Production wiring, not a hand-built tuple.
+
+    Every other test here assembles ``_host_check_inputs`` itself, so none of
+    them can notice the stager forgetting to pass the workspace -- and a dump
+    whose new leg is always ``n/a`` is the phantom-metric failure in its purest
+    form: a reassuring absence that looks like a working instrument.
+    """
+    hostids_env["mode"] = 2
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert emb._host_check_inputs is not None, "staging kept no host side"
+    assert (
+        len(emb._host_check_inputs) > 3
+        and emb._host_check_inputs[3] is emb.padded_buffer
+    ), "the dump was not handed the workspace the compute writes into"

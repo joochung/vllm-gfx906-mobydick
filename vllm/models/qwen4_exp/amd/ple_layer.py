@@ -612,7 +612,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # disagrees is worth nothing unless the dump also shows the three tokens
         # that produced it and where the host got them, because the arithmetic
         # itself is now known to match the device (tools/gfx906/cpu-diff-ngram.py).
-        self._host_check_inputs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._host_check_inputs: tuple[Any, ...] | None = None
         self._host_check_draft: tuple[np.ndarray, np.ndarray, int] | None = None
         # Input-agreement gate (P1.10b). ``_host_input_checks`` counts the
         # comparisons that went through because the device's own copy of the
@@ -921,7 +921,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # References, not copies: ``build_decode_step_inputs`` allocates these
             # fresh per step, and the compare happens inside the very op of this
             # step, before anything else can recycle them.
-            self._host_check_inputs = (input_ids, query_start_loc, ngram_context)
+            # P1.12 adds a fourth member: the compute's own packed workspace.
+            # It is written by nobody else, so reading it at op time is the only
+            # view of the cells the hash actually consumed, as opposed to the
+            # arrays the caller passed it.
+            self._host_check_inputs = (
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self.padded_buffer,
+            )
             # The device half of the same step's inputs, captured HERE rather than
             # in forward(). The 14:54 boot proved the forward-time stash is dead
             # code on a compiled path: dynamo runs the Python body at trace time
@@ -1123,7 +1132,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         if device_inputs is not None and inputs is not None:
             d_ids, d_qsl, d_ctx = device_inputs
-            h_ids, h_qsl, h_ctx = inputs
+            # Positional, not unpacked: P1.12 appended the compute's packed
+            # workspace as a fourth member, and a 3-tuple unpack would make every
+            # staged mismatch raise inside the diagnostic instead of printing it.
+            h_ids, h_qsl, h_ctx = inputs[0], inputs[1], inputs[2]
 
             def _np(t: Any) -> Any:
                 # A None member means "this side has no device counterpart worth
@@ -1193,6 +1205,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         where = np.argwhere(host != dev)
         bad = sorted({int(r) for r, _ in where})
         parts.append(f"rows differing={bad}")
+        parts.append(self._packed_dump(self._host_check_inputs, bad))
         # What the compute itself consumed (P1.9). The section above reads the
         # runner's buffers from Python at compare time; this one is a copy taken
         # inside the graph, so it is the only view of the arrays the hash
@@ -1217,6 +1230,83 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             parts.append(f"host row{r}={host[r, shown].tolist()}")
             parts.append(f"dev  row{r}={dev[r, shown].tolist()}")
         return "; ".join(parts)
+
+    def _packed_dump(self, inputs: Any, bad_rows: list[int]) -> str:
+        """What the hash consumed inside itself, not what the caller handed it.
+
+        Every other leg of this dump reads an array the *caller* owns: the ids and
+        query boundaries the runner filled, the window the model state filled. The
+        q=3 boot (2026-10-02 11:53) closed all three -- ids, qsl and window
+        identical on both sides -- and a faithful CPU replay of
+        :meth:`_compute_ngram_ids` on those exact inputs reproduced the HOST ids
+        to the digit, not the device's. So the shipped arithmetic is not producing
+        the device's answer from the arrays the caller can see, and what is left is
+        the one array nobody else writes: ``padded_buffer``, the compute's own
+        packed workspace, filled from ``input_ids`` inside the compiled piece.
+
+        This prints its first cells and, for each differing row, the exact cell
+        each ngram order reads as its left context -- the same
+        ``context = cat([ngram_context, packed])`` arithmetic the compute uses, with
+        ``adjusted_columns = column + ngram_size - 1``. If that cell holds the
+        token, the divergence is in the compiled arithmetic. If it holds something
+        else, the compute consumed an ids tensor that is not the one the op was
+        handed, and the search moves to the buffer, not the math.
+
+        Compare-only, and it costs one small sync on a path that disables itself
+        after the first mismatch. A failure here must never kill a step.
+
+        ``packed`` may be a tensor (the layer's own ``padded_buffer``, which is what
+        the worker stages) or a plain array (what the on-path probe stages), so it
+        is read the same way ``ngram_context`` is. The first version of this leg
+        called ``.detach()`` unconditionally, the probe's numpy fixture raised
+        ``AttributeError``, and the leg printed ``packed=n/a`` while looking like a
+        leg that ran -- which is precisely the failure the probe exists to catch.
+        """
+        if not bad_rows:
+            return "packed=n/a(no differing row)"
+        packed = inputs[3] if inputs is not None and len(inputs) > 3 else None
+        if packed is None:
+            return "packed=n/a(stager handed no workspace)"
+        try:
+            qsl = np.asarray(inputs[1]).reshape(-1)
+            ctx = inputs[2]
+            ctx_np = (
+                None
+                if ctx is None
+                else (
+                    ctx.detach().cpu().numpy()
+                    if hasattr(ctx, "detach")
+                    else np.asarray(ctx)
+                )
+            )
+            pk = (
+                packed.detach().cpu().numpy()
+                if hasattr(packed, "detach")
+                else np.asarray(packed)
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
+            return f"packed=n/a(reading it raised {type(exc).__name__})"
+        ctx_len = self.ngram_size - 1
+        n_reqs = int(min(pk.shape[0], max(1, qsl.shape[0] - 1)))
+        lens = [int(qsl[i + 1] - qsl[i]) for i in range(n_reqs)]
+        width = int(min(pk.shape[1], (max(lens) if lens else 0) + ctx_len))
+        out = [f"packed device={pk[:n_reqs, :max(width, 1)].tolist()}"]
+        for r in bad_rows[:2]:
+            req = int(np.clip(np.searchsorted(qsl, r, side="right") - 1, 0, n_reqs - 1))
+            col = int(r - qsl[req])
+            for ngram in range(2, self.ngram_size + 1):
+                idx = col + ctx_len - (ngram - 1)
+                if idx < 0:
+                    out.append(f"row{r}ngram{ngram}=<before the request>")
+                elif idx < ctx_len:
+                    val = "?" if ctx_np is None else int(ctx_np[req, idx])
+                    out.append(f"row{r}ngram{ngram}=ctx[{req},{idx}]={val}")
+                else:
+                    out.append(
+                        f"row{r}ngram{ngram}=packed[{req},{idx - ctx_len}]"
+                         f"={int(pk[req, idx - ctx_len])}"
+                    )
+        return "; ".join(out)
 
     def _inputs_agree(self, device_inputs: tuple[Any, ...] | None) -> bool | None:
         """Did the device read the tokens the host mirrored?
