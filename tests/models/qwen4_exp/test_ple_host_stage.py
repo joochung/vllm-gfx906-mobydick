@@ -1757,3 +1757,94 @@ def test_the_device_query_boundaries_are_printed_whole(caplog) -> None:
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "qsl host=[0, 3, 6] device=[0, 3, 6, 6, 6]" in text, text
+
+
+class _AllocStandIn:
+    """The three attributes ``_alloc_snap_scratch`` actually reads, and nothing else.
+
+    ``layer_multipliers`` lives on the **meta** device: a non-CPU placement whose
+    tensors have shapes but no storage, so ``pin_memory()`` on one fails exactly the
+    way it fails on ``cuda``. That is what makes the pinning contract testable with
+    no GPU and no DMA.
+    """
+
+    def __init__(self) -> None:
+        self.layer_multipliers = torch.zeros(HEADS, dtype=torch.long, device="meta")
+        self._pinned_ngram_ids = torch.zeros(ROWS, dtype=torch.long)
+        self.padded_buffer = torch.zeros(ROWS, HEAD_DIM, dtype=torch.float32)
+        self._ids_snapshot: torch.Tensor | None = None
+        self._qsl_snapshot: torch.Tensor | None = None
+        self._pinned_ids_snapshot: torch.Tensor | None = None
+        self._pinned_qsl_snapshot: torch.Tensor | None = None
+
+
+def test_alloc_snap_scratch_pins_cpu_even_when_the_compute_device_is_not(
+    hostids_env,
+) -> None:
+    """The pinned side of the snapshot must be a CPU tensor.
+
+    Regression for the crash that killed every ``HOSTIDS=2`` boot on 2026-10-01:
+    ``torch.zeros_like(self._ids_snapshot).pin_memory()`` inherits the CUDA
+    placement and raises ``cannot pin 'torch.cuda.LongTensor' only dense CPU tensors
+    can be pinned`` -- inside ``load_weights``, so the engine never comes up. It
+    survived the suite because the *off* path of this method was tested and the *on*
+    path never was.
+    """
+    hostids_env["mode"] = 2
+    obj = _AllocStandIn()
+
+    Qwen4ExpNGramEmbedding._alloc_snap_scratch(obj)
+
+    ids_snap, qsl_snap = obj._ids_snapshot, obj._qsl_snapshot
+    pinned_ids, pinned_qsl = obj._pinned_ids_snapshot, obj._pinned_qsl_snapshot
+    assert ids_snap is not None and qsl_snap is not None
+    assert pinned_ids is not None and pinned_qsl is not None
+    # The scratch the captured nodes write into stays on the compute device...
+    assert ids_snap.device.type == "meta"
+    assert qsl_snap.device.type == "meta"
+    # ...and the host side it is copied to is pinned CPU. Not zeros_like: that is
+    # what made the host side inherit the compute device.
+    assert pinned_ids.device.type == "cpu"
+    assert pinned_qsl.device.type == "cpu"
+    assert pinned_ids.is_pinned()
+    assert pinned_qsl.is_pinned()
+    # Row counts must shadow the buffers they are read against, or the D2H
+    # under- or over-fills silently.
+    assert pinned_ids.shape == ids_snap.shape
+    assert pinned_qsl.shape == qsl_snap.shape
+    assert pinned_qsl.shape[0] == ROWS + 1
+
+
+def test_alloc_snap_scratch_allocates_nothing_below_mode_two(hostids_env) -> None:
+    """The off state of a perf knob has to cost zero, asserted at the method itself."""
+    for mode in (0, 1):
+        hostids_env["mode"] = mode
+        obj = _AllocStandIn()
+
+        Qwen4ExpNGramEmbedding._alloc_snap_scratch(obj)
+
+        assert obj._ids_snapshot is None, mode
+        assert obj._qsl_snapshot is None, mode
+        assert obj._pinned_ids_snapshot is None, mode
+        assert obj._pinned_qsl_snapshot is None, mode
+
+
+def test_an_over_long_input_snapshots_the_prefix_instead_of_raising() -> None:
+    """A captured graph hands forward capacity-padded arrays; that is not an error.
+
+    Boot #4's own dump printed ``qsl=[0, 3, 6, 6, 6]`` for three requests, so the
+    device side is routinely longer than the snapshot. Uncapped slicing shortens the
+    destination silently and ``copy_`` then raises -- and this runs inside the
+    compiled region, where a raise is a dead boot rather than a missing diagnostic.
+    """
+    emb = StagingEmbedding()
+    emb._ids_snapshot = torch.zeros(2, dtype=torch.long)
+    emb._qsl_snapshot = torch.zeros(3, dtype=torch.long)
+
+    emb._snapshot_compute_inputs(
+        torch.tensor([11, 22, 33, 44], dtype=torch.long),
+        torch.tensor([0, 3, 6, 6, 6], dtype=torch.long),
+    )
+
+    assert emb._ids_snapshot.tolist() == [11, 22], emb._ids_snapshot.tolist()
+    assert emb._qsl_snapshot.tolist() == [0, 3, 6], emb._qsl_snapshot.tolist()

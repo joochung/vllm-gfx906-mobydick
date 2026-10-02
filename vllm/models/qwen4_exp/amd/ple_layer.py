@@ -1003,8 +1003,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._qsl_snapshot = torch.zeros(
             self.padded_buffer.shape[0] + 1, dtype=torch.long, device=device
         )
-        self._pinned_ids_snapshot = torch.zeros_like(self._ids_snapshot).pin_memory()
-        self._pinned_qsl_snapshot = torch.zeros_like(self._qsl_snapshot).pin_memory()
+        # The pinned host buffers are allocated from the *shape*, never with
+        # zeros_like() on the device tensors: zeros_like inherits the CUDA placement
+        # and pin_memory() then raises "cannot pin 'torch.cuda.LongTensor' only dense
+        # CPU tensors can be pinned". That is exactly how every HOSTIDS=2 boot died on
+        # 2026-10-01 (17:49, 17:56) inside load_weights, before the engine came up --
+        # and it survived the test suite because the ON path of this method had no
+        # test at all, only the off path did. See
+        # test_alloc_snap_scratch_pins_cpu_even_when_the_compute_device_is_not.
+        self._pinned_ids_snapshot = torch.zeros(
+            self._ids_snapshot.shape, dtype=torch.long, device="cpu"
+        ).pin_memory()
+        self._pinned_qsl_snapshot = torch.zeros(
+            self._qsl_snapshot.shape, dtype=torch.long, device="cpu"
+        ).pin_memory()
 
     def _snapshot_compute_inputs(
         self, input_ids: torch.Tensor, query_start_loc: torch.Tensor
@@ -1023,10 +1035,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if snap is None or self._hostids_disabled:
             return
         ids = input_ids.reshape(-1)
-        snap[: ids.numel()].copy_(ids)
+        # Clamped, not sliced. ``snap[:n]`` silently shortens the destination when
+        # n exceeds it, and ``copy_`` then raises on a shape mismatch -- inside the
+        # compiled region, where a raise is a dead boot and not a missing
+        # diagnostic. The buffers are sized from max_num_batched_tokens and
+        # max_num_seqs, and a captured graph hands forward capacity-padded arrays
+        # (boot #4's own dump printed qsl=[0, 3, 6, 6, 6] for three requests), so
+        # "too long" is expected, not exceptional; the prefix that fits is exactly
+        # the part worth reading.
+        n = min(ids.numel(), snap.numel())
+        snap[:n].copy_(ids[:n])
         qsl_snap = self._qsl_snapshot
         if qsl_snap is not None:
-            qsl_snap[: query_start_loc.numel()].copy_(query_start_loc)
+            m = min(query_start_loc.numel(), qsl_snap.numel())
+            qsl_snap[:m].copy_(query_start_loc[:m])
 
     def _read_input_snapshot(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Pull the snapshot into host memory and return numpy views.
