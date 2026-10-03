@@ -287,6 +287,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self,
         input_batch: InputBatch,
         req_states: RequestState,
+        *,
+        consumed_qsl: Any = None,
     ) -> None:
         """Compute this step's PLE ids on the host, if the step is one we can.
 
@@ -294,6 +296,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
         which is the whole reason the host has to do this work itself: a captured
         FULL decode graph replays the H2D out of ``_pinned_output`` and contains
         neither the D2H of the ids nor the gather that produced them.
+
+        ``consumed_qsl`` is the ``query_start_loc`` view ``prepare_inputs`` is
+        handing the forward for this step -- the boundary array the ngram fill
+        actually reads, at the capture-padded width. Differential mode forwards it
+        to the layer so its per-step line can report what the compute consumed
+        instead of what the gate compared (P1.14); with the knob off, or in mode 1,
+        it is read by nobody.
 
         Every failure mode returns without touching the model inputs, so the
         device path stays the default answer to anything unexpected. Refusals are
@@ -405,6 +414,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     ngram_context,
                     gather=gather,
                     device_inputs=device_inputs,
+                    consumed_qsl=consumed_qsl,
                 )
             except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
                 self.disable_host_staging(
@@ -533,8 +543,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         # Host ids first: the pinned rows they fill are what this step's H2D (or,
         # under a captured graph, the replayed H2D) delivers to the device, so
-        # they have to be in place before the forward is enqueued.
-        self._stage_host_ple_ids(input_batch, req_states)
+        # they have to be in place before the forward is enqueued. ``consumed_qsl``
+        # is the same object the model is about to be handed -- not the runner's
+        # ``input_batch.query_start_loc`` the differential's input gate compares
+        # against, which is a different buffer at a different width (P1.14).
+        self._stage_host_ple_ids(input_batch, req_states, consumed_qsl=query_start_loc)
         # Issued last: the current chunk's inputs are already prepared, so the
         # hints overlap the GPU work that follows instead of delaying it.
         self._prefetch_next_ple_chunk(input_batch, req_states)

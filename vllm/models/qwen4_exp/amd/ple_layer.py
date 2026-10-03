@@ -473,7 +473,7 @@ class MmapShardedNGramEmbedding(nn.Module):
         out.index_copy_(0, order, gathered)
 
 
-def _bounded_ids(arr, cap: int = 16) -> str:
+def _bounded_ids(arr, cap: int = 16, compact: bool = False) -> str:
     """Render an ids array for a log line, with any truncation visible.
 
     A refusal that names only the first differing pair proves the buffer is not the
@@ -484,11 +484,111 @@ def _bounded_ids(arr, cap: int = 16) -> str:
     explicit ``+N more`` marker are here because a log line on this path must not be
     able to grow with the batch, and a dump that silently stops at a limit reads as a
     complete one.
+
+    ``compact`` only drops the space after each comma, so a width-bearing field like
+    ``qsl(width=4)=[0,4,4,4]`` reads as one token.  The cap and the marker are
+    deliberately identical in both spacings: one convention, not two.
     """
     flat = [int(v) for v in np.asarray(arr).reshape(-1).tolist()]
+    sep = "," if compact else ", "
     if len(flat) <= cap:
-        return str(flat)
-    return str(flat[:cap])[:-1] + f", ... +{len(flat) - cap} more]"
+        return "[" + sep.join(str(v) for v in flat) + "]"
+    shown = sep.join(str(v) for v in flat[:cap])
+    return f"[{shown}, ... +{len(flat) - cap} more]"
+
+
+_PACKED_DUMP_ROWS = 16
+_PACKED_DUMP_CELLS = 16
+_QSL_DUMP = 32
+"""Caps for the differential's log lines.
+
+Row count, cells per row, and query boundaries per vector. Every one of them is a
+constant, which is what makes "this line cannot grow with traffic" a property of the
+code rather than a hope about the workload: the workspace is ``max_num_reqs`` by
+``max_total_tokens`` wide, so an uncapped print of it is a multi-kilobyte line on a
+prefill step.
+"""
+
+
+def _shape_str(values: Any) -> str | None:
+    """``(3,192)`` for a tensor or an array, or None if there is no shape to name.
+
+    Reads the shape metadata only, so it costs no device access -- which matters
+    because a geometry field that needs a sync is a field that changes what the
+    instrument measures.
+    """
+    shape = getattr(values, "shape", None)
+    if shape is None:
+        return None
+    return "(" + ",".join(str(int(d)) for d in shape) + ")"
+
+
+def _host_view(values: Any) -> Any:
+    """A numpy view of a tensor or an array, or None for nothing to read.
+
+    The differential reads tensor *references* to the runner's own buffers, which
+    may equally well be numpy in a probe or a test fixture, so the same two-line
+    dance the existing legs do is factored out here rather than copied a fourth
+    time.
+    """
+    if values is None:
+        return None
+    if hasattr(values, "detach"):
+        return values.detach().cpu().numpy()
+    return np.asarray(values)
+
+
+def _render_vector(name: str, values: Any, cap: int = _QSL_DUMP) -> str:
+    """``qsl(width=4)=[0,4,4,4]`` for a query-boundary vector, or a *named* absence.
+
+    The width is part of the field name rather than a footnote: the whole P1.14
+    finding is that two qsl views of different widths were compared as if they were
+    one object, and a value without its width is how that got past the instrument
+    for twelve boots.
+    """
+    if values is None:
+        return f"{name}(n/a(no buffer was handed over))"
+    flat = np.asarray(values).reshape(-1)
+    return f"{name}(width={flat.size})={_bounded_ids(flat, cap=cap, compact=True)}"
+
+
+def _fill_extent(values: Any, sentinel: int) -> int:
+    """Count the leading cells of a packed row that are not the fill sentinel.
+
+    ``_compute_ngram_ids`` opens with ``packed.fill_(eos_token_id)`` and scatters
+    exactly one cell per token it was handed, so the first cell still holding the
+    fill value is the first cell the scatter never reached -- a measurement of the
+    extent the fill worked from, taken off the scratch itself.
+
+    It is a *lower bound*: a real token that happens to equal ``eos_token_id``
+    truncates the count early. On this model the fill value is the vocabulary's
+    EOS and decode rows are draft tokens, so the case is rare but not impossible,
+    and an instrument that overstates what the scratch proves is worse than one
+    that says "at most".
+    """
+    row = np.asarray(values).reshape(-1)
+    hit = np.flatnonzero(row == sentinel)
+    return int(hit[0]) if hit.size else int(row.size)
+
+
+def _bounded_rows(
+    values: Any,
+    cap: int = _PACKED_DUMP_ROWS,
+    cells: int = _PACKED_DUMP_CELLS,
+) -> str:
+    """Render the rows of a 2D workspace, with both caps made visible.
+
+    Same ``+N more`` convention as :func:`_bounded_ids`, applied one level up: a
+    workspace print that stops at a limit has to say it stopped, or the reader
+    takes a partial view of the scratch for the whole thing.
+    """
+    n = int(values.shape[0])
+    rows = [
+        _bounded_ids(values[r, :], cap=cells, compact=True) for r in range(min(n, cap))
+    ]
+    if n > len(rows):
+        return "[" + ", ".join(rows) + f", ... +{n - len(rows)} more]"
+    return "[" + ", ".join(rows) + "]"
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -663,6 +763,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._host_check_dev_inputs: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
+        # P1.14: the qsl view the compute is actually handed, captured in the
+        # worker next to the staging call. It is NOT ``input_batch.query_start_loc``
+        # (which the input gate compares against the host's): ``prepare_inputs``
+        # stages ``ple_query_start_loc[: num_reqs_padded + 1]`` into forward, a
+        # different buffer at the padded width, so until now nothing in the
+        # harness ever read the array the fill math consumed. Overwritten by the
+        # same act that sets ``_host_check_rows``, so it cannot outlive the step it
+        # describes any more than the staged rows can.
+        self._host_consumed_qsl: Any = None
         # Generation tripwire (P1.5). ``_host_stage_gen`` counts staged steps and
         # is copied into pinned memory in the same act that writes the rows, so a
         # value in the pinned slot means "rows for that step are in the buffer
@@ -906,12 +1015,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         *,
         gather: bool,
         device_inputs: tuple[Any, ...] | None = None,
+        consumed_qsl: Any = None,
     ) -> bool:
         """Turn this step's host-computed row ids into staged embedding rows.
 
         ``gather=False`` is differential mode: the ids are kept in a side buffer
         for :meth:`compare_host_ids` against the device's own answer, and the
         device path is left completely in charge.
+
+        ``consumed_qsl`` is differential-only too, and it is the *forward* input:
+        the exact ``query_start_loc`` view ``prepare_inputs`` hands the model this
+        step, as opposed to the runner's array the gate compares against. See
+        :meth:`_consumed_report`.
         """
         if self._hostids_disabled:
             return False
@@ -961,6 +1076,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # runs inside this same step.
             if device_inputs is not None:
                 self._host_check_dev_inputs = device_inputs
+            self._host_consumed_qsl = consumed_qsl
             return True
         dst = self._pinned_ngram_ids[:rows]
         dst.numpy()[:] = ids
@@ -1249,6 +1365,92 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             parts.append(f"dev  row{r}={dev[r, shown].tolist()}")
         return "; ".join(parts)
 
+    def _consumed_report(self, ids_len: int, stage_rows: int, dev_inputs: Any) -> str:
+        """One line per compared step, naming the extent the fill consumed (P1.14).
+
+        Why the scratch is the witness. ``_compute_ngram_ids`` opens with
+        ``packed.fill_(eos_token_id)``, and ``positions`` is
+        ``positions_buffer[:num_tokens]`` -- a registered ``arange`` buffer that is
+        never written per step -- so a scatter over ``ids_len`` tokens writes cells
+        ``0 .. qsl[1] - 1`` of row 0 and nothing beyond them. Therefore
+        ``extent_row0 == consumed_qsl[1]`` whenever the fill and the buffer it read
+        agree, and the equality is measured off the device's own scratch rather
+        than off any array the harness believes in.
+
+        Why the two qsl vectors are printed side by side. Boot #12's row 0 was
+        ``[17383, 653, EOS, EOS]`` at ``ids_len=4``: the fill had written two cells
+        for a four-token step, which is what a qsl whose first boundary is 2 looks
+        like (with ``arange`` positions, cells 0 and 1 go to request 0 and cells 2
+        and 3 land in *other* rows). The gate printed ``qsl device=[0,4]`` and
+        concluded the inputs agreed, because it reads ``input_batch.query_start_loc``
+        -- the runner's array, sliced to the real ``num_reqs`` -- while forward is
+        handed ``ple_query_start_loc[: num_reqs_padded + 1]``, a different buffer at
+        the capture-padded width. Two objects, two widths, compared as one. Printing
+        both with their widths is the entire change; the line says which of them the
+        fill listened to.
+
+        Cost, stated because the house rule is that a check must not be priced in
+        the currency of the bug it catches. Three reads per *compared* step: two
+        boundary vectors of at most ``max_num_reqs + 1`` integers, and row 0 of the
+        scratch cut to ``ids_len`` cells -- strictly smaller than the ids buffer
+        this mode copies a few statements earlier in the same op body. That copy is
+        blocking, so the stream wait is already paid before any of these are
+        issued: they add launches, not waits. Nothing here runs when the knob is
+        off or at 1 (mode 1 never sets ``_host_check_rows``, so
+        :meth:`compare_host_ids` is never entered), and the no-sync test counts
+        ``Tensor.cpu`` and ``Tensor.item`` calls across a whole device-path lookup
+        to keep that honest.
+
+        Rate: one line per compared step, no sampling. The failure is single-step
+        and intermittent -- two boots in eleven -- so any sampling rule can step
+        over the only step that shows it, and a diagnostic that can miss the event
+        it exists to catch is not a diagnostic. What is bounded instead is the
+        line: three integers, one shape, and two vectors capped at ``_QSL_DUMP``
+        numbers, so its length does not depend on the batch or the traffic. Mode 2
+        is a correctness boot that keeps the blocking D2H by design, so a per-step
+        line costs nothing that mode is not already paying.
+
+        Anything that fails to read is named as an absence. An ``n/a`` that looks
+        like a value is the failure mode this harness has been rebuilt around.
+        """
+        fields = [f"PLE DIFF: ids_len={ids_len}"]
+        try:
+            consumed = _host_view(getattr(self, "_host_consumed_qsl", None))
+            gate = (
+                _host_view(dev_inputs[1])
+                if dev_inputs is not None and len(dev_inputs) > 1
+                else None
+            )
+            inputs = self._host_check_inputs
+            packed = (
+                inputs[3]
+                if inputs is not None and len(inputs) > 3
+                else getattr(self, "padded_buffer", None)
+            )
+            fields.append(_render_vector("qsl", consumed))
+            shape = _shape_str(packed)
+            fields.append(
+                f"packed.shape={shape if shape is not None else 'n/a(no workspace)'}"
+            )
+            extent = "n/a(no workspace)"
+            if packed is not None and getattr(packed, "ndim", 0) == 2 and ids_len > 0:
+                row0 = _host_view(packed[0, :ids_len])
+                if row0 is not None:
+                    extent = str(_fill_extent(row0, self.eos_token_id))
+            fields.append(f"extent_row0={extent}")
+            fields.append(_render_vector("gate_qsl", gate))
+            if stage_rows != ids_len:
+                # The silent case: compare_host_ids used to return here without
+                # saying anything, so a compute that produced a different number of
+                # rows than the host staged was invisible by construction.
+                fields.append(f"stage_rows={stage_rows}")
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
+            return (
+                "PLE DIFF: n/a(reading the consumed extent raised "
+                f"{type(exc).__name__})"
+            )
+        return " ".join(fields)
+
     def _packed_dump(self, inputs: Any, bad_rows: list[int]) -> str:
         """What the hash consumed inside itself, not what the caller handed it.
 
@@ -1272,6 +1474,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         Compare-only, and it costs one small sync on a path that disables itself
         after the first mismatch. A failure here must never kill a step.
+
+        Geometry (P1.14): the print covers ``pk.shape[0]`` rows and names
+        ``packed.shape`` itself. The first version derived the row count from the
+        compare-time qsl, so every dump ever taken printed exactly one row of a
+        workspace that had three, and reported no sign of the difference.
 
         ``packed`` may be a tensor (the layer's own ``padded_buffer``, which is what
         the worker stages) or a plain array (what the on-path probe stages), so it
@@ -1306,9 +1513,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return f"packed=n/a(reading it raised {type(exc).__name__})"
         ctx_len = self.ngram_size - 1
         n_reqs = int(min(pk.shape[0], max(1, qsl.shape[0] - 1)))
-        lens = [int(qsl[i + 1] - qsl[i]) for i in range(n_reqs)]
-        width = int(min(pk.shape[1], (max(lens) if lens else 0) + ctx_len))
-        out = [f"packed device={pk[:n_reqs, :max(width, 1)].tolist()}"]
+        # P1.14: print the workspace's OWN geometry. Until now this line sized
+        # itself with ``qsl.shape[0] - 1`` -- the request count of the *compare-time*
+        # qsl, i.e. the host's -- so a three-request workspace under a one-request
+        # host step printed exactly one row, and every row the host never staged was
+        # invisible by construction. Those are precisely the rows a second pass in
+        # the same step writes, which is the case this dump is for.
+        out = [f"packed.shape={_shape_str(pk)}", "packed device=" + _bounded_rows(pk)]
         for r in bad_rows[:2]:
             req = int(np.clip(np.searchsorted(qsl, r, side="right") - 1, 0, n_reqs - 1))
             col = int(r - qsl[req])
@@ -1534,7 +1745,28 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         captured = self._host_check_dev_inputs
         dev_inputs = device_inputs if device_inputs is not None else captured
         self._host_check_dev_inputs = None
-        if rows < 0 or rows != device_ids.shape[0]:
+        if rows < 0:
+            return
+        # P1.14: the consumed-extent line, printed BEFORE both early returns and
+        # before the input gate. Order is the point. The two returns below are
+        # silent, and the first one is exactly the case the extent exists to
+        # describe -- a compute that handed over a different number of rows than
+        # the host staged -- so an instrument that printed after either would
+        # report on the steps that already make sense and stay quiet on the ones
+        # that do not. The gate is skipped for the same reason: when it refuses,
+        # the comparison never happens, and that is the step worth reading.
+        if ple_hostids.hostids_mode() == 2 and not self._hostids_disabled:
+            # The method guards its own reads; this guard is for the one failure it
+            # cannot see from the inside -- the report not existing or blowing up on
+            # whatever ``self`` turns out to be. A diagnostic that kills a step is
+            # worse than one that prints nothing, which is the rule P1.9's snapshot
+            # copies paid for with a boot.
+            try:
+                line = self._consumed_report(device_ids.shape[0], rows, dev_inputs)
+            except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
+                line = f"PLE DIFF: n/a(the report raised {type(exc).__name__})"
+            logger.info("%s", line)
+        if rows != device_ids.shape[0]:
             return
         # Input-agreement gate (P1.10b): ask the attribution question directly
         # instead of inferring it from how often the op has been entered.

@@ -111,6 +111,7 @@ class StagingEmbedding:
     _inputs_agree = Qwen4ExpNGramEmbedding._inputs_agree
     _ctx_leg = Qwen4ExpNGramEmbedding._ctx_leg
     _packed_dump = Qwen4ExpNGramEmbedding._packed_dump
+    _consumed_report = Qwen4ExpNGramEmbedding._consumed_report
     _note_input_refusal = Qwen4ExpNGramEmbedding._note_input_refusal
 
     def __init__(self, rows: int = ROWS, capacity: int = CAPACITY) -> None:
@@ -144,6 +145,10 @@ class StagingEmbedding:
         self.padded_buffer = torch.full((4, 64), EOS, dtype=torch.long)
         self._host_check_draft: tuple[Any, Any, int] | None = None
         self._host_check_dev_inputs: Any = None
+        # P1.14: the qsl view the forward is handed. The stand-in has to carry it
+        # because the per-step report reads it, and a stand-in whose log lines
+        # cannot be rendered is a stand-in whose tests are not testing the line.
+        self._host_consumed_qsl: Any = None
         self._rows = rows
         # Generation tripwire state, mirroring the production __init__. The event
         # is a FakeEvent so `query()` is controllable and a synchronize() is a
@@ -2193,7 +2198,13 @@ def test_the_worker_hands_the_device_window_over_at_staging_time(monkeypatch) ->
         def note_draft_provenance(self, values, row_idx, gen) -> None:  # noqa: ANN
             return None
 
-        def stage_host_step(self, ids, qsl, ctx, *, gather, device_inputs) -> None:  # noqa: ANN
+        def stage_host_step(  # noqa: ANN
+            self, ids, qsl, ctx, *, gather, device_inputs, consumed_qsl=None
+        ) -> None:
+            # ``consumed_qsl`` is P1.14's addition to the production signature. A
+            # stub narrower than production's does not catch a wiring change, it
+            # just stops the staging loop with a TypeError -- which the producer
+            # swallows by design -- so it has to be restated here when it moves.
             self.staged.append((gather, device_inputs))
 
     class History:
