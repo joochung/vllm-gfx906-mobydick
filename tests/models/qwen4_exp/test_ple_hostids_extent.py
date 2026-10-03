@@ -573,12 +573,23 @@ def test_prepare_inputs_forwards_the_same_view_it_hands_the_model() -> None:
     same name, with no second slice in between.
     """
     src = inspect.getsource(model_state_module.Qwen4ExpModelState.prepare_inputs)
+    refresh = inspect.getsource(
+        model_state_module.Qwen4ExpModelState._refresh_ple_query_start_loc
+    )
 
     assert "query_start_loc=query_start_loc" in src, src
     assert "consumed_qsl=query_start_loc" in src, src
-    assert src.count("self.ple_query_start_loc[") == 1, (
-        "prepare_inputs slices the staged qsl more than once: the differential can "
-        "then report one slice while the model reads another"
+    # The slice used to sit in prepare_inputs; it now lives in the refresh method so
+    # the whole-buffer write and the view handed forward cannot disagree. The property
+    # is unchanged -- exactly one slice, handed to both consumers -- it is just asked
+    # of two functions now.
+    assert "self.ple_query_start_loc[" not in src, (
+        "prepare_inputs slices the staged qsl again: the differential can then report "
+        "one view while the model reads another"
+    )
+    assert refresh.count("return dst[") == 1, (
+        "the refresh method must hand forward exactly one view of the buffer it just "
+        "wrote, or the captured graph and the report can describe different slices"
     )
 
 

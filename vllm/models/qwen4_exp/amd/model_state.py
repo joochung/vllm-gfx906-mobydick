@@ -525,6 +525,49 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 dict(self._ple_host_refusals),
             )
 
+    def _refresh_ple_query_start_loc(self, input_batch: InputBatch) -> torch.Tensor:
+        """Make the whole static PLE boundary array describe THIS step.
+
+        Why the whole buffer and not the padded prefix. A captured full-decode graph
+        indexes this array with the request width it was **captured** at, not the
+        width of the step being replayed, so refreshing only
+        ``[: num_reqs_padded + 1]`` leaves the tail holding some older, wider step's
+        boundaries. Boot #13 caught the consequence: a one-request, four-token step
+        whose ngram fill read an array beginning ``[0, 2, 2, ...]`` -- the padded form
+        of an earlier two-token step, whose tail is ``num_tokens`` by the runner's own
+        convention (``input_batch.py:159``) -- and therefore scattered positions 2 and
+        3 into **row 2** of the workspace instead of row 0. The scratch pins how narrow
+        that is: of the non-decreasing arrays the fill could have held, only four-entry
+        ones starting ``[0, 2, 2]`` reproduce the captured workspace cell for cell
+        (entry 3 is unconstrained by the observation; the runner would have written
+        ``2`` there). A three-entry ``[0, 2, 2]`` does not -- the first analysis said
+        that until ``request_indices.clamp_`` was included in the reproduction.
+
+        The runner already keeps its own copy unambiguous for every width by
+        writing ``num_tokens`` into the tail, so the fix is to hand over that whole
+        array instead of a prefix of it. When the source is a short
+        ``[num_reqs + 1]`` view -- adaptive verification rebuilds
+        ``query_start_loc`` at ``model_runner.py:1521`` -- the remaining cells get
+        the same ``num_tokens`` the runner would have written there, rather than
+        whatever the previous step left.
+
+        Cost is the same one copy that call already was: this buffer is
+        ``max_num_reqs + 1`` int32 (16 bytes at the capture width this box runs at),
+        and the short-source fill is a host-side branch that does not fire when the
+        runner handed over its full buffer.
+
+        Returns the view forward is handed -- the same ``[: num_reqs_padded + 1]``
+        prefix as before, from the same slice, so the differential's
+        ``consumed_qsl`` capture and the graph still describe one object.
+        """
+        src = input_batch.query_start_loc
+        dst = self.ple_query_start_loc
+        copied = min(src.shape[0], dst.shape[0])
+        dst[:copied].copy_(src[:copied])
+        if copied < dst.shape[0]:
+            dst[copied:].fill_(input_batch.num_tokens)
+        return dst[: input_batch.num_reqs_after_padding + 1]
+
     def prepare_inputs(
         self,
         input_batch: InputBatch,
@@ -534,9 +577,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if not self.uses_ngram_embedding:
             return model_inputs
 
-        num_reqs_padded = input_batch.num_reqs_after_padding
-        query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
-        query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        query_start_loc = self._refresh_ple_query_start_loc(input_batch)
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
