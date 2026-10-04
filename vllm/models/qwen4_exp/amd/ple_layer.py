@@ -217,6 +217,103 @@ def _reset_capture_probe_cache() -> None:
     _CAPTURE_PROBE = None
 
 
+# ---------------------------------------------------------------------------
+# E1 Phase 1 (docs/e1-full-graph-plan.md sec 3e): making a FULL graph capturable
+# with host-staged PLE rows, and saying out loud which branch each capture shape
+# took while doing it.
+#
+# Phase 0 was read by INFERENCE -- from later comparison counts I claimed which
+# capture shapes had taken the graph-safe branch, and the inference was wrong
+# once already (it wrote `divmod(num_tokens, num_reqs)` into the plan when the
+# real mechanism is `num_reqs = min(num_tokens, max_num_reqs)`,
+# cudagraph_utils.py:280). So the branch that decides whether a FULL graph
+# contains a capturable H2D now reports what it did, per capture shape.
+# ---------------------------------------------------------------------------
+
+# Bounded label set, so the summary line cannot be widened by an unforeseen case.
+CAPTURE_STAGE_LABELS = ("staged", "staged-mismatch", "dummy", "fell-through")
+# capture shape (n) -> {label: count}. Cleared by the flush, which is also what
+# makes the flush run once per capture round rather than once per process.
+_CAPTURE_STAGE: dict[int, dict[str, int]] = {}
+
+
+def _host_stage_active(ple_embedding: Any) -> bool:
+    """Is the host going to stage this layer's rows on real decode steps?
+
+    Mode 1 only, deliberately. Mode 2 (differential) keeps the device path fully
+    in charge and retains the blocking D2H by design -- a graph that replays an
+    H2D of host-staged rows has no device path left to disagree with, so
+    ``GRAPHMODE=full`` and ``VLLM_GFX906_PLE_HOSTIDS=2`` are mutually exclusive.
+    That is a consequence worth stating before someone boots it and reads the
+    HIP error as a regression: the differential arm has to run on a piecewise
+    boot (which is how boot #14 got its 22,637 steps), and what a FULL boot
+    verifies instead is the generation tripwire.
+
+    ``getattr(..., True)`` for the disabled flag so a stub embedding that never
+    participated in staging -- the probe and prof tests use those -- falls
+    through to the device path instead of taking this branch.
+    """
+    return (
+        getattr(ple_embedding, "_hostids_disabled", True) is False
+        and getattr(ple_embedding, "_pinned_output", None) is not None
+        and ple_hostids.hostids_mode() == 1
+    )
+
+
+def _attest_capture_stage(ple_embedding: Any, n: int, how: str) -> None:
+    """Record how the graph got its PLE H2D for an ``n``-token capture shape."""
+    counts = _CAPTURE_STAGE.setdefault(n, {})
+    counts[how] = counts.get(how, 0) + 1
+    if how == "fell-through" and counts[how] == 1:
+        # The next statement in the caller is the blocking D2H, which is the op
+        # hipErrorStreamCaptureUnsupported fires on. Saying so BEFORE the HIP
+        # error is the difference between a log that explains a dead boot and a
+        # log that merely shows one.
+        logger.warning(
+            "PLE STAGE@CAPTURE: n=%d is falling through to the blocking "
+            "device->host copy while a capture is in progress ('%s'). That copy "
+            "is not capturable, so if this capture dies with "
+            "hipErrorStreamCaptureUnsupported, this is why: host staging is off "
+            "or was disabled for this layer. VLLM_GFX906_PLE_HOSTIDS=1 is a "
+            "prerequisite for GRAPHMODE=full, not an optional extra "
+            "(docs/e1-full-graph-plan.md sec 3e).",
+            n,
+            getattr(ple_embedding, "layer_name", "?"),
+        )
+
+
+def _flush_capture_stage_summary() -> None:
+    """One INFO line per capture shape, on the first step that is not a capture.
+
+    Deferred rather than immediate because the op runs once per PLE layer per
+    capture iteration: logging in the branch would be a line per layer per shape
+    per round, which is noise that hides the one thing the line is for. Clearing
+    the dict is what ends the round, so a second capture round (piecewise then
+    full, or a retry) gets its own summary.
+    """
+    for n in sorted(_CAPTURE_STAGE):
+        counts = _CAPTURE_STAGE[n]
+        body = " ".join(
+            f"{label}={counts.get(label, 0)}" for label in CAPTURE_STAGE_LABELS
+        )
+        captured = counts.get("staged", 0) + counts.get("dummy", 0)
+        layers = max(counts.values()) if counts else 0
+        logger.info(
+            "PLE STAGE@CAPTURE: capture shape n=%d -> %s. %d of %d PLE layer "
+            "call(s) at this shape got their embedding rows from the host-staged "
+            "pinned buffer (non-blocking H2D, capturable); %d went the device "
+            "path (blocking D2H, NOT capturable). 'dummy' = capture of a padded "
+            "batch no producer staged, whose values are irrelevant and which the "
+            "host overwrites before every replay.",
+            n,
+            body,
+            captured,
+            layers,
+            counts.get("fell-through", 0) + counts.get("staged-mismatch", 0),
+        )
+    _CAPTURE_STAGE.clear()
+
+
 class MmapShardedNGramEmbedding(nn.Module):
     """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
     shard tensors, with no TP sharding and no copying. Every rank maps the
@@ -2603,6 +2700,12 @@ def qwen4_exp_amd_ple_ngram_embedding(
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
     ple_embedding = layer.ple_embedding
     n = ngram_ids.shape[0]
+    if _CAPTURE_STAGE and not torch.cuda.is_current_stream_capturing():
+        # Capture is over -- this is a live step -- and at least one shape was
+        # recorded. Report what each capture shape did before real work buries it.
+        # Gated on the dict being non-empty so a boot that never captured anything
+        # pays a dict check and no CUDA call.
+        _flush_capture_stage_summary()
     # E1 Phase 0 ceiling probe: while a capture is in progress, record only the
     # H2D and return. See _capture_probe_enabled() for why a captured gather is
     # worse than a skipped one, and why the consequence (frozen PLE rows) makes
@@ -2635,11 +2738,51 @@ def qwen4_exp_amd_ple_ngram_embedding(
                 # what makes a tripwire fire fatal rather than a disable. Not a
                 # graph node, and deliberately so.
                 ple_embedding._staged_branch_captured = True
+                _attest_capture_stage(ple_embedding, n, "staged")
             return
+        if torch.cuda.is_current_stream_capturing():
+            # A row count that does not match the shape being captured cannot be
+            # honored, and the fall-through below is fatal here. Worth a label of
+            # its own in the summary: it means the producer staged something for a
+            # different extent than the graph was built for, which is a padding
+            # bug, not a "nothing staged" case.
+            _attest_capture_stage(ple_embedding, n, "staged-mismatch")
+    # E1 Phase 1: a capture is in progress and nothing staged this step.
+    #
+    # The FULL ("mixed") capture branch picks its request count with
+    # `num_reqs = min(num_tokens, max_num_reqs)` (cudagraph_utils.py:280-281), so
+    # with max_num_seqs=3 and capture sizes [4, 8, 12] the 4- and 8-token dummies
+    # are 3-request batches whose rows are NOT a uniform 1 + num_speculative_tokens
+    # per request. The producer refuses those -- they are not a decode step anyone
+    # will ever replay -- and without this clause the op fell through to the
+    # blocking D2H and the capture died, which is why HOSTIDS=1 + GRAPHMODE=full
+    # was not bootable before this clause existed.
+    #
+    # What capture actually needs is a fixed-extent, non-blocking H2D out of the
+    # pinned staging buffer. It does not need these dummies' VALUES: no replay
+    # reads what capture left there, because the host writes the real rows into
+    # the same pinned address before every replay. So the rows are zeroed first.
+    # That is not tidiness. If a step ever replays this graph without the host
+    # having staged it, zeros mean PLE contributes nothing -- which the
+    # degeneration smoke test catches structurally -- instead of serving the
+    # previous step's embedding rows, which read as entirely plausible text. The
+    # second is the 2026-09-20 failure mode; this line turns it from silent into
+    # detectable.
+    if torch.cuda.is_current_stream_capturing() and _host_stage_active(ple_embedding):
+        staged_rows = ple_embedding._pinned_output[:n]
+        staged_rows.zero_()  # host memset on pinned memory: not a graph node
+        output.copy_(staged_rows, non_blocking=True)
+        scratch = ple_embedding._gen_scratch(output.device)
+        scratch.copy_(ple_embedding._pinned_gen, non_blocking=True)
+        ple_embedding._staged_branch_captured = True
+        _attest_capture_stage(ple_embedding, n, "dummy")
+        return
     # VLLM_GFX906_PLE_PROF=1 brackets the four host-visible steps below (see
     # vllm/models/qwen4_exp/amd/ple_prof.py for what each one means and why
     # graph capture is excluded). With the knob unset the statements executed
     # are exactly the ones that ran before the brackets existed.
+    if torch.cuda.is_current_stream_capturing():
+        _attest_capture_stage(ple_embedding, n, "fell-through")
     prof = ple_prof.prof_enabled() and not torch.cuda.is_current_stream_capturing()
     if prof:
         faults_before = ple_prof.page_faults()

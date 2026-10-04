@@ -86,6 +86,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
+        # E1 Phase 1: refusals that happened while a graph had the staged branch
+        # captured, and the sticky flag that says a graph does. Sticky because a
+        # capture cannot be undone, and because checking it per refusal should not
+        # have to walk the layer list every time.
+        self._ple_host_captured = False
+        self._ple_host_captured_refusals = 0
         # The draft-block generation this model state last consumed. Freshness is
         # the one property of the mirror that no shape check can infer.
         self._last_draft_gen = -1
@@ -485,10 +491,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
     def disable_host_staging(self, why: str) -> None:
         if not self._ple_host_layers:
             return
-        captured = any(
-            getattr(layer, "_staged_branch_captured", False)
-            for layer in self._ple_host_gen_layers
-        )
+        captured = self._staged_graph_in_play()
         if captured:
             # Do not claim a fallback that a replay cannot perform. The op body
             # stopped running for these steps, so the graph keeps replaying
@@ -514,6 +517,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         self._ple_host_layers = []
 
+    def _staged_graph_in_play(self) -> bool:
+        """True once a captured graph is serving these steps, and forever after.
+
+        The op sets ``_staged_branch_captured`` during capture only, so this is
+        False for the whole of a piecewise boot -- which is what makes it the
+        right precondition for claims that only hold under FULL.
+        """
+        if self._ple_host_captured:
+            return True
+        if any(
+            getattr(layer, "_staged_branch_captured", False)
+            for layer in self._ple_host_gen_layers
+        ):
+            self._ple_host_captured = True
+        return self._ple_host_captured
+
     def _note_host_refusal(self, reason: str) -> None:
         self._ple_host_refusals[reason] = self._ple_host_refusals.get(reason, 0) + 1
         if reason not in self._ple_host_refusal_logged:
@@ -522,6 +541,32 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 "PLE HOSTIDS: first refusal (%s); device path used for that step. "
                 "Counts so far: %s",
                 reason,
+                dict(self._ple_host_refusals),
+            )
+        if not self._staged_graph_in_play():
+            return
+        # E1 Phase 1, and the sharpest edge on shipping FULL. "Device path used
+        # for that step" is FALSE under a captured graph: the op body does not run
+        # at replay, so a refused step replays the PREVIOUS step's pinned rows.
+        # Plausible text is the worst output a lookup table can produce, and the
+        # generation tripwire cannot see a sustained refusal (nothing advances the
+        # counter, so nothing looks stale). So the count is the thing that decides
+        # whether FULL + HOSTIDS=1 is shippable as a default or needs the runner to
+        # pick a non-FULL descriptor for unstaged steps: if a FULL boot leaves this
+        # at zero, the cliff was never reached; if it is non-zero, FULL needs that
+        # fallback and this line is the evidence for it.
+        self._ple_host_captured_refusals += 1
+        if (
+            self._ple_host_captured_refusals == 1
+            or self._ple_host_captured_refusals % 32 == 0
+        ):
+            logger.warning(
+                "PLE HOSTIDS: refusal (%s) while a captured graph holds the staged "
+                "PLE branch. There is NO device path for that step: the graph "
+                "replays the previous step's embedding rows, so %d step(s) so far "
+                "ran on stale PLE. Counts: %s",
+                reason,
+                self._ple_host_captured_refusals,
                 dict(self._ple_host_refusals),
             )
 

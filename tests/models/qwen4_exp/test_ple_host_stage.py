@@ -522,6 +522,7 @@ class FakeModelState:
     stage_host_tokens = model_state_module.Qwen4ExpModelState.stage_host_tokens
     disable_host_staging = model_state_module.Qwen4ExpModelState.disable_host_staging
     _note_host_refusal = model_state_module.Qwen4ExpModelState._note_host_refusal
+    _staged_graph_in_play = model_state_module.Qwen4ExpModelState._staged_graph_in_play
 
     def __init__(self, slots: int = 8) -> None:
         self.uses_ngram_embedding = True
@@ -533,6 +534,11 @@ class FakeModelState:
         self._ple_host_refusals: dict[str, int] = {}
         self._ple_host_refusal_logged: set[str] = set()
         self._ple_host_steps = 0
+        # E1 Phase 1: the captured-graph refusal tracking the real class does. The
+        # stub borrows ``_note_host_refusal``, so it has to carry the state that
+        # method reads -- which is the point of borrowing rather than copying.
+        self._ple_host_captured = False
+        self._ple_host_captured_refusals = 0
         self._last_draft_gen = -1
         self._ple_host_tokens = None
         # The real class builds this in __init__ and seeds it at add time, so the
@@ -833,6 +839,37 @@ def test_refusals_are_counted_and_logged_once(hostids_env, caplog) -> None:
     assert st._ple_host_refusals["no-drafts"] == 1
     logged = [r.getMessage() for r in caplog.records if "HOSTIDS" in r.getMessage()]
     assert len(logged) == 2, "a repeated refusal reason logged repeatedly"
+
+
+def test_a_refusal_under_a_captured_graph_denies_the_device_path(
+    hostids_env, caplog
+) -> None:
+    """Under FULL, "device path used for that step" is a lie -- so say the truth.
+
+    This count is the shipping gate for ``GRAPHMODE=full`` + ``HOSTIDS=1``: a step
+    the host refused still replays, and the graph hands back the PREVIOUS step's
+    embedding rows. The generation tripwire cannot see a sustained refusal (nothing
+    advances the counter, so nothing looks stale), which is why the counter exists.
+    A FULL boot that leaves this at zero never reached the cliff; a non-zero number
+    means FULL needs the runner to pick a non-FULL descriptor for unstaged steps.
+    """
+    emb = StagingEmbedding()
+    emb._staged_branch_captured = True
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_gen_layers = [emb]
+
+    with caplog.at_level("WARNING"):
+        st._note_host_refusal("history-pending")
+        st._note_host_refusal("history-pending")
+
+    assert st._ple_host_captured_refusals == 2
+    msgs = [
+        r.getMessage() for r in caplog.records if "captured graph" in r.getMessage()
+    ]
+    assert len(msgs) == 1, "first, then every 32nd -- not one per step"
+    assert "NO device path" in msgs[0]
+    assert "previous step's embedding rows" in msgs[0]
 
 
 def test_disable_reports_the_coverage_it_is_leaving(hostids_env, caplog) -> None:
