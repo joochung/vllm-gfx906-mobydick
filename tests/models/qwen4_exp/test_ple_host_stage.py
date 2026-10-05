@@ -109,6 +109,8 @@ class StagingEmbedding:
     check_host_gen = Qwen4ExpNGramEmbedding.check_host_gen
     _fire_gen = Qwen4ExpNGramEmbedding._fire_gen
     _inputs_agree = Qwen4ExpNGramEmbedding._inputs_agree
+    stage_inputs_agree = Qwen4ExpNGramEmbedding.stage_inputs_agree
+    _note_stage_refusal = Qwen4ExpNGramEmbedding._note_stage_refusal
     _ctx_leg = Qwen4ExpNGramEmbedding._ctx_leg
     _packed_dump = Qwen4ExpNGramEmbedding._packed_dump
     _consumed_report = Qwen4ExpNGramEmbedding._consumed_report
@@ -169,6 +171,7 @@ class StagingEmbedding:
         # were both observers of a region the AOT cache decides how to run.
         self._host_input_checks = 0
         self._host_input_skips = 0
+        self._host_stage_refusals = 0
         # P1.11: steps where the device window was never handed over, so the third
         # leg stayed dark. Mirrors the production __init__ for the same reason the
         # other counters do -- the gate prints it, so a stand-in without it is a
@@ -574,6 +577,75 @@ def _slot_tokens(slot: int, width: int = 64) -> np.ndarray:
 _POSITION = 5  # every request in _batch_and_states sits here
 
 
+def _step_device_ids(
+    slots, tokens: np.ndarray, num_reqs: int, q: int, position: int | None = None
+) -> list[int]:
+    """The runner's ``input_ids`` for the step ``_batch_and_states`` describes.
+
+    Row 0 of each request is the newest committed token from the host mirror; the
+    rest are the staged drafts. Same construction the tests spell out by hand, in
+    one place so the fixture and the assertions cannot drift apart.
+    """
+    position = _POSITION if position is None else position
+    drafts = _drafts(num_reqs, q).wait_host_draft_tokens()[0]
+    ids: list[int] = []
+    for order, slot in enumerate(slots):
+        ids.append(int(tokens[slot, position]))
+        ids.extend(int(v) for v in drafts[order])
+    return ids
+
+
+def _advance_device_ids(
+    input_batch, st: FakeModelState, *, num_reqs: int = 2, q: int = 3
+) -> None:
+    """Set the fixture's device ``input_ids`` to what the runner holds for this step.
+
+    Row 0 is the mirror's newest committed token and the rest are the staged
+    drafts -- read from the state rather than recomputed from ``_slot_tokens``,
+    because after a commit the mirror is the ground truth for row 0 and the raw
+    token grid is not (``_commit`` lands values like 7 and 11, which are not in the
+    grid's synthetic id space).
+
+    In production the two move together: the post-update kernel advances
+    ``num_computed`` and the next step's ids start from the newly committed token.
+    A test that bumps only the counter describes a device that advanced and a
+    runner that did not, and the mode-1 input gate now refuses exactly that -- so a
+    test that simulates a commit landing has to advance the ids too, or it is
+    testing the refusal path while its name claims it tests the commit path. The
+    refusal itself is what ``test_mode_one_refuses_a_device_array_that_lags`` is
+    for. One exception, in ``test_dropped_commit_costs_coverage_never_correctness``:
+    there the device really has advanced past the mirror, and this helper makes the
+    two agree; the refusal that test asserts comes from the history-length check,
+    which runs before the gate, so the difference never reaches the assertion.
+    """
+    hist = st._ple_host_history
+    # Drain first: the build drains inside ``_stage_host_ple_ids``, and row 0 is
+    # whatever that drain appends, so a helper that has to know the ids BEFORE the
+    # build has to do the same drain. It is idempotent -- landed commits are popped
+    # once -- so the build's own drain then finds nothing pending and the step
+    # proceeds exactly as it would have.
+    hist.drain()
+    drafts = _drafts(num_reqs, q).wait_host_draft_tokens()[0]
+    ids: list[int] = []
+    for order, slot in enumerate([0, 3][:num_reqs]):
+        # ``-1``, not ``length - 1``: the window is a rolling tail of
+        # ``ngram_context_len + 1`` cells while ``length`` counts every token the
+        # request has accepted. The newest cell is the last one, which is what the
+        # builder reads as row 0.
+        ids.append(int(hist.window[slot][-1]))
+        ids.extend(int(v) for v in drafts[order])
+    input_batch.input_ids = torch.tensor(
+        ids + [0] * (16 - len(ids)), dtype=torch.int32
+    )
+
+
+def _step_qsl(num_reqs: int, q: int) -> list[int]:
+    """``query_start_loc`` for that step, padded the way the runner pads it."""
+    num_tokens = num_reqs * q
+    qsl = list(range(0, num_tokens + 1, q))
+    return qsl + [num_tokens] * (4 - len(qsl))
+
+
 def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
     """A pure-decode batch over slots 0 and 3, with a UVA-shaped host mirror.
 
@@ -601,8 +673,20 @@ def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
         # The runner's own device arrays, padded to capacity. The differential
         # dump reads these (not anything forward() stashed) because torch.compile
         # runs that body at trace time only.
-        input_ids=torch.zeros(16, dtype=torch.int32),
-        query_start_loc=torch.zeros(4, dtype=torch.int32),
+        #
+        # Filled to agree with the host mirror, because a healthy step is what
+        # this fixture claims to describe. They used to be all zeros, which was
+        # harmless while only the differential read them: its gate refused and the
+        # tests asserted on staging, never on the verdict. Mode 1 now asks the same
+        # question before it serves, so zeros would turn every mode-1 test into a
+        # test of the refusal path -- and a fixture whose device arrays disagree
+        # with the batch it names tests the wrong thing. The gate's refusal on a
+        # mismatch is asserted directly, by corrupting these, below.
+        input_ids=torch.tensor(
+            _step_device_ids(slots, tokens, num_reqs, q) + [0] * (16 - num_reqs * q),
+            dtype=torch.int32,
+        ),
+        query_start_loc=torch.tensor(_step_qsl(num_reqs, q), dtype=torch.int32),
     )
     req_states = SimpleNamespace(
         num_computed_tokens_np=computed, all_token_ids=all_token_ids
@@ -739,6 +823,151 @@ def test_pure_decode_batch_reaches_the_layer(hostids_env) -> None:
         ),
     )
     assert np.array_equal(emb._pinned_ngram_ids[:ROWS].numpy(), expected)
+
+
+def test_mode_one_refuses_a_device_array_that_lags(hostids_env) -> None:
+    """The gate boot #14 said the serving path needed.
+
+    Mode 1 used to stage whatever the mirror handed it. Boot #14 (differential
+    mode, same builder, same mirror) caught the mirror returning
+    ``host=4161103993993705554`` where a token id belongs -- 8 refused comparisons
+    across 4 workers in 45 minutes. Mode 2 refused those steps and the device served
+    them; mode 1 would have gathered rows out of a nonexistent id and handed the
+    model a plausible answer built from garbage.
+
+    So: when the runner's arrays and the mirror do not describe the same tokens,
+    nothing stages. The layer's flag stays down, the op falls through to the device
+    path, and the refusal is counted. Staging nothing is the whole safety argument;
+    asserting it is the point of the test.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, tokens = _batch_and_states()
+    # Row 0 of each request holds the token BEFORE the newest committed one: the
+    # shape of a step whose sides disagree, whether the mirror ran ahead or the
+    # runner's array is stale.
+    input_batch.input_ids[0] = int(tokens[0, _POSITION - 1])
+    input_batch.input_ids[3] = int(tokens[3, _POSITION - 1])
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_refusals == {"stage-inputs-disagree": 1}
+    assert st._ple_host_steps == 0
+    assert st.staged_rows() == [-1], "a refused step armed the D2H skip"
+    # -1 is the layer's "nothing staged" sentinel: ``take_host_stage`` will not
+    # answer yes, so the op falls through to the device path for this step.
+    assert emb.lookup_calls == 0
+    assert emb._host_stage_refusals == 1
+
+
+def test_mode_one_refuses_a_draft_column_the_device_does_not_have(hostids_env) -> None:
+    """A draft position is as load-bearing as row 0.
+
+    The staged rows are [newest committed, draft, draft]; a wrong draft column
+    gathers embedding rows for a token the device never fed to its own embedding
+    lookup. The gate covers the whole id vector, not just the boundary the builder
+    derived its positions from -- which is the same reach the differential's gate
+    has, and the reason both now share one implementation.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    input_batch.input_ids[1] = 987654  # a draft token the device does not have
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_refusals == {"stage-inputs-disagree": 1}
+    assert emb.lookup_calls == 0
+    assert emb._host_stage_refusals == 1
+
+
+def test_a_staging_refusal_is_worded_as_a_refusal_to_stage(
+    hostids_env, caplog
+) -> None:
+    """Two different claims, so two different counters and two different verbs.
+
+    ``SKIPPED a comparison`` means the device served the step and the harness
+    declined to judge it. ``REFUSED to stage`` means the serving path declined the
+    step and the device served it. The first is a hole in coverage; the second is a
+    statement about served output. Blurring them is how a diagnostic starts lying,
+    and this file has a counter for each because of it.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    input_batch.input_ids[0] = 999
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "REFUSED to stage" in text, text
+    assert "SKIPPED a comparison" not in text, text
+    assert "input_ids differ at 0 of 6" in text, text
+    assert emb._host_input_skips == 0, "a staging refusal counted as a comparison skip"
+    assert emb._host_stage_refusals == 1
+
+
+def test_the_comparison_gate_still_counts_comparisons(hostids_env) -> None:
+    """The shared implementation must not merge the two counters.
+
+    ``_inputs_agree`` now serves both paths, so a refactor that routed every
+    refusal to one counter would keep every other assertion in this file green while
+    quietly deleting the distinction the boot reads. A mode-2 refusal still lands on
+    ``_host_input_skips`` and leaves the staging counter alone.
+    """
+    emb = StagingEmbedding()
+    host_ids = np.arange(ROWS * HEADS, dtype=np.int64).reshape(ROWS, HEADS)
+    emb._host_check_ids = torch.from_numpy(host_ids)
+    emb._host_check_rows = ROWS
+    ran_ids = np.arange(ROWS, dtype=np.int64) + 100
+    emb._host_check_inputs = (
+        ran_ids,
+        np.array([0, 3, 6], dtype=np.int64),
+        np.zeros((ROWS, CTX), dtype=np.int64),
+    )
+    other = ran_ids.copy()
+    other[1] = 4
+    emb._host_check_dev_inputs = (
+        torch.from_numpy(other),
+        torch.from_numpy(np.array([0, 3, 6], dtype=np.int64)),
+        None,
+    )
+
+    emb.compare_host_ids(torch.from_numpy(host_ids.copy()), emb._host_check_dev_inputs)
+
+    assert emb._host_input_skips == 1, "the input-agreement gate did not fire"
+    assert emb._host_stage_refusals == 0, "a comparison skip counted as a refusal"
+
+
+def test_the_stage_gate_stays_out_of_graph_capture(hostids_env, monkeypatch) -> None:
+    """During a capture there is no step to attribute, and a D2H would kill the boot.
+
+    The gate reads three device arrays synchronously. Inside a stream capture that
+    is ``hipErrorStreamCaptureUnsupported``: the capture aborts and the engine dies
+    at startup -- the same class of failure that ended boot #26 at config time, one
+    layer down. And it would protect nothing: replay never reads the host arrays,
+    and the rows a capture leaves behind are zeroed on purpose
+    (``test_ple_capture_stage``). So the gate asks the capture question first.
+    """
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    input_batch.input_ids[0] = 999  # would refuse if the gate were consulted
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_refusals == {}, f"refused: {st._ple_host_refusals}"
+    assert emb.lookup_calls == 1
+    assert emb._host_stage_refusals == 0
 
 
 def test_mode_two_stages_for_comparison_only(hostids_env) -> None:
@@ -1356,13 +1585,14 @@ def test_landed_commit_advances_the_step(hostids_env) -> None:
     hostids_env["layers"] = [emb]
     st = FakeModelState()
     st.set_host_draft_source(_drafts())
-    input_batch, req_states, _ = _batch_and_states()
+    input_batch, req_states, tokens = _batch_and_states()
 
     assert st.stage_host_tokens(*_commit(done=True)) is True
     # The commit carries one accepted token per request; the device's post-update
     # kernel advances num_computed by the same count, and so does the scheduler's
     # host copy that the batch carries.
     req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_refusals == {}, f"refused: {st._ple_host_refusals}"
     assert st._ple_host_steps == 1
@@ -1389,7 +1619,7 @@ def test_unlanded_commit_refuses_the_step_rather_than_waiting(hostids_env) -> No
     hostids_env["layers"] = [emb]
     st = FakeModelState()
     st.set_host_draft_source(_drafts())
-    input_batch, req_states, _ = _batch_and_states()
+    input_batch, req_states, tokens = _batch_and_states()
 
     slots, rows, counts, event = _commit(done=False)
     assert st.stage_host_tokens(slots, rows, counts, event) is True
@@ -1402,6 +1632,7 @@ def test_unlanded_commit_refuses_the_step_rather_than_waiting(hostids_env) -> No
     # by the commit it was waiting on.
     event.done = True
     req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_steps == 1
     assert st._ple_host_history.pending == 0
@@ -1420,7 +1651,7 @@ def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
     hostids_env["layers"] = [emb]
     st = FakeModelState()
     st.set_host_draft_source(_drafts())
-    input_batch, req_states, _ = _batch_and_states()
+    input_batch, req_states, tokens = _batch_and_states()
 
     slots, rows, counts, event = _commit(done=True)
     # A commit claiming more accepted tokens than the row holds.
@@ -1432,6 +1663,7 @@ def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
 
     # The device advanced anyway, so the mirror now lags by exactly one token.
     req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_refusals.get("history-length") == 1
     assert st._ple_host_steps == 0, "staged ids built from a history with a hole"
@@ -1443,6 +1675,7 @@ def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
         is True
     )
     req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_steps == 1
 

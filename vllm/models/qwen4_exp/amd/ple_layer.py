@@ -850,6 +850,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # diagnostic has no business being the reason a serving boot dies.
         self._host_input_checks = 0
         self._host_input_skips = 0
+        # Steps mode 1 refused to stage. Separate from ``_host_input_skips``
+        # because the two refusals mean different things about served output.
+        self._host_stage_refusals = 0
         # Steps where the device's ngram context was not handed over, so the gate
         # compared ids and query_start_loc and the third leg stayed dark. Counted
         # because a leg nobody checks reads as a leg that passed: this number is
@@ -1634,7 +1637,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     )
         return "; ".join(out)
 
-    def _inputs_agree(self, device_inputs: tuple[Any, ...] | None) -> bool | None:
+    def _inputs_agree(
+        self,
+        device_inputs: tuple[Any, ...] | None,
+        host_inputs: tuple[Any, ...] | None = None,
+        staging: bool = False,
+    ) -> bool | None:
         """Did the device read the tokens the host mirrored?
 
         True makes the comparison that follows attributable. False means the
@@ -1665,10 +1673,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ids and qsl verdict still stands, but the leg is counted in
         ``_host_ctx_unchecked`` and said out loud: a leg nobody checks reads as a
         leg that passed.
+
+        ``host_inputs`` lets the *serving* path ask the same question. It defaulted
+        to nothing while this was a comparison-only gate, and the serving path had
+        no copy of it -- which is the hole :meth:`stage_inputs_agree` closes. Pass
+        the triple the stager built (ids, query boundaries, window) and the host
+        half is read from there instead of from ``_host_check_inputs``, which only
+        differential mode populates. ``staging`` routes the refusal to
+        :meth:`_note_stage_refusal` so a step the serving path declined is not
+        logged as "a comparison was skipped": one says the device served it, the
+        other says the harness declined to judge. Same numbers, different claim,
+        and this box has been misled by diagnostics that blurred the two.
         """
-        host = self._host_check_inputs
+        host = self._host_check_inputs if host_inputs is None else host_inputs
+        note = self._note_stage_refusal if staging else self._note_input_refusal
         if host is None or device_inputs is None:
-            self._note_input_refusal(
+            note(
                 "inputs missing on the "
                 + ("host" if host is None else "device")
                 + " side"
@@ -1677,7 +1697,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         d_ids, d_qsl = device_inputs[0], device_inputs[1]
         d_ctx = device_inputs[2] if len(device_inputs) > 2 else None
         if d_ids is None or d_qsl is None:
-            self._note_input_refusal("device inputs incomplete (no ids or no qsl)")
+            note("device inputs incomplete (no ids or no qsl)")
             return None
         h_ids = np.asarray(host[0]).reshape(-1)
         h_qsl = np.asarray(host[1]).reshape(-1)
@@ -1689,16 +1709,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if d_ctx is not None:
                 dev_ctx = d_ctx.detach().cpu().numpy()
         except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill a step
-            self._note_input_refusal(
-                f"reading the device inputs raised {type(exc).__name__}"
-            )
+            note(f"reading the device inputs raised {type(exc).__name__}")
             return None
         if dev_ids.shape[0] < h_ids.shape[0]:
             # The runner's array is the padded one, so it is at least as long as the
             # host's rows whenever both describe this step. Shorter means the two
             # sides are not describing the same work at all, and comparing a prefix
             # of that would be a green light invented by the slicing.
-            self._note_input_refusal(
+            note(
                 f"device ids shorter than the staged rows "
                 f"({dev_ids.shape[0]} < {h_ids.shape[0]})"
             )
@@ -1715,7 +1733,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # input the host mirror builds independently of the runner's arrays.
             verdict, why = self._ctx_leg(h_ctx, dev_ctx)
             if verdict is False:
-                self._note_input_refusal(why)
+                note(why)
                 return False
             if verdict is None:
                 self._host_ctx_unchecked += 1
@@ -1747,7 +1765,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"device={int(dev_qsl[first])} host={int(h_qsl[first])} "
                 f"(device={dev_qsl[:m].tolist()} host={h_qsl[:m].tolist()})"
             )
-        self._note_input_refusal(detail)
+        note(detail)
         return False
 
     def _ctx_leg(
@@ -1819,6 +1837,60 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 self.layer_name,
                 why,
                 self._host_input_skips,
+                self._host_ctx_unchecked,
+            )
+
+    def stage_inputs_agree(
+        self,
+        host_inputs: tuple[Any, ...],
+        device_inputs: tuple[Any, ...] | None,
+    ) -> bool:
+        """May this step be staged? Mode 1's copy of the input-agreement gate.
+
+        ``_inputs_agree`` existed as a gate on a *comparison*, and its only caller
+        was :meth:`compare_host_ids`, which differential mode alone reaches. The
+        serving path -- ``stage_host_step(gather=True)`` -- therefore staged whatever
+        the mirror handed it, and boot #14 showed what the mirror sometimes hands
+        out: ``host=4161103993993705554`` where a token id belongs (8 refused
+        comparisons across 4 workers in 45 minutes, ~2 per worker). Differential mode
+        refused that step and the device served it. Mode 1 would have gathered
+        embedding rows out of a nonexistent token id and handed the model a
+        plausible answer built from garbage -- the same silent-wrong-answer class as
+        a stale replay, arriving by a different route.
+
+        The rule is the differential's rule, unchanged, including the one that
+        matters most: a question that cannot be asked (``None``) is answered like a
+        ``False``. Refusing is cheap and being wrong is not.
+
+        A refused step stages nothing, so ``take_host_stage`` finds no flag, the op
+        falls through to the blocking D2H, and the device serves the step. That is
+        the safe direction under piecewise graphs. Under a captured graph it is not:
+        the op body does not run at replay, so the step ships the previous step's
+        rows. The caller counts that case and warns about it
+        (``Qwen4ExpModelState._note_host_refusal``), which is why a gate that used to
+        be a diagnostic is now load-bearing on the FULL-graph question.
+
+        Cost: three small blocking D2H copies per staged step, in the worker, before
+        the forward. Synchronous scheduling is already mandatory for this knob
+        (``ple_hostids_async_conflict``), so it is not a new class of stall; the E1
+        boot measures what it costs against the +15 % the capture branch buys.
+        """
+        return (
+            self._inputs_agree(device_inputs, host_inputs=host_inputs, staging=True)
+            is True
+        )
+
+    def _note_stage_refusal(self, why: str) -> None:
+        """Count a step the serving path refused to stage: once, then every 32nd."""
+        self._host_stage_refusals += 1
+        if self._host_stage_refusals == 1 or self._host_stage_refusals % 32 == 0:
+            logger.info(
+                "PLE HOSTIDS: REFUSED to stage '%s' -- %s. The device path serves "
+                "this step; the pinned rows were not touched. (%d refused; %d steps "
+                "went with the ngram window unchecked.)",
+                self.layer_name,
+                why,
+                self._host_stage_refusals,
                 self._host_ctx_unchecked,
             )
 

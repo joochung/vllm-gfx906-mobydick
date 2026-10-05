@@ -386,32 +386,55 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         gather = mode == 1
+        # The device half of this step's inputs, captured in the worker where both
+        # sides are in scope. forward() cannot do it: torch.compile runs that body at
+        # trace time, so anything stashed there is a trace-time value. The runner's
+        # own arrays are padded, so the gate slices them to the host's lengths.
+        #
+        # The window is handed over as a reference to the state's own buffer, not as
+        # a copy, and that is the whole reason it can be compared at all:
+        # prepare_inputs() fills ``ngram_context`` via ``_prepare_ngram_context`` and
+        # *then* calls this staging function, so by the time the op reads the buffer
+        # back it holds this step's window -- the same cells the forward was handed a
+        # view of. An earlier version of this file claimed the worker had no
+        # device-side counterpart for the window and passed None; boot #8's inversion
+        # put the one wrong term exactly in the cell that window feeds, so the claim
+        # went looking for its evidence and failed.
+        #
+        # This block used to live inside ``if not gather``, because only the
+        # differential had a question to ask with it. Mode 1 now asks the same
+        # question before it serves (see ``stage_inputs_agree``), so the triple is
+        # built for both modes.
         device_inputs: tuple[Any, ...] | None = None
+        d_ids = getattr(input_batch, "input_ids", None)
+        d_qsl = getattr(input_batch, "query_start_loc", None)
+        d_ctx = getattr(self, "ngram_context", None)
+        if d_ids is not None and d_qsl is not None:
+            device_inputs = (d_ids, d_qsl, d_ctx)
         if not gather:
             # Differential mode: keep the provenance so a mismatch can name the
             # block its draft columns came from instead of describing its output.
             for layer in self._ple_host_layers:
                 layer.note_draft_provenance(values, row_idx, gen)
-            # The device half of this step's inputs, captured in the worker where
-            # both sides are in scope. forward() cannot do it: torch.compile runs
-            # that body at trace time, so anything stashed there is a trace-time
-            # value. The runner's own arrays are padded, so the dump slices them
-            # to the host's lengths.
+        elif not torch.cuda.is_current_stream_capturing():
+            # Mode 1: attribute the step BEFORE any layer is staged, so a refusal
+            # cannot leave one layer holding rows the next layer does not. A step
+            # that fails the gate stages nothing and is served by the device path.
             #
-            # The window is handed over as a reference to the state's own buffer,
-            # not as a copy, and that is the whole reason it can be compared at all:
-            # prepare_inputs() fills ``ngram_context`` via ``_prepare_ngram_context``
-            # and *then* calls this staging function, so by the time the op reads the
-            # buffer back it holds this step's window -- the same cells the forward
-            # was handed a view of. An earlier version of this file claimed the
-            # worker had no device-side counterpart for the window and passed None;
-            # boot #8's inversion put the one wrong term exactly in the cell that
-            # window feeds, so the claim went looking for its evidence and failed.
-            d_ids = getattr(input_batch, "input_ids", None)
-            d_qsl = getattr(input_batch, "query_start_loc", None)
-            d_ctx = getattr(self, "ngram_context", None)
-            if d_ids is not None and d_qsl is not None:
-                device_inputs = (d_ids, d_qsl, d_ctx)
+            # The capture test is not decoration. A blocking D2H inside a capture
+            # aborts it (hipErrorStreamCaptureUnsupported) and that kills the boot,
+            # and during a capture there is no step to attribute anyway: replay
+            # reads no host arrays.
+            host_inputs = (input_ids, query_start_loc, ngram_context)
+            for layer in self._ple_host_layers:
+                check = getattr(layer, "stage_inputs_agree", None)
+                if check is None:
+                    # Stub embeddings (probe/prof tests) never gathered and never
+                    # staged real rows; do not make them a reason to refuse.
+                    continue
+                if not check(host_inputs, device_inputs):
+                    self._note_host_refusal("stage-inputs-disagree")
+                    return
         for layer in self._ple_host_layers:
             try:
                 layer.stage_host_step(
