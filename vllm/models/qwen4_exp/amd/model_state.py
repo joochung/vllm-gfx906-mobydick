@@ -4,6 +4,7 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -92,6 +93,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # have to walk the layer list every time.
         self._ple_host_captured = False
         self._ple_host_captured_refusals = 0
+        # Boot #26's lesson. The only writers of a mirror slot's length were
+        # ``seed`` at add and ``invalidate`` at remove, so a commit lost at the
+        # epilogue left the slot short for the rest of the request's life and the
+        # exact-length check refused every step after it. These bound and describe
+        # the repair; see :meth:`_ple_resync_mirror`.
+        self._ple_resyncs = 0
+        self._ple_resync_disagree = 0
+        self._ple_resync_refused: set[str] = set()
+        self._ple_resync_slots: dict[int, int] = {}
+        # Indirection so a test can stand in for the device sync without a
+        # device. Production calls the real one.
+        self._ple_resync_sync = torch.cuda.synchronize
         # The draft-block generation this model state last consumed. Freshness is
         # the one property of the mirror that no shape check can infer.
         self._last_draft_gen = -1
@@ -137,6 +150,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_index = self._ple_host_slots.pop(req_id, None)
         if req_index is not None:
             self._ple_host_history.invalidate(req_index)
+            # A slot is reused by the next request, and the resync budget belongs
+            # to a request, not to a slot number.
+            self._ple_resync_slots.pop(req_index, None)
 
     # ------------------------------------------------------------- read-ahead
     def _ple_prefetch_modules(self):
@@ -365,25 +381,52 @@ class Qwen4ExpModelState(MambaHybridModelState):
             # agreed, the row that needs column 1 did not.
             if values is not None and gen == self._last_draft_gen:
                 raise HostIdsRefused("draft-gen-stale", f"gen={gen}")
-            input_ids, query_start_loc, ngram_context = build_decode_step_inputs(
-                input_batch.idx_mapping_np[:num_reqs],
-                input_batch.num_scheduled_tokens[:num_reqs],
-                req_states.num_computed_tokens_np,
-                self._ple_host_history.window,
-                self._ple_host_history.length,
-                values,
-                row_idx,
-                ngram_context_len=self.ngram_context_len,
-                eos_token_id=self.ngram_eos_token_id,
-            )
         except HostIdsRefused as exc:
-            self._note_host_refusal(exc.reason)
+            self._note_host_refusal(exc.reason, str(exc))
             return
         except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
             self.disable_host_staging(
-                f"host id build failed ({type(exc).__name__}: {exc})"
+                f"host draft mirror read failed ({type(exc).__name__}: {exc})"
             )
             return
+
+        # Two attempts, not a loop, and the second only ever follows a mirror
+        # repair. ``history-length`` is the one refusal worth retrying because it
+        # is the only one that describes the mirror rather than this step's shape,
+        # and a short mirror is exactly what a lost commit leaves behind. Every
+        # other reason is a property of the batch, which no host-side repair
+        # changes, so retrying it would only cost a build.
+        built: tuple[Any, ...] | None = None
+        for attempt in (0, 1):
+            try:
+                built = build_decode_step_inputs(
+                    input_batch.idx_mapping_np[:num_reqs],
+                    input_batch.num_scheduled_tokens[:num_reqs],
+                    req_states.num_computed_tokens_np,
+                    self._ple_host_history.window,
+                    self._ple_host_history.length,
+                    values,
+                    row_idx,
+                    ngram_context_len=self.ngram_context_len,
+                    eos_token_id=self.ngram_eos_token_id,
+                )
+            except HostIdsRefused as exc:
+                if (
+                    attempt
+                    or exc.reason != "history-length"
+                    or not self._ple_resync_mirror(req_states, input_batch, str(exc))
+                ):
+                    self._note_host_refusal(exc.reason, str(exc))
+                    return
+            except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+                self.disable_host_staging(
+                    f"host id build failed ({type(exc).__name__}: {exc})"
+                )
+                return
+            else:
+                break
+        assert built is not None
+        input_ids, query_start_loc, ngram_context = built
 
         gather = mode == 1
         # The device half of this step's inputs, captured in the worker where both
@@ -463,6 +506,16 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 if gather
                 else "differential: device path in charge, ids compared every step",
             )
+        elif self._ple_host_steps % 1024 == 0:
+            # A serving log should not print per step, and a boot that only prints
+            # on failure cannot tell a healthy arm from an idle one. Boot #26 said
+            # "576 refusals" and never said how few steps staged; this line is the
+            # denominator, and at 1024 steps it is roughly once a minute at B=1.
+            logger.info(
+                "PLE HOSTIDS: staged %d decode step(s) so far. %s",
+                self._ple_host_steps,
+                self._ple_host_coverage(),
+            )
 
     def set_host_draft_source(self, handler: object) -> None:
         """Wire in the worker's staged draft-token mirror (P1.1).
@@ -508,7 +561,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self._note_host_refusal(f"stage-tokens-{type(exc).__name__}")
             return False
         if not staged:
-            self._note_host_refusal("stage-tokens-rejected")
+            # The detail names the check that lost the commit. It matters more
+            # here than anywhere: a lost commit used to cost the request's whole
+            # remaining coverage, and boot #26 had 67 per worker with no way to
+            # tell a padded sampler row from a full queue.
+            self._note_host_refusal(
+                "stage-tokens-rejected", self._ple_host_history.last_drop
+            )
         return staged
 
     def disable_host_staging(self, why: str) -> None:
@@ -540,6 +599,153 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         self._ple_host_layers = []
 
+    PLE_RESYNC_PER_SLOT = 2
+    """Repairs allowed for one request before it is left to the device path.
+
+    Two, because the first is the repair and the second catches a mirror that
+    repairs and then disagrees with itself. Beyond that the request is not worth
+    another sync: it has a systematic problem, and paying for it every time is how
+    a coverage bug becomes a latency bug.
+    """
+
+    PLE_RESYNC_TOTAL = 64
+    """Repairs per worker per boot. Bounds the worst case of a systematic
+    mismatch, which would otherwise be a device sync on every decode step -- a
+    boot that runs at a third of the speed with entirely plausible text."""
+
+    def _ple_resync_mirror(
+        self, req_states: Any, input_batch: InputBatch, detail: str
+    ) -> bool:
+        """Rebuild the slots whose token count disagrees with the mirror.
+
+        Returns True if every mismatching slot was rebuilt, so the caller may
+        retry the build. False leaves the refusal exactly where it was.
+
+        Where the tokens come from. ``req_states.all_token_ids`` is UVA-backed
+        (``states.py`` picks that to save GPU memory), so its cells are
+        host-*addressable* -- which is the whole trap: prompt cells are host-written
+        at add time while generated cells are written by ``_post_update_kernel`` on
+        the device, unordered before a host read in ``prepare_inputs``. A read that
+        raced was caught on 2026-10-01 returning ``4161103993993705554`` where a
+        token id belongs. So this path pays a device sync first: it is the only
+        thing that makes the cells being read the cells the device committed. That
+        sync is why the repair is capped.
+
+        Why the repair is not self-certifying. Seeding a slot from a row and then
+        taking its length from the same row would leave the exact-length check that
+        triggered this unable to notice a bad read. So the rebuilt row is
+        cross-checked against the cells the *old* window still claims to hold --
+        ``num_sampled`` commits on one side, the device's own token buffer on the
+        other. If they disagree over the overlap, the host cannot vouch for its own
+        read and the knob goes off rather than serve from it.
+
+        Slots only arrive here having already failed the count check, so seeding
+        one cannot turn a working mirror into a broken one.
+        """
+        try:
+            return self._ple_resync_mirror_inner(req_states, input_batch, detail)
+        except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+            # The refusal path is exactly the wrong place to raise: this runs
+            # inside an ``except`` that already decided the step is the device's,
+            # and a repair that throws would turn a coverage bug into a crash.
+            self._ple_resync_refused.add(f"{type(exc).__name__}: {exc}")
+            return False
+
+    def _ple_resync_mirror_inner(
+        self, req_states: Any, input_batch: InputBatch, detail: str
+    ) -> bool:
+        hist = self._ple_host_history
+        if torch.cuda.is_current_stream_capturing():
+            # A sync inside a capture aborts it (hipErrorStreamCaptureUnsupported)
+            # and that kills the boot. Nothing is lost by skipping: a capture is
+            # not a served step, and replay reads no host arrays.
+            self._ple_resync_refused.add("capturing")
+            return False
+        if self._ple_resyncs >= self.PLE_RESYNC_TOTAL:
+            self._ple_resync_refused.add("total cap")
+            return False
+
+        slots = np.asarray(
+            input_batch.idx_mapping_np[: input_batch.num_reqs], dtype=np.int64
+        )
+        if slots.size == 0:
+            return False
+        positions = np.asarray(req_states.num_computed_tokens_np, dtype=np.int64)[slots]
+        lengths = np.asarray(hist.length, dtype=np.int64)[slots]
+        bad = np.nonzero(positions != lengths - 1)[0]
+        if bad.size == 0:
+            # The refusal described a mismatch this step's mapping does not
+            # contain, so there is nothing here to rebuild.
+            self._ple_resync_refused.add("no mismatching slot")
+            return False
+        row_width = int(req_states.all_token_ids.gpu.shape[1])
+        for i in bad:
+            slot = int(slots[i])
+            want = int(positions[i]) + 1
+            if self._ple_resync_slots.get(slot, 0) >= self.PLE_RESYNC_PER_SLOT:
+                self._ple_resync_refused.add("per-slot cap")
+                return False
+            if want < 1 or want > row_width:
+                self._ple_resync_refused.add("position beyond row")
+                return False
+
+        # The one device sync on this path, before any cell is read.
+        self._ple_resync_sync()
+        self._ple_resyncs += 1
+        rows = req_states.all_token_ids.gpu
+        for i in bad:
+            slot = int(slots[i])
+            want = int(positions[i]) + 1
+            old_len = int(hist.length[slot])
+            row = rows[slot, :want].to("cpu", non_blocking=False).numpy()
+            overlap = min(hist.width, old_len)
+            if overlap and not np.array_equal(
+                row[old_len - overlap : old_len],
+                hist.window[slot, hist.width - overlap :],
+            ):
+                self._ple_resync_disagree += 1
+                self.disable_host_staging(
+                    "PLE host mirror resync disagreed with the device's own token "
+                    f"row on slot {slot}: mirrored "
+                    f"{hist.window[slot, hist.width - overlap :].tolist()} vs "
+                    f"row {row[old_len - overlap : old_len].tolist()} over the "
+                    f"last {overlap} cell(s). Refusing to serve ids from a "
+                    "host read this worker cannot vouch for."
+                )
+                return False
+            hist.seed(slot, row)
+            self._ple_resync_slots[slot] = self._ple_resync_slots.get(slot, 0) + 1
+        if self._ple_resyncs == 1 or self._ple_resyncs % 16 == 0:
+            logger.warning(
+                "PLE HOSTIDS: resynced %d mirror slot(s) from the device token "
+                "row after a count mismatch (%s). Slots so far: %s. One device "
+                "sync per repair; budget %d per worker, %d per request.",
+                bad.size,
+                detail,
+                dict(self._ple_resync_slots),
+                self.PLE_RESYNC_TOTAL,
+                self.PLE_RESYNC_PER_SLOT,
+            )
+        return True
+
+    def _ple_host_coverage(self) -> str:
+        """What the host path actually did, for the log lines that need a denominator.
+
+        Boot #26 reported 576 refusals per worker and no successes in sight, and
+        the number that would have made that line legible -- how many steps
+        staged, how many commits went missing and how -- was only printed when the
+        knob disabled itself.
+        """
+        hist = self._ple_host_history
+        return (
+            f"staged_steps={self._ple_host_steps} "
+            f"refused={sum(self._ple_host_refusals.values())} "
+            f"mirror(staged={hist.staged} dropped={hist.dropped} "
+            f"sliced={hist.sliced} flushes={hist.flushes} pending={hist.pending}) "
+            f"resync={self._ple_resyncs} "
+            f"resync_refused={sorted(self._ple_resync_refused)}"
+        )
+
     def _staged_graph_in_play(self) -> bool:
         """True once a captured graph is serving these steps, and forever after.
 
@@ -556,15 +762,24 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self._ple_host_captured = True
         return self._ple_host_captured
 
-    def _note_host_refusal(self, reason: str) -> None:
+    def _note_host_refusal(self, reason: str, detail: str = "") -> None:
         self._ple_host_refusals[reason] = self._ple_host_refusals.get(reason, 0) + 1
         if reason not in self._ple_host_refusal_logged:
             self._ple_host_refusal_logged.add(reason)
+            # ``detail`` is what the exception knew and the reason token does not:
+            # for ``history-length`` it is ``positions [...] != committed-1 [...]``,
+            # which is the difference between knowing the mirror is short and
+            # knowing by how much and for which slot. Boot #26 raised 411 of these
+            # and could not answer that question because only the reason was
+            # logged. Once per reason, not per step: the detail carries per-step
+            # arrays and a serving log should not repeat them.
             logger.info(
-                "PLE HOSTIDS: first refusal (%s); device path used for that step. "
-                "Counts so far: %s",
+                "PLE HOSTIDS: first refusal (%s)%s; device path used for that step. "
+                "Counts so far: %s. Coverage: %s",
                 reason,
+                f" -- {detail}" if detail else "",
                 dict(self._ple_host_refusals),
+                self._ple_host_coverage(),
             )
         if not self._staged_graph_in_play():
             return
@@ -587,10 +802,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 "PLE HOSTIDS: refusal (%s) while a captured graph holds the staged "
                 "PLE branch. There is NO device path for that step: the graph "
                 "replays the previous step's embedding rows, so %d step(s) so far "
-                "ran on stale PLE. Counts: %s",
+                "ran on stale PLE. Counts: %s. Coverage: %s",
                 reason,
                 self._ple_host_captured_refusals,
                 dict(self._ple_host_refusals),
+                self._ple_host_coverage(),
             )
 
     def _refresh_ple_query_start_loc(self, input_batch: InputBatch) -> torch.Tensor:

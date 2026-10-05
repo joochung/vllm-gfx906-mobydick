@@ -450,11 +450,17 @@ class HostTokenHistory:
     MAX_PENDING = 8
     """Bound on queued commits.
 
-    Exceeding it drops the *new* commit, which makes the affected slots' lengths
-    lag. The builder's exact-length check turns that into a counted refusal, so
-    a drop costs coverage, never correctness. Eight steps of un-drained output
-    copies means the copy stream is a full step behind, which is a bug worth
-    seeing in the refusal counts rather than hiding behind a bigger bound.
+    Reaching it flushes the queue (one blocking wait for the head commit) and
+    only drops if the flush did not free a slot. Eight steps of un-drained
+    output copies means the copy stream is a full step behind, which is a bug
+    worth seeing in the counters rather than hiding behind a bigger bound.
+
+    It used to drop the *new* commit outright, on the theory that a drop costs
+    coverage rather than correctness. Boot #26 showed the theory's blind spot:
+    a dropped commit is never recovered, so the exact-length check refuses that
+    request on *every* step for the rest of its life. Six consecutive windows of
+    32/32 ``history-length`` refusals, with the drops that caused them all
+    clustered at batch transitions. Blocking once is much the cheaper failure.
     """
 
     def __init__(self, num_slots: int, width: int) -> None:
@@ -471,6 +477,17 @@ class HostTokenHistory:
         # that reports its own coverage.
         self.staged = 0
         self.dropped = 0
+        # The two ways a commit goes missing, which boot #26 could not tell
+        # apart because neither was ever surfaced: sampler rows trimmed to the
+        # real batch, and queue overflows flushed instead of dropped. Both are
+        # counted rather than logged because this runs on every step.
+        self.sliced = 0
+        self.flushes = 0
+        # Detail of the most recent drop, for the caller to log once. A bare
+        # drop count says a commit was lost; the detail says which check lost it
+        # and what the row counts actually were, which is the difference between
+        # a diagnosis and a suspicion.
+        self.last_drop = ""
 
     def _check_slot(self, slot: int) -> None:
         if slot < 0 or slot >= self.num_slots:
@@ -537,55 +554,107 @@ class HostTokenHistory:
         num_sampled: np.ndarray,
         done: object,
     ) -> bool:
-        """Queue one step's accepted tokens. Reads nothing, blocks on nothing.
+        """Queue one step's accepted tokens. Reads nothing; blocks only to avoid
+        losing a commit it cannot recover (see ``MAX_PENDING``).
 
         ``done`` is the ``AsyncOutput`` copy event (anything with ``query()``,
         including ``None`` for a caller whose data is already host-side, which is
         how the tests stage synchronously).
 
-        Returns False -- and counts a drop -- on any inconsistency, because a
-        malformed commit would reorder a slot's history.
+        Returns False -- and counts a drop, recording why in ``last_drop`` -- on
+        any inconsistency, because a malformed commit would reorder a slot's
+        history.
+
+        **Row counts are not required to match; they are required to be
+        explainable.** ``slots`` is ``input_batch.idx_mapping_np[:num_reqs]``,
+        the real batch, while ``sampled`` and ``num_sampled`` are the sampler's
+        own arrays, copied out whole by ``AsyncOutput`` (``async_utils.py`` calls
+        ``async_copy_to_np`` with no slice). A step replayed from a padded
+        descriptor therefore carries MORE sampler rows than slots, and the rows
+        past ``len(slots)`` belong to no request in this batch. Trimming to the
+        first ``len(slots)`` rows is exact: the sampler emits one row per request
+        in the same batch order ``idx_mapping_np`` is built in. Fewer rows than
+        slots stays a drop -- there is no way to know which request an absent
+        commit was meant for.
         """
         slots = np.asarray(slots)
         num_sampled = np.asarray(num_sampled)
-        if (
-            sampled.ndim != 2
-            or slots.ndim != 1
-            or num_sampled.ndim != 1
-            or slots.shape[0] != sampled.shape[0]
-            or num_sampled.shape[0] != slots.shape[0]
-        ):
-            self.dropped += 1
-            return False
+        self.last_drop = ""
+        if sampled.ndim != 2 or slots.ndim != 1 or num_sampled.ndim != 1:
+            return self._drop(
+                f"ndim sampled={sampled.ndim} slots={slots.ndim} "
+                f"num_sampled={num_sampled.ndim}"
+            )
+        n = slots.shape[0]
+        if sampled.shape[0] < n or num_sampled.shape[0] < n:
+            return self._drop(
+                f"rows sampled={sampled.shape[0]} "
+                f"num_sampled={num_sampled.shape[0]} < slots={n}"
+            )
+        if sampled.shape[0] > n or num_sampled.shape[0] > n:
+            # A view, so this reads no token values: the array's event has not
+            # necessarily landed and staging must stay safe while it is in flight.
+            sampled = sampled[:n]
+            num_sampled = num_sampled[:n]
+            self.sliced += 1
         if slots.size and (int(slots.min()) < 0 or int(slots.max()) >= self.num_slots):
-            self.dropped += 1
-            return False
+            return self._drop(f"slot {slots.tolist()} outside 0..{self.num_slots - 1}")
         if num_sampled.size and (
             int(num_sampled.min()) < 0 or int(num_sampled.max()) > sampled.shape[1]
         ):
-            self.dropped += 1
-            return False
+            return self._drop(
+                f"num_sampled {num_sampled.tolist()} outside 0..{sampled.shape[1]}"
+            )
         if len(self._pending) >= self.MAX_PENDING:
-            self.dropped += 1
-            return False
+            # Blocking, and the only blocking call in this class, for the reason
+            # in the MAX_PENDING docstring: the alternative is a commit that is
+            # never recovered. Counted, so a boot that does this every step is
+            # visible as a slow boot rather than as a coverage hole.
+            self.drain(flush=True)
+            if len(self._pending) >= self.MAX_PENDING:
+                return self._drop(f"pending full ({len(self._pending)})")
         self._pending.append(
             _PendingCommit(slots.copy(), sampled, num_sampled.copy(), done)
         )
         self.staged += 1
         return True
 
-    def drain(self) -> int:
-        """Apply every queued commit whose copy has landed. Never blocks.
+    def _drop(self, detail: str) -> bool:
+        """Count a refused commit, record why, and return False for the caller."""
+        self.dropped += 1
+        self.last_drop = detail
+        return False
+
+    def drain(self, flush: bool = False) -> int:
+        """Apply every queued commit whose copy has landed. Never blocks unless
+        ``flush`` says to wait for the head.
 
         Stops at the first commit that has not landed: the window is append-only
         per slot, so applying step N+1 before step N would put a request's
         tokens in the wrong order.
+
+        ``flush`` is the repair path :meth:`stage_step` uses when the queue is
+        full: it waits for the head commit instead of returning with the queue
+        still full. Only the head -- one wait is enough to make room, and waiting
+        for the whole queue would turn a rare repair into a stall that grows with
+        how far behind the copy stream is. Counted in ``flushes``.
         """
         applied = 0
+        flushed = False
         while self._pending:
             entry = self._pending[0]
             if entry.done is not None and not entry.done.query():
-                break
+                if not flush or flushed:
+                    break
+                entry.done.synchronize()  # type: ignore[union-attr]
+                self.flushes += 1
+                flushed = True
+                # Re-ask rather than assume. Applying a commit whose copy has not
+                # landed is the one thing this queue exists to prevent, and a
+                # wait that returns without completing must not sneak past it.
+                if not entry.done.query():
+                    break
+
             self._pending.pop(0)
             for i in range(int(entry.slots.size)):
                 n = int(entry.num_sampled[i])

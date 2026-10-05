@@ -25,29 +25,42 @@ SLOTS = 4
 
 
 class FakeEvent:
-    """The only method ``HostTokenHistory`` calls on a copy event."""
+    """The two methods ``HostTokenHistory`` calls on a copy event.
 
-    def __init__(self, done: bool = False) -> None:
+    ``blocks`` models a copy that will not land, which is how the flush path gets
+    tested: a wait that returns without completing must still not apply the row.
+    """
+
+    def __init__(self, done: bool = False, blocks: bool = False) -> None:
         self.done = done
+        self.blocks = blocks
         self.queries = 0
+        self.syncs = 0
 
     def query(self) -> bool:
         self.queries += 1
         return self.done
 
+    def synchronize(self) -> None:
+        self.syncs += 1
+        if not self.blocks:
+            self.done = True
+
     def complete(self) -> None:
         self.done = True
 
 
-def _stage(history, slots, rows, counts, done=None):
+def _stage(history, slots, rows, counts, done=None, pad=0):
+    """Stage one step. ``pad`` adds trailing sampler rows that belong to no
+    request in the batch, which is what a padded graph descriptor produces."""
     width = max(len(r) for r in rows)
-    matrix = np.zeros((len(rows), width), dtype=np.int32)
+    matrix = np.zeros((len(rows) + pad, width), dtype=np.int32)
     for i, row in enumerate(rows):
         matrix[i, : len(row)] = row
     return history.stage_step(
         np.array(slots, np.int32),
         matrix,
-        np.array(counts, np.int32),
+        np.array(list(counts) + [0] * pad, np.int32),
         done,
     )
 
@@ -207,17 +220,82 @@ def test_invalidate_drops_an_in_flight_commit_for_that_slot():
     assert history.length[2] == 2
 
 
-def test_queue_is_bounded_and_counts_what_it_drops():
+def test_queue_is_bounded_and_flushes_rather_than_loses_a_commit():
+    """A full queue waits for the head commit; it does not silently lose the new one.
+
+    This is the behaviour boot #26 paid for. The bound used to drop the new
+    commit, and because nothing here can recover a lost commit, the affected
+    slot's length stayed short and the builder refused that request on every
+    remaining step -- six consecutive windows of 32/32 refusals, with the drops
+    that caused them all behind them. Waiting once is the cheaper failure, so the
+    queue now flushes and the commit lands.
+    """
     history = HostTokenHistory(SLOTS, W)
-    for _ in range(HostTokenHistory.MAX_PENDING):
-        assert _stage(history, [0], [[1]], [1], FakeEvent(False))
+    events = [FakeEvent(False) for _ in range(HostTokenHistory.MAX_PENDING)]
+    for event in events:
+        assert _stage(history, [0], [[1]], [1], event)
     assert history.pending == HostTokenHistory.MAX_PENDING
+
+    # The head's copy has not landed, but waiting for it is allowed to succeed.
+    assert _stage(history, [0], [[2]], [1], FakeEvent(False)) is True
+    assert events[0].syncs == 1, "the flush did not wait for the head commit"
+    assert events[1].syncs == 0, "the flush waited for more than the head"
+    assert history.flushes == 1
+    assert history.dropped == 0
+    # Flushing applied the head, so the queue made room instead of losing work.
+    assert history.length[0] == 1
+
+
+def test_a_flush_that_cannot_finish_still_drops_and_says_so():
+    """Waiting is a repair, not a licence to read an un-landed copy."""
+    history = HostTokenHistory(SLOTS, W)
+    stuck = FakeEvent(False, blocks=True)
+    for _ in range(HostTokenHistory.MAX_PENDING):
+        assert _stage(history, [0], [[1]], [1], stuck)
     assert _stage(history, [0], [[2]], [1], FakeEvent(False)) is False
+    assert stuck.syncs == 1
+    assert stuck.queries >= 2, "the flush applied a commit without re-asking"
     assert history.dropped == 1
-    # What a drop costs is a length that lags the device, which the builder then
-    # refuses on -- see test_dropped_commit_costs_coverage_never_correctness in
-    # test_ple_host_stage.py. It can never show up as a wrong id.
-    assert history.length[0] == 0
+    assert history.length[0] == 0, "an in-flight commit was applied"
+    assert "pending full" in history.last_drop
+
+
+def test_padded_sampler_rows_are_trimmed_to_the_batch():
+    """The sampler arrays are copied out whole; the batch is the real width.
+
+    ``AsyncOutput`` copies ``sampler_output.sampled_token_ids`` with no slice, so
+    a step replayed from a padded descriptor hands over more rows than
+    ``idx_mapping_np[:num_reqs]``. Those extra rows belong to no request in this
+    batch, and the first ``len(slots)`` are the batch's, in the same order. The
+    old code called that a shape violation and dropped the commit -- which is the
+    one failure mode that used to be permanent.
+    """
+    history = HostTokenHistory(SLOTS, W)
+    assert _stage(history, [3], [[11, 12]], [2], FakeEvent(True), pad=2) is True
+    assert history.sliced == 1
+    assert history.dropped == 0
+    assert history.drain() == 1
+    assert history.length[3] == 2
+    assert history.window[3].tolist() == [0, 11, 12]
+
+
+def test_fewer_sampler_rows_than_slots_is_still_a_drop():
+    """Trimming answers extra rows. Missing rows have no owner to guess."""
+    history = HostTokenHistory(SLOTS, W)
+    assert _stage(history, [0, 1], [[1]], [1]) is False
+    assert history.dropped == 1
+    assert "rows" in history.last_drop
+
+
+def test_drop_detail_names_the_check_that_fired():
+    """A count says a commit was lost; the detail says which check lost it."""
+    history = HostTokenHistory(SLOTS, W)
+    assert _stage(history, [9], [[1]], [1]) is False
+    assert "slot" in history.last_drop
+    assert _stage(history, [0], [[1, 2, 3]], [5]) is False
+    assert "num_sampled" in history.last_drop
+    assert _stage(history, [0], [[1]], [1]) is True
+    assert history.last_drop == "", "a success left a stale explanation"
 
 
 def test_stage_rejects_inconsistent_shapes():

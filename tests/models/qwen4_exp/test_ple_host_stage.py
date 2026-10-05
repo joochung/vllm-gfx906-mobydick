@@ -526,6 +526,15 @@ class FakeModelState:
     disable_host_staging = model_state_module.Qwen4ExpModelState.disable_host_staging
     _note_host_refusal = model_state_module.Qwen4ExpModelState._note_host_refusal
     _staged_graph_in_play = model_state_module.Qwen4ExpModelState._staged_graph_in_play
+    _ple_host_coverage = model_state_module.Qwen4ExpModelState._ple_host_coverage
+    _ple_resync_mirror = model_state_module.Qwen4ExpModelState._ple_resync_mirror
+    _ple_resync_mirror_inner = (
+        model_state_module.Qwen4ExpModelState._ple_resync_mirror_inner
+    )
+    # The budgets are read off the real class rather than restated here, so a
+    # cap changed in production changes what these tests assert.
+    PLE_RESYNC_PER_SLOT = model_state_module.Qwen4ExpModelState.PLE_RESYNC_PER_SLOT
+    PLE_RESYNC_TOTAL = model_state_module.Qwen4ExpModelState.PLE_RESYNC_TOTAL
 
     def __init__(self, slots: int = 8) -> None:
         self.uses_ngram_embedding = True
@@ -550,7 +559,20 @@ class FakeModelState:
         self._ple_host_history = HostTokenHistory(slots, CTX + 1)
         for slot in range(slots):
             self._ple_host_history.seed(slot, _slot_tokens(slot)[: _POSITION + 1])
+        # Repair state, because ``_stage_host_ple_ids`` now reaches for it on a
+        # count mismatch. The stub has no device, so the sync is a counter: the
+        # repair's correctness does not depend on it, only its ordering does, and
+        # the resync tests assert that it was called.
+        self._ple_resyncs = 0
+        self._ple_resync_disagree = 0
+        self._ple_resync_refused: set[str] = set()
+        self._ple_resync_slots: dict[int, int] = {}
+        self._ple_syncs = 0
+        self._ple_resync_sync = self._count_sync
         self.slots = slots
+
+    def _count_sync(self) -> None:
+        self._ple_syncs += 1
 
     def staged_rows(self) -> list[int]:
         return [layer._host_stage_rows for layer in self._ple_host_layers or []]
@@ -596,7 +618,13 @@ def _step_device_ids(
 
 
 def _advance_device_ids(
-    input_batch, st: FakeModelState, *, num_reqs: int = 2, q: int = 3
+    input_batch,
+    st: FakeModelState,
+    *,
+    num_reqs: int = 2,
+    q: int = 3,
+    row: np.ndarray | None = None,
+    computed: np.ndarray | None = None,
 ) -> None:
     """Set the fixture's device ``input_ids`` to what the runner holds for this step.
 
@@ -613,9 +641,10 @@ def _advance_device_ids(
     test that simulates a commit landing has to advance the ids too, or it is
     testing the refusal path while its name claims it tests the commit path. The
     refusal itself is what ``test_mode_one_refuses_a_device_array_that_lags`` is
-    for. One exception, in ``test_dropped_commit_costs_coverage_never_correctness``:
-    there the device really has advanced past the mirror, and this helper makes the
-    two agree; the refusal that test asserts comes from the history-length check,
+    for. One exception, in
+    ``test_a_lost_commit_is_repaired_not_poisoning``: there the
+    device really has advanced past the mirror, and this helper makes the two
+    agree; the mismatch that test simulates is caught by the history-length check,
     which runs before the gate, so the difference never reaches the assertion.
     """
     hist = st._ple_host_history
@@ -632,7 +661,16 @@ def _advance_device_ids(
         # ``ngram_context_len + 1`` cells while ``length`` counts every token the
         # request has accepted. The newest cell is the last one, which is what the
         # builder reads as row 0.
-        ids.append(int(hist.window[slot][-1]))
+        if row is not None:
+            # ... unless the test is describing a device that moved and a mirror
+            # that did not hear about it. Then row 0 is the token sitting at this
+            # step's position in the device's own row; taking it from the mirror
+            # would describe a device that agrees with the mirror the test just
+            # made wrong, and the repair would trip the input gate on the
+            # fixture rather than on anything real.
+            ids.append(int(row[slot, int(computed[slot])]))
+        else:
+            ids.append(int(hist.window[slot][-1]))
         ids.extend(int(v) for v in drafts[order])
     input_batch.input_ids = torch.tensor(
         ids + [0] * (16 - len(ids)), dtype=torch.int32
@@ -661,10 +699,15 @@ def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
     tokens = np.zeros((8, 64), dtype=np.int64)
     for slot in slots:
         tokens[slot, :] = _slot_tokens(slot)
+    # Production exposes the same cells twice: ``.gpu`` is the view the device
+    # writes and ``._uva_buf.np`` the host alias of it. The resync reads ``.gpu``,
+    # which is also the only view a non-UVA StagedWriteTensor has, so the stub
+    # carries both in both configurations.
+    gpu = torch.from_numpy(tokens)
     all_token_ids = (
-        SimpleNamespace(_uva_buf=SimpleNamespace(np=tokens))
+        SimpleNamespace(_uva_buf=SimpleNamespace(np=tokens), gpu=gpu)
         if uva
-        else SimpleNamespace(_uva_buf=None)
+        else SimpleNamespace(_uva_buf=None, gpu=gpu)
     )
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
@@ -1638,19 +1681,29 @@ def test_unlanded_commit_refuses_the_step_rather_than_waiting(hostids_env) -> No
     assert st._ple_host_history.pending == 0
 
 
-def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
-    """A commit that fails validation is dropped, and the exact-length check shows it.
+def test_a_lost_commit_is_repaired_not_poisoning(hostids_env) -> None:
+    """A commit that fails validation costs a step and a sync, not the request.
 
     The device advanced its counter whether or not the host mirror got the tokens,
-    so the mirror is one token short afterwards. The check must refuse the steps it
-    can no longer vouch for rather than build ids from a history with a hole in it
-    -- which is the same guarantee a full queue gives (``MAX_PENDING`` drops the new
-    commit), paid for here by one refused step instead of a wrong embedding.
+    so the mirror is one token short afterwards. Until 2026-10-04 that was
+    terminal: nothing could rebuild a slot -- ``seed`` ran at add and
+    ``invalidate`` at remove and never again -- so the exact-length check refused
+    that request for the rest of its life. Boot #26 measured the result: 411
+    ``history-length`` refusals per worker and six consecutive windows of 32/32,
+    with the drops that caused them all clustered behind them at batch transitions.
+
+    What the repair does NOT give up: it reads nothing until the device has been
+    synced (the row's generated cells are written by a kernel that is unordered
+    before a host read), it cross-checks the row against the cells the old window
+    still claims to hold, and it is budgeted per request and per boot. A mirror it
+    cannot vouch for still refuses the step rather than building ids from a
+    history with a hole in it.
     """
     emb = StagingEmbedding()
     hostids_env["layers"] = [emb]
     st = FakeModelState()
-    st.set_host_draft_source(_drafts())
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
     input_batch, req_states, tokens = _batch_and_states()
 
     slots, rows, counts, event = _commit(done=True)
@@ -1660,24 +1713,133 @@ def test_dropped_commit_costs_coverage_never_correctness(hostids_env) -> None:
         is False
     )
     assert "stage-tokens-rejected" in st._ple_host_refusals
+    # Boot #26 could not say why a commit was lost, only how many. The detail now
+    # names the check that lost it.
+    assert "num_sampled" in st._ple_host_history.last_drop
 
     # The device advanced anyway, so the mirror now lags by exactly one token.
     req_states.num_computed_tokens_np[[0, 3]] += 1
-    _advance_device_ids(input_batch, st)
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_refusals.get("history-length") is None, "not repaired"
+    assert st._ple_host_steps == 1
+    assert st._ple_resyncs == 1, "the repair did not run"
+    assert st._ple_syncs == 1, "the repair read the row without ordering the device"
+    hist = st._ple_host_history
+    for slot in (0, 3):
+        assert hist.length[slot] == req_states.num_computed_tokens_np[slot] + 1
+        assert int(hist.window[slot, -1]) == int(tokens[slot, hist.length[slot] - 1])
+
+    # The budget is per request and finite. A third loss is a systematic problem,
+    # and paying another device sync per step for it turns a coverage bug into a
+    # latency bug that produces entirely plausible text.
+    for step in range(FakeModelState.PLE_RESYNC_PER_SLOT - 1):
+        # A fresh draft block each step, or the staleness check refuses before the
+        # build and the loop measures the wrong thing.
+        drafts.bump_generation(10 + step)
+        req_states.num_computed_tokens_np[[0, 3]] += 1
+        _advance_device_ids(
+            input_batch,
+            st,
+            row=req_states.all_token_ids.gpu.numpy(),
+            computed=req_states.num_computed_tokens_np,
+        )
+        st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resyncs == FakeModelState.PLE_RESYNC_PER_SLOT
+    drafts.bump_generation(99)
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_refusals.get("history-length") == 1
-    assert st._ple_host_steps == 0, "staged ids built from a history with a hole"
+    assert st._ple_resyncs == FakeModelState.PLE_RESYNC_PER_SLOT, "budget exceeded"
+    assert "per-slot cap" in st._ple_resync_refused
 
-    # The next commit closes the gap: two accepted tokens per request, and the
-    # counter advances by the same amount the device advanced.
-    assert (
-        st.stage_host_tokens(slots, rows, np.array([2, 2], dtype=np.int32), event)
-        is True
-    )
+
+def test_resync_refuses_to_serve_when_the_row_disagrees_with_the_mirror(
+    hostids_env,
+) -> None:
+    """A repair that takes its length from the row it read cannot notice a bad read.
+
+    So it cross-checks the row against the cells the old window still claims --
+    ``num_sampled`` commits on one side, the device's own token buffer on the
+    other. Disagreement over the overlap means one of those two is lying about the
+    request's history, and boot #14 already caught the host mirror handing back
+    ``4161103993993705554`` where a token id belongs. The knob goes off; it does
+    not serve from a read this worker cannot vouch for.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    hist = st._ple_host_history
     req_states.num_computed_tokens_np[[0, 3]] += 1
     _advance_device_ids(input_batch, st)
+    old_len = int(hist.length[0])
+    req_states.all_token_ids.gpu[0, old_len - 1] = 4161103993993705554 % (2**31)
     st._stage_host_ple_ids(input_batch, req_states)
-    assert st._ple_host_steps == 1
+    assert st._ple_resync_disagree == 1
+    assert st._ple_host_steps == 0, "ids built from a row that contradicts the mirror"
+    assert st._ple_host_refusals.get("history-length") == 1
+
+
+def test_resync_never_runs_inside_a_capture(hostids_env, monkeypatch) -> None:
+    """A device sync inside a capture aborts it, and that kills the boot."""
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
+    monkeypatch.setattr(
+        model_state_module.torch.cuda, "is_current_stream_capturing", lambda: True
+    )
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_syncs == 0
+    assert st._ple_host_steps == 0
+    assert "capturing" in st._ple_resync_refused
+    assert st._ple_host_refusals.get("history-length") == 1
+
+
+def test_refusal_detail_says_which_side_of_the_count_is_wrong(
+    hostids_env, caplog
+) -> None:
+    """Boot #26 raised 411 of these and could not answer the question it posed.
+
+    The exception carried ``positions [...] != committed-1 [...]`` and only
+    ``exc.reason`` was logged, so the boot could establish that the mirror and the
+    scheduler disagreed on every step and could not say which one was wrong or by
+    how much. ``grep -c committed-1`` on that log is zero.
+    """
+    import logging
+
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
+    # No repair possible: the budget is gone, so the refusal reaches the log.
+    st._ple_resync_slots.update({0: st.PLE_RESYNC_PER_SLOT, 3: st.PLE_RESYNC_PER_SLOT})
+    with caplog.at_level(logging.INFO):
+        st._stage_host_ple_ids(input_batch, req_states)
+    line = "\n".join(r.getMessage() for r in caplog.records)
+    assert "committed-1" in line, line
+    # And the line that counts refusals now has the denominator next to it.
+    assert "staged_steps=" in line and "dropped=" in line
 
 
 def test_replaying_a_stale_draft_block_refuses(hostids_env) -> None:
