@@ -102,6 +102,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
         self._ple_resync_disagree = 0
         self._ple_resync_refused: set[str] = set()
         self._ple_resync_slots: dict[int, int] = {}
+        # Which request each slot's mirror describes, and the disagreement ledger
+        # the disable decision reads. The owner has to be known before two token
+        # sequences can be compared at all: see the cross-check in
+        # :meth:`_ple_resync_mirror_inner` for what boot #27 found out.
+        self._ple_host_slot_req: dict[int, str] = {}
+        self._ple_resync_disagree_slots: dict[int, int] = {}
+        self._ple_resync_owner_skip = 0
         # Indirection so a test can stand in for the device sync without a
         # device. Production calls the real one.
         self._ple_resync_sync = torch.cuda.synchronize
@@ -139,6 +146,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # the host can trust without asking the device; everything after it
         # arrives through ``HostTokenHistory.stage_step``.
         self._ple_host_slots[new_req_data.req_id] = req_index
+        # The mirror's owner, recorded at the only moment it is knowable for sure.
+        # A slot's row outlives its request (``invalidate`` clears the mirror, the
+        # device's ``all_token_ids`` row keeps the previous occupant's tokens
+        # forever), so "which request do these cells belong to" has to be carried
+        # rather than inferred.
+        self._ple_host_slot_req[req_index] = new_req_data.req_id
         self._ple_host_history.seed(req_index, new_req_data.prefill_token_ids or ())
 
     def remove_request(self, req_id: str) -> None:
@@ -150,9 +163,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_index = self._ple_host_slots.pop(req_id, None)
         if req_index is not None:
             self._ple_host_history.invalidate(req_index)
-            # A slot is reused by the next request, and the resync budget belongs
-            # to a request, not to a slot number.
+            # A slot is reused by the next request, and the resync budget, the
+            # mirrored owner and the disagreement ledger all belong to a request,
+            # not to a slot number. Carrying any of them across would let the next
+            # request inherit a spent budget -- or, worse, a comparison against a
+            # window it never owned.
             self._ple_resync_slots.pop(req_index, None)
+            self._ple_resync_disagree_slots.pop(req_index, None)
+            self._ple_host_slot_req.pop(req_index, None)
 
     # ------------------------------------------------------------- read-ahead
     def _ple_prefetch_modules(self):
@@ -356,6 +374,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # path" is not something a replay can do.
         for layer in self._ple_host_gen_layers:
             layer.check_host_gen()
+        if not self._ple_host_layers:
+            # ``disable_host_staging`` empties the layer list, after which this
+            # method's job -- hand rows to a layer -- cannot be done at all. It
+            # used to fall through anyway: the build ran, the mirror kept
+            # tracking, and ``_ple_host_steps`` advanced through a staging loop
+            # that iterated zero times. That is how boot #27 reported 5,120 staged
+            # steps in the same log line as a mirror that had received 1,140
+            # commits and a layer that had been handed no rows since 02:30:55. A
+            # counter that survives the thing it counts cannot be the shipping
+            # signal, so say what the step is: a refusal, because staging is off.
+            self._note_host_refusal("staging-disabled")
+            return
         if self._host_drafts is None:
             self._note_host_refusal("no-draft-source")
             return
@@ -480,7 +510,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     return
         for layer in self._ple_host_layers:
             try:
-                layer.stage_host_step(
+                accepted = layer.stage_host_step(
                     input_ids,
                     query_start_loc,
                     ngram_context,
@@ -492,6 +522,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 self.disable_host_staging(
                     f"host id staging failed ({type(exc).__name__}: {exc})"
                 )
+                return
+            if not accepted:
+                # The layer took the ids and wrote nothing: its own differential is
+                # off, or the step is wider than its pinned buffer. Either way
+                # these rows are not in the buffer this step's replay reads, which
+                # is the definition of a step that did not stage. The return value
+                # used to be dropped on the floor and the step counted as staged.
+                self._note_host_refusal("layer-declined-staging")
                 return
         self._last_draft_gen = gen
         self._ple_host_steps += 1
@@ -613,6 +651,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
     mismatch, which would otherwise be a device sync on every decode step -- a
     boot that runs at a third of the speed with entirely plausible text."""
 
+    PLE_DISAGREE_TOTAL = 4
+    """Disagreements per worker before the knob goes off for the boot.
+
+    Four, because four different slots disagreeing is not one bad read, and the
+    thing a disable is for -- and can only be for -- is a host that cannot vouch
+    for its own reads. A single disagreement is a refused step, which under a
+    captured graph costs that request the same coverage a disable would, without
+    taking every other slot in the boot with it. That trade is exactly what boot
+    #27 made at 02:30:55, on evidence that turned out to be two requests sharing
+    a slot.
+    """
+
+    PLE_DISAGREE_PER_SLOT = 2
+    """Two on one request is a mirror and a row that are not going to agree, so
+    stop paying a device sync to find that out again."""
+
     def _ple_resync_mirror(
         self, req_states: Any, input_batch: InputBatch, detail: str
     ) -> bool:
@@ -636,8 +690,24 @@ class Qwen4ExpModelState(MambaHybridModelState):
         triggered this unable to notice a bad read. So the rebuilt row is
         cross-checked against the cells the *old* window still claims to hold --
         ``num_sampled`` commits on one side, the device's own token buffer on the
-        other. If they disagree over the overlap, the host cannot vouch for its own
-        read and the knob goes off rather than serve from it.
+        other.
+
+        That comparison is only meaningful between a mirror and a row that describe
+        the **same request**, and boot #27 is what not knowing that cost: at
+        02:30:55, three seconds before its first real step, it compared a mirror
+        holding ``[4, 5, 10]`` against a row holding ``[4, 5, 19959]`` on slot 2 --
+        two different requests in one slot, because ``prepare_dummy_inputs`` never
+        goes through ``add_request`` and ``invalidate`` clears the mirror but never
+        the device's row. So the overlap is compared only when this slot's current
+        owner, from the runner's own ``index_to_req_id``, is the request the mirror
+        was seeded for. Anything else is recorded as an owner skip and the row is
+        taken on trust, which is what a post-sync read of the device's own token
+        buffer is for.
+
+        And a disagreement turns this step down; it does not turn the knob off.
+        Under a captured graph there is no fallback for the step either way, so
+        disabling traded one request for every slot in the boot. The knob goes off
+        only once disagreements repeat -- see :meth:`_note_resync_disagreement`.
 
         Slots only arrive here having already failed the count check, so seeding
         one cannot turn a working mirror into a broken one.
@@ -679,6 +749,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self._ple_resync_refused.add("no mismatching slot")
             return False
         row_width = int(req_states.all_token_ids.gpu.shape[1])
+        # Who owns each slot according to the runner, which is the only party that
+        # knows. Nothing here may assume the mirror and the row describe the same
+        # request until this says so.
+        owners = getattr(req_states, "index_to_req_id", {})
+        plan: list[tuple[int, int, int, str | None, bool]] = []
         for i in bad:
             slot = int(slots[i])
             want = int(positions[i]) + 1
@@ -688,32 +763,39 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if want < 1 or want > row_width:
                 self._ple_resync_refused.add("position beyond row")
                 return False
+            owner = owners.get(slot)
+            same_request = owner is not None and owner == self._ple_host_slot_req.get(
+                slot
+            )
+            if not same_request:
+                # Either the runner has no request in this slot (a capture or
+                # warmup dummy) or the mirror describes a request that has left.
+                # Both are normal, and neither is evidence about the device.
+                self._ple_resync_owner_skip += 1
+            plan.append((slot, want, int(hist.length[slot]), owner, same_request))
 
         # The one device sync on this path, before any cell is read.
         self._ple_resync_sync()
         self._ple_resyncs += 1
         rows = req_states.all_token_ids.gpu
-        for i in bad:
-            slot = int(slots[i])
-            want = int(positions[i]) + 1
-            old_len = int(hist.length[slot])
+        for slot, want, old_len, owner, same_request in plan:
             row = rows[slot, :want].to("cpu", non_blocking=False).numpy()
-            overlap = min(hist.width, old_len)
+            overlap = min(hist.width, old_len) if same_request else 0
             if overlap and not np.array_equal(
                 row[old_len - overlap : old_len],
                 hist.window[slot, hist.width - overlap :],
             ):
-                self._ple_resync_disagree += 1
-                self.disable_host_staging(
-                    "PLE host mirror resync disagreed with the device's own token "
-                    f"row on slot {slot}: mirrored "
-                    f"{hist.window[slot, hist.width - overlap :].tolist()} vs "
-                    f"row {row[old_len - overlap : old_len].tolist()} over the "
-                    f"last {overlap} cell(s). Refusing to serve ids from a "
-                    "host read this worker cannot vouch for."
+                self._note_resync_disagreement(
+                    slot,
+                    hist.window[slot, hist.width - overlap :],
+                    row[old_len - overlap : old_len],
+                    overlap,
                 )
                 return False
             hist.seed(slot, row)
+            if owner is not None:
+                # The rebuilt window belongs to whoever is in the slot now.
+                self._ple_host_slot_req[slot] = owner
             self._ple_resync_slots[slot] = self._ple_resync_slots.get(slot, 0) + 1
         if self._ple_resyncs == 1 or self._ple_resyncs % 16 == 0:
             logger.warning(
@@ -728,6 +810,63 @@ class Qwen4ExpModelState(MambaHybridModelState):
             )
         return True
 
+    def _note_resync_disagreement(
+        self, slot: int, mirrored: np.ndarray, row_cells: np.ndarray, overlap: int
+    ) -> None:
+        """Record one cross-check failure, and decide whether it is a boot problem.
+
+        Takes the two slices that were compared, not the arrays they came from: the
+        row is ``want`` cells long and the window is the full ring, so a helper that
+        re-derived the slice from the lengths would print the wrong cells -- and a
+        diagnostic that names cells nobody compared is worse than no diagnostic.
+
+        Refuses the step. It does not refuse the boot unless the pattern says the
+        host's own reads are the thing that is broken.
+        """
+        detail = (
+            f"PLE host mirror resync disagreed with the device's own token row on "
+            f"slot {slot}: mirrored {mirrored.tolist()} vs row "
+            f"{row_cells.tolist()} over the last {overlap} cell(s)."
+        )
+        self._ple_resync_disagree += 1
+        per_slot = self._ple_resync_disagree_slots.get(slot, 0) + 1
+        self._ple_resync_disagree_slots[slot] = per_slot
+        if (
+            self._ple_resync_disagree >= self.PLE_DISAGREE_TOTAL
+            or per_slot >= self.PLE_DISAGREE_PER_SLOT
+        ):
+            self.disable_host_staging(
+                f"{detail} Repeated disagreement: the host cannot vouch for its own "
+                "reads, so it stops serving ids built from them rather than "
+                "repeating this step after step."
+            )
+            return
+        logger.warning(
+            "PLE HOSTIDS: resync declined slot %d -- %s The step goes to the "
+            "device path. Declining rather than turning the knob off: %d/%d "
+            "disagreements this boot, %d on this slot.",
+            slot,
+            detail,
+            self._ple_resync_disagree,
+            self.PLE_DISAGREE_TOTAL,
+            per_slot,
+        )
+
+    def _ple_host_layer_steps(self) -> int:
+        """Steps on which a layer actually put rows in its pinned buffer.
+
+        Read at the sink, from the layer's own counter, because every other number
+        in this file is upstream of the thing that matters. Three boots in a row
+        were read from a counter that sat between the build and the layer and so
+        kept rising after the layer stopped being called: boot #26's
+        ``staged_steps`` never existed, and boot #27's reached 5,120 while this one
+        stayed at 1 -- the capture dummy.
+        """
+        return sum(
+            int(getattr(layer, "_host_stage_steps", 0))
+            for layer in self._ple_host_gen_layers
+        )
+
     def _ple_host_coverage(self) -> str:
         """What the host path actually did, for the log lines that need a denominator.
 
@@ -737,12 +876,27 @@ class Qwen4ExpModelState(MambaHybridModelState):
         knob disabled itself.
         """
         hist = self._ple_host_history
+        layers = self._ple_host_gen_layers
+        # Two ways this boot is not staging, and they look identical from the
+        # outside: the worker turned the knob off (which empties the layer list),
+        # or every layer stopped taking steps (its own hostids went off, and
+        # ``stage_host_step`` will decline from here on). Reporting the first and
+        # reading the second as "on but idle" is how boot #27's 5,120 staged steps
+        # got read as a live knob by the person who wrote the counter.
+        knob_off = bool(layers) and not self._ple_host_layers
+        layers_off = bool(layers) and all(
+            getattr(layer, "_hostids_disabled", False) for layer in layers
+        )
         return (
             f"staged_steps={self._ple_host_steps} "
             f"refused={sum(self._ple_host_refusals.values())} "
+            f"layers_staged={self._ple_host_layer_steps()} "
+            f"disabled={'yes' if knob_off or layers_off else 'no'} "
             f"mirror(staged={hist.staged} dropped={hist.dropped} "
             f"sliced={hist.sliced} flushes={hist.flushes} pending={hist.pending}) "
             f"resync={self._ple_resyncs} "
+            f"disagree={self._ple_resync_disagree}/{self.PLE_DISAGREE_TOTAL} "
+            f"owner_skip={self._ple_resync_owner_skip} "
             f"resync_refused={sorted(self._ple_resync_refused)}"
         )
 

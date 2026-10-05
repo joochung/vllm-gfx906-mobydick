@@ -98,8 +98,33 @@ class StagingEmbedding:
 
     # The real implementations, not copies.
     _host_hash_buffers = Qwen4ExpNGramEmbedding._host_hash_buffers
-    stage_host_step = Qwen4ExpNGramEmbedding.stage_host_step
+    _stage_step_impl = Qwen4ExpNGramEmbedding.stage_host_step
     take_host_stage = Qwen4ExpNGramEmbedding.take_host_stage
+
+    #: Whether a staged step also puts its generation where the op would have put
+    #: it. See :meth:`stage_host_step` below.
+    _mirror_op_gen = True
+
+    def stage_host_step(self, *args: Any, **kwargs: Any) -> bool:
+        """The real staging method, plus the one thing only the custom op does.
+
+        The staged branch of the op copies this step's generation into the device
+        scratch on every staged step, eager and replayed alike
+        (``ple_layer.py:2806``), and the generation tripwire reads that scratch back
+        later. A test that drives ``stage_host_step`` never runs the op, so the
+        scratch would stay at zero and the tripwire would correctly report a handoff
+        that never landed -- a true statement about the fake, arriving as a layer
+        disabled in the middle of a test about something else. Boot #27 is what that
+        looks like from the outside: a ``staged_steps`` counter that climbed while
+        the layer underneath it had stopped taking steps.
+
+        A test that wants the wire to report something -- stale, ahead, in flight --
+        says so itself with :func:`_replay`, which turns this mirror off.
+        """
+        accepted = self._stage_step_impl(*args, **kwargs)
+        if accepted and self._mirror_op_gen and self._gen_device is not None:
+            self._gen_device.copy_(self._pinned_gen)
+        return accepted
     compare_host_ids = Qwen4ExpNGramEmbedding.compare_host_ids
     note_draft_provenance = Qwen4ExpNGramEmbedding.note_draft_provenance
     _id_dump = Qwen4ExpNGramEmbedding._id_dump
@@ -531,10 +556,16 @@ class FakeModelState:
     _ple_resync_mirror_inner = (
         model_state_module.Qwen4ExpModelState._ple_resync_mirror_inner
     )
+    _note_resync_disagreement = (
+        model_state_module.Qwen4ExpModelState._note_resync_disagreement
+    )
+    _ple_host_layer_steps = model_state_module.Qwen4ExpModelState._ple_host_layer_steps
     # The budgets are read off the real class rather than restated here, so a
     # cap changed in production changes what these tests assert.
     PLE_RESYNC_PER_SLOT = model_state_module.Qwen4ExpModelState.PLE_RESYNC_PER_SLOT
     PLE_RESYNC_TOTAL = model_state_module.Qwen4ExpModelState.PLE_RESYNC_TOTAL
+    PLE_DISAGREE_TOTAL = model_state_module.Qwen4ExpModelState.PLE_DISAGREE_TOTAL
+    PLE_DISAGREE_PER_SLOT = model_state_module.Qwen4ExpModelState.PLE_DISAGREE_PER_SLOT
 
     def __init__(self, slots: int = 8) -> None:
         self.uses_ngram_embedding = True
@@ -567,6 +598,13 @@ class FakeModelState:
         self._ple_resync_disagree = 0
         self._ple_resync_refused: set[str] = set()
         self._ple_resync_slots: dict[int, int] = {}
+        # Boot #27's lesson, carried as state: a cross-check is only meaningful
+        # against the request that owns the slot, so the stub has to know owners,
+        # and it has to match the mapping ``_batch_and_states`` puts in
+        # ``req_states.index_to_req_id``.
+        self._ple_host_slot_req = {slot: _req_id(slot) for slot in range(slots)}
+        self._ple_resync_disagree_slots: dict[int, int] = {}
+        self._ple_resync_owner_skip = 0
         self._ple_syncs = 0
         self._ple_resync_sync = self._count_sync
         self.slots = slots
@@ -589,6 +627,16 @@ class FakeDrafts:
         """Simulate an epilogue that staged a fresh block."""
         values, row_idx, _ = self._result
         self._result = (values.copy(), row_idx.copy(), gen)
+
+
+def _req_id(slot: int) -> str:
+    """The request id a slot carries, shared by the stub's owner map and the batch.
+
+    The resync cross-check compares a mirror against a device row, and that is
+    only a question when both describe the same request -- so the fixture has to
+    name requests, not just slots.
+    """
+    return f"req-{slot}"
 
 
 def _slot_tokens(slot: int, width: int = 64) -> np.ndarray:
@@ -732,7 +780,12 @@ def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
         query_start_loc=torch.tensor(_step_qsl(num_reqs, q), dtype=torch.int32),
     )
     req_states = SimpleNamespace(
-        num_computed_tokens_np=computed, all_token_ids=all_token_ids
+        num_computed_tokens_np=computed,
+        all_token_ids=all_token_ids,
+        # The runner's own slot -> request map, which is the only authority on who
+        # is in a slot. The resync's cross-check reads it before comparing a
+        # mirror against a row.
+        index_to_req_id={slot: _req_id(slot) for slot in slots},
     )
     return input_batch, req_states, tokens
 
@@ -1237,6 +1290,7 @@ def _replay(emb, gen: int) -> None:
     for the wrong reason.
     """
     assert emb._gen_device is not None
+    emb._mirror_op_gen = False  # this test drives the scratch itself from here on
     emb._gen_device.fill_(gen)
 
 
@@ -1774,8 +1828,9 @@ def test_resync_refuses_to_serve_when_the_row_disagrees_with_the_mirror(
     ``num_sampled`` commits on one side, the device's own token buffer on the
     other. Disagreement over the overlap means one of those two is lying about the
     request's history, and boot #14 already caught the host mirror handing back
-    ``4161103993993705554`` where a token id belongs. The knob goes off; it does
-    not serve from a read this worker cannot vouch for.
+    ``4161103993993705554`` where a token id belongs. The step is refused; the
+    worker does not serve from a read it cannot vouch for. What it does with a
+    *pattern* of these is ``test_a_disagreement_refuses_the_step_not_the_boot``.
     """
     emb = StagingEmbedding()
     hostids_env["layers"] = [emb]
@@ -1792,6 +1847,183 @@ def test_resync_refuses_to_serve_when_the_row_disagrees_with_the_mirror(
     assert st._ple_resync_disagree == 1
     assert st._ple_host_steps == 0, "ids built from a row that contradicts the mirror"
     assert st._ple_host_refusals.get("history-length") == 1
+
+
+def test_the_cross_check_only_compares_the_request_that_owns_the_slot(
+    hostids_env,
+) -> None:
+    """Boot #27: two requests in one slot is not a disagreement, it is two requests.
+
+    At 02:30:55 -- three seconds before its first real step -- boot #27 compared a
+    mirror holding ``[4, 5, 10]`` against a row holding ``[4, 5, 19959]`` on slot 2
+    and turned the knob off on all four workers. The mirror had been seeded by a
+    warmup dummy that never went through ``add_request``; the row held the previous
+    occupant's tokens, which ``invalidate`` does not clear because it is not the
+    mirror's to clear. Neither side was wrong and the boot was dead.
+
+    So the row is compared against the window only when the runner says the slot
+    still belongs to the request the mirror describes. Otherwise the post-sync read
+    of the device's own token buffer is taken on trust, which is what it is for.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    hist = st._ple_host_history
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    old_len = int(hist.length[0])
+    # A token the mirror has never seen, in the cell the overlap would compare.
+    req_states.all_token_ids.gpu[0, old_len - 1] = 4161103993993705554 % (2**31)
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+    # Slot 0 now holds somebody else; slot 3 still holds who the mirror says. The
+    # per-slot distinction is the whole point, so the test keeps one of each.
+    req_states.index_to_req_id = {0: "the-previous-occupant", 3: _req_id(3)}
+
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_resync_disagree == 0, "a stranger's tokens were read as a defect"
+    assert st._ple_syncs == 1
+    assert st._ple_resync_owner_skip == 1
+    assert st._ple_host_steps == 1, "the slot was rebuilt but the step was lost anyway"
+    assert int(hist.window[0, -1]) == int(
+        req_states.all_token_ids.gpu[0, hist.length[0] - 1]
+    ), "the mirror did not take the row it was told to trust"
+    assert st._ple_host_slot_req[0] == "the-previous-occupant"
+    # The slot whose owner matched was still checked, and passed.
+    assert st._ple_host_slot_req[3] == _req_id(3)
+
+
+def test_a_disagreement_with_the_owner_refuses_the_step_not_the_boot(
+    hostids_env,
+) -> None:
+    """One bad read is a refused step; a pattern of them is a dead knob.
+
+    Under a captured graph the step has no device fallback either way, so the old
+    immediate disable traded every other request in the boot for coverage it was
+    not going to get on that step anyway. Disabling stays correct once the
+    disagreement repeats, because then the thing that is broken is the host's
+    ability to read its own memory.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    hist = st._ple_host_history
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    old_len = int(hist.length[0])
+    req_states.all_token_ids.gpu[0, old_len - 1] = 4161103993993705554 % (2**31)
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resync_disagree == 1
+    assert st._ple_host_steps == 0, "ids built from a row that contradicts the mirror"
+    assert st._ple_host_layers == [emb], "one disagreement disabled the whole boot"
+    assert emb._hostids_disabled is False
+
+    # The same slot again. The mirror was deliberately not re-seeded after a
+    # disagreement, so it still lags and the next step asks the same question --
+    # which is the point: two on one request means the two sides will not agree.
+    drafts.bump_generation(7)
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_resync_disagree == 2
+    assert st._ple_host_layers == [], "a repeating disagreement kept the knob on"
+    assert st._ple_resync_disagree_slots[0] == FakeModelState.PLE_DISAGREE_PER_SLOT
+
+
+def test_staged_steps_stops_when_staging_is_disabled(hostids_env) -> None:
+    """A counter that survives the thing it counts cannot be the shipping signal.
+
+    Boot #27 logged ``staged_steps=5120`` for a worker that had disabled staging at
+    02:30:55, whose mirror had taken 1,140 commits and whose layer had been handed
+    one row -- the capture dummy. ``_stage_host_ple_ids`` tested only whether the
+    layer list had been *built*, and an empty list built just as well as a full
+    one, so the counter advanced through a staging loop that ran zero times. Every
+    number on that line now comes from at or below the layer that does the work.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1
+    assert st._ple_host_layer_steps() == 1
+
+    st.disable_host_staging("test: what the counter does afterwards")
+    before = st._ple_host_layer_steps()
+
+    for step in range(3):
+        drafts.bump_generation(10 + step)
+        st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_steps == 1, "the counter kept rising after the disable"
+    assert st._ple_host_layer_steps() == before
+    assert st._ple_host_refusals.get("staging-disabled") == 3
+    coverage = st._ple_host_coverage()
+    assert "staged_steps=1" in coverage
+    assert f"layers_staged={before}" in coverage
+    assert "disabled=yes" in coverage
+
+
+def test_a_layer_that_declines_the_ids_is_not_counted_as_staged(
+    hostids_env,
+) -> None:
+    """``stage_host_step`` answers whether it staged. The answer is the fact.
+
+    The layer returns False when its own hostids are off or the step is wider than
+    its pinned buffer, which means these rows are not in the buffer this step's
+    replay reads. The return value used to be dropped and the step counted as
+    staged anyway -- the same one-line class of slip as the empty layer list, and
+    invisible for exactly the same reason: nothing downstream consumed the answer.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_host_steps == 1
+    assert st._ple_host_layer_steps() == 1
+
+    emb.disable_hostids("test: the layer stopped taking steps")
+    drafts.bump_generation(11)
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_host_steps == 1, "a step that staged nothing was counted"
+    assert st._ple_host_layer_steps() == 1
+    assert st._ple_host_refusals.get("layer-declined-staging") == 1
+    coverage = st._ple_host_coverage()
+    assert "staged_steps=1" in coverage
+    # A layer that stopped taking steps is a boot that is not staging, whatever
+    # the worker's own knob says.
+    assert "disabled=yes" in coverage
 
 
 def test_resync_never_runs_inside_a_capture(hostids_env, monkeypatch) -> None:
