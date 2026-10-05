@@ -285,107 +285,168 @@ def ple_hostids_async_conflict(
 
 
 ENV_ALLOW_HOSTIDS_MTP = "VLLM_GFX906_ALLOW_HOSTIDS_MTP"
-"""Set to 1 to run the PLE host-ids *differential* (``VLLM_GFX906_PLE_HOSTIDS=2``)
-under speculative decoding. It does not open mode 1: serving host rows that were
-gathered for a different pass has no acceptable risk level to accept."""
+"""Set to 1 to run the PLE host-ids knob under speculative decoding.
+
+It opens both modes, and what it concedes differs by mode. ``HOSTIDS=2`` compares
+and never serves, so the override there says a question can be asked. ``HOSTIDS=1``
+serves the host's rows to the model, so the override there says the configuration
+has never run on this hardware and the operator has weighed that -- see
+:func:`ple_hostids_mtp_conflict` for what is and is not established, and
+``docs/ple-multipass-verdict.md`` for why the reason this guard first printed
+("the PLE op runs k+1 times per step, a patchwork of passes") is false.
+"""
 
 
 def ple_hostids_mtp_conflict(
     num_speculative_tokens: int, environ: dict[str, str] | None = None
 ) -> str | None:
-    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` cannot be correct under MTP, or None.
+    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` needs an override under MTP, or None.
 
-    With ``num_speculative_tokens = k`` the PLE op runs ``k + 1`` times per step --
-    the main pass plus one pass per drafter iteration -- and each pass writes only
-    the rows it computed into one static ids buffer sized to the capture size. The
-    buffer is therefore a patchwork of passes, not the output of any single query.
-    Measured on this box (2026-10-01 22:20:51, boot ``vllm.log.20261001-215123``,
-    all four TP workers, inverted exactly by
-    ``scripts/invert-mismatch-2220b.py``): the host
-    staged a step whose query was ``[760, 1156, 2640, 343]`` while rows 2-3 of the
-    device's ids buffer hash to ``[*, 4, 2640, 343]`` -- a different pass's draft at
-    row 1 -- and row 1 of the same buffer agrees with the *host*, which no single
-    compute can do. So rows 1 and 2 were authored by different passes.
+    What this guard is for has not changed: host ids and a drafter do not combine
+    by inspection, and someone has to say out loud what the combination costs.
+    What it *says* had to be rewritten, because the mechanism it originally
+    refused on was false.
 
-    That is a correctness problem for the staged path, not just for the comparison:
-    the staged branch is taken on row-count agreement (``staged == n``), so a
-    drafter pass with the same row count and different tokens consumes embeddings
-    the host gathered for another pass's query. The ids stay in range, the gather
-    hits real rows, and the model is handed an embedding computed from the wrong
-    context -- the same silent-wrong-answer class as a captured graph replaying a
-    stale PLE embedding (mtp-cudagraph-profile-crash.md 13.2). The generation
-    tripwire cannot see it either, because it checks the draft provenance and the
-    row count, and here both agree.
+    **The mechanism it printed was wrong.** It claimed that with
+    ``num_speculative_tokens = k`` the PLE op runs ``k + 1`` times per step, each
+    pass writing only its own rows into one static ids buffer, so the buffer is a
+    patchwork of passes -- and it cited the 2026-10-01 22:20:51 mismatch across all
+    four TP workers (``vllm.log.20261001-215123``, inverted by
+    ``scripts/invert-mismatch-2220b.py``) as the measurement. Four independent lines
+    say that is not how this tree works (**``docs/ple-multipass-verdict.md``**):
 
-    Refusing at config time rather than shipping a knob that can be silently wrong
-    is the house pattern (see ``ple_hostids_async_conflict``).
+    * the drafter builds no PLE module at all -- ``mtp.py:8`` turns it off and
+      ``mtp.py:314-322`` passes ``input_ids=None``, which ``model.py:296`` would
+      raise on if a PLE layer existed, and that string appears in zero logs from
+      this box,
+    * one PLE op call per step, measured: boot #14's TP0 compared at 14.4/s while
+      the engine ran 15.0 steps/s (49.0 tok/s / 3.27 acceptance), where the
+      multi-pass story predicts ~25,000 gate-skips per worker and 8 happened,
+    * ``[0, 2, 2, 2]`` -- the qsl the mismatch reported -- is arithmetically
+      impossible as a pass of a 3-request step, and is exactly the padded form of
+      an earlier B=1 2-token step (``input_batch.py:159``), and
+    * the mismatch itself disappeared when ``18c119f010`` fixed the non-monotone
+      ``ple_query_start_loc`` that made the workspace scatter's ``searchsorted()``
+      undefined: boot #14, 55,921 comparisons, 0 mismatches, 0 DISABLED, against
+      the cited boot's 4 mismatches and 4 DISABLED after **0** staged steps.
 
-    The remedy this guard first printed -- "run the differential on a boot without
-    ``--speculative-config``" -- was measured to be wrong on 2026-10-02, and a
-    guard's remedy is part of the guard: it cost five boot attempts across two
-    boots (``234242``: two APIServer pids; ``065905``: three), all five dying at
-    the same line. A drafter-off boot cannot answer the question the differential
-    asks, twice over. (1) It compares nothing: the host mirror's only window into
-    the token stream is ``draft_tokens_handler`` (``gpu/model_runner.py`` binds
-    ``_host_drafts`` from it, because P1.6 reuses the one per-step host copy that
-    is already being paid), so with no drafter every step refuses with
-    ``no-draft-source`` -- ``logs/vllm.log.20261002-065905``, all four TP workers,
-    during ``profile_run``. (2) It does not compile: ``ConstraintViolationError:
-    L['input_ids'].size()[0] ... specialized to be a constant (4096)`` at
-    ``profile_run`` -> ``aot_compile`` -> ``build_guards``; the only two logs in
-    this box's corpus that contain the exception at all are the two drafter-off
-    ``HOSTIDS=2`` boots (``20261001-234242``, ``20261002-065905``), and the error
-    is deterministic so retrying does not help.
+    The rows that looked authored by another pass were rows **misplaced** into the
+    wrong workspace row. The host column is reproduced exactly by
+    ``f(2640, 1156)``: the host was right.
 
-    Differential mode under MTP with the override is therefore not merely the
-    least-bad option, it is the only configuration in which a comparison can
-    happen -- and it is safe in a way mode 1 is not:
-    ``ple_layer.Qwen4ExpPLELayer.stage_host_step(gather=False)`` returns before
-    ``_host_stage_rows``, ``_pinned_output`` and the generation counter are
-    touched, so mode 2 cannot take the staged branch. It can only compare, and the
-    input-agreement gate refuses the passes whose arrays do not describe the same
-    work. Mode 1, which serves the host's rows to the model, gets no override.
+    **What is left is the thing no amount of code-reading settles:** whether
+    ``HOSTIDS=1`` under MTP is correct has never been run on this hardware. Mode 1's
+    rows are attributable only while the step's device arrays agree with the host
+    mirror; that is now checked in the staging path (``stage_inputs_agree``, which is
+    where it belongs -- as a mode-2-only gate it guarded a comparison while the
+    serving path staged anything it was handed), and boot #14 measured the
+    disagreement rate at about 2 steps per worker per 40,500. The open question is
+    what a *refused* step does under a captured graph: piecewise is safe by
+    construction (the op falls through to the device path), FULL is not (the op body
+    does not run at replay, so the step ships the previous step's rows). That is what
+    ``Qwen4ExpModelState._ple_host_captured_refusals`` exists to count, and it is a
+    measured cliff rather than a hypothetical one.
+
+    So ``VLLM_GFX906_ALLOW_HOSTIDS_MTP=1`` now opens both modes, which is not the
+    same concession in either. Mode 2 returns from
+    ``stage_host_step(gather=False)`` before ``_host_stage_rows``, ``_pinned_output``
+    and the generation counter are touched, so it cannot take the staged branch: it
+    compares, and the gate refuses steps whose arrays do not describe the same work.
+    Mode 1 serves the host's rows to the model, and the override says that has never
+    been booted here and the risk was weighed. Neither mode runs without the
+    override: a knob that silently fails to engage is indistinguishable from one that
+    worked, and refusing is the house pattern (``ple_hostids_async_conflict``).
+
+    Do not "fix" this by dropping ``--speculative-config``, which is what this guard
+    used to advise. Measured wrong on 2026-10-02, and a guard's remedy is part of the
+    guard: it cost five boot attempts across two boots (``234242``, ``065905``), all
+    dying at the same line. A drafter-off boot cannot answer the question, twice over.
+    (1) It compares nothing: the mirror's only window into the token stream is
+    ``draft_tokens_handler`` (``gpu/model_runner.py`` binds ``_host_drafts`` from it,
+    because P1.6 reuses the one per-step host copy already being paid), so with no
+    drafter every step refuses with ``no-draft-source`` -- ``vllm.log.20261002-065905``,
+    all four TP workers, during ``profile_run``. (2) It does not compile:
+    ``ConstraintViolationError: L['input_ids'].size()[0] ... specialized to be a
+    constant (4096)`` at ``profile_run`` -> ``aot_compile`` -> ``build_guards``; the
+    only two logs in this box's corpus containing that exception at all are the two
+    drafter-off ``HOSTIDS=2`` boots, and it is deterministic, so retrying does not
+    help.
     """
+
     env = os.environ if environ is None else environ
     mode = env.get(ENV_PLE_HOSTIDS, "0")
     if num_speculative_tokens < 1 or mode in ("0", ""):
         return None
-    # The override opens differential mode only. Under MTP the host cannot say
-    # which pass it staged its rows for, so for mode 1 "I accept that risk" is not
-    # an informed answer: an escape hatch onto a silent-wrong-answer path is the
-    # bug with a permission slip, not a guard.
-    if mode == "2" and env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
-        return None
-    mechanism = (
-        f"{ENV_PLE_HOSTIDS} cannot be correct with speculative decoding: "
-        f"num_speculative_tokens={num_speculative_tokens} means the PLE op runs "
-        f"{num_speculative_tokens + 1} times per step and each pass overwrites "
-        "only the rows it computed in one static ids buffer, so the buffer is a "
-        "patchwork of passes. "
-    )
-    if mode == "2":
-        return mechanism + (
-            "Differential mode only compares and never serves host rows, so under "
-            "MTP the patchwork is a question you can ask instead of an answer you "
-            f"serve: set {ENV_ALLOW_HOSTIDS_MTP}=1 to run it, and the "
-            "input-agreement gate refuses the passes it cannot attribute. Do NOT "
-            "drop --speculative-config instead -- that route does not work on this "
-            "engine (measured 2026-10-02): with no drafter the host has no token "
-            "source, so every step refuses with 'no-draft-source' and there is "
-            "nothing to compare, and drafter-off boots fail to compile "
-            "(ConstraintViolationError: input_ids specialized to 4096). "
-            "logs/vllm.log.20261001-234242, logs/vllm.log.20261002-065905."
+    if mode not in ("1", "2"):
+        # An unrecognised value is not a mode the guard can reason about, and the
+        # override permits a *named* risk -- so it does not permit this one. Keep
+        # this check ahead of the override or a typo becomes a silent green light.
+        return (
+            f"{ENV_PLE_HOSTIDS}={mode!r} is neither 1 (serve host rows) nor 2 "
+            "(compare only), so which path this config takes is unknown. The "
+            f"{ENV_ALLOW_HOSTIDS_MTP} override permits a named risk; this is not "
+            "one. Set the variable to 1, 2, or unset it."
         )
-    return mechanism + (
-        "This is mode 1, which serves the host's rows: a pass whose row count "
-        "matches the staged one consumes embeddings gathered for a different query "
-        "and hands the model a plausible answer built from the wrong tokens, and "
-        "the host cannot say which pass it staged for -- so there is no override "
-        f"for it. Run the comparison instead: {ENV_PLE_HOSTIDS}=2 with "
-        f"{ENV_ALLOW_HOSTIDS_MTP}=1, or unset {ENV_PLE_HOSTIDS}. Dropping "
-        "--speculative-config does not work on this engine either (measured "
-        "2026-10-02): with no drafter the host has no token source, so every step "
-        "refuses with 'no-draft-source', and drafter-off boots do not compile."
+    if env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
+        if mode == "1":
+            # The override concedes an unmeasured configuration, not a measured
+            # defect, and the boot log should record which -- otherwise the next
+            # reader of this boot finds a knob on with no note of what was
+            # accepted by turning it on.
+            logger.warning_once(
+                "%s=1 under MTP with %s=1: host-staged PLE rows are SERVED to the "
+                "model, a combination this hardware has never booted. The staging "
+                "path refuses a step whose device arrays and host mirror disagree "
+                "(~5e-5 of steps measured on boot #14); under a captured CUDA graph "
+                "a refused step replays the PREVIOUS step's rows. Read "
+                "'captured-graph refusals' in the log before calling this arm "
+                "shippable.",
+                ENV_PLE_HOSTIDS,
+                ENV_ALLOW_HOSTIDS_MTP,
+            )
+        return None
+    headline = (
+        f"{ENV_PLE_HOSTIDS}={mode} with num_speculative_tokens="
+        f"{num_speculative_tokens} has not been measured on this hardware"
+    )
+    # The two modes do not concede the same thing, so they must not read the same
+    # paragraph. One message for both would be wrong about one of them.
+    if mode == "1":
+        concession = (
+            "What the override concedes here: mode 1 SERVES the host's rows to the "
+            "model, and this hardware has never booted that combination. The staging "
+            "path refuses a step whose device arrays and host mirror disagree (about "
+            "2 steps per worker per 40,500, measured on boot #14); under piecewise "
+            "graphs a refused step goes to the device path and that is safe, while "
+            "under a captured graph it replays the previous step's rows -- the cliff "
+            "the captured-refusal counter measures."
+        )
+    else:
+        concession = (
+            "What the override concedes here: mode 2 only compares. "
+            "stage_host_step(gather=False) returns before the staged rows, the pinned "
+            "output and the generation counter are touched, so it cannot take the "
+            "staged branch -- a mistake in this arm is a wrong verdict, not a wrong "
+            "token, and boot #14 is this arm already run: 55,921 comparisons, 0 "
+            "mismatches."
+        )
+    return (
+        f"{headline}. Set {ENV_ALLOW_HOSTIDS_MTP}=1 to run it anyway.\n"
+        "The reason this guard used to refuse -- \"the PLE op runs "
+        f"{num_speculative_tokens + 1} times per step and each pass overwrites only "
+        "the rows it computed, so the ids buffer is a patchwork of passes\" -- is "
+        "FALSE on this tree: the drafter builds no PLE module (mtp.py:8, "
+        "mtp.py:314-322 + model.py:296, which has never raised in any log from this "
+        "box), boot #14 measured one PLE op call per step (14.4 comparisons/s vs "
+        "15.0 steps/s), and the mismatch it cited vanished once 18c119f010 made "
+        "ple_query_start_loc monotone (55,921 comparisons, 0 mismatches). See "
+        "docs/ple-multipass-verdict.md.\n"
+        f"{concession}\n"
+        "Do NOT drop --speculative-config instead (measured 2026-10-02): with no "
+        "drafter the host has no token source, so every step refuses with "
+        "'no-draft-source', and drafter-off boots do not compile "
+        "(ConstraintViolationError: input_ids specialized to 4096). "
+        "logs/vllm.log.20261001-234242, logs/vllm.log.20261002-065905."
     )
 
 
@@ -1569,9 +1630,11 @@ class VllmConfig:
         ) is not None:
             raise ValueError(hostids_conflict)
 
-        # GFX906: and it cannot be correct under MTP either, because the ids
-        # buffer it compares against (and the staged rows it would serve) are
-        # per-pass, not per-step. Same reason, same shape of refusal.
+        # GFX906: and it needs an override under MTP too. The reason is NOT the
+        # per-pass ids buffer this comment used to give -- the drafter never runs a
+        # PLE op (docs/ple-multipass-verdict.md) -- it is that the combination has
+        # never been booted, and a refused step under a captured graph has no device
+        # path to fall back to. Same shape of refusal: say it, do not drop the knob.
         if self.speculative_config is not None:
             mtp_conflict = ple_hostids_mtp_conflict(
                 self.speculative_config.num_speculative_tokens or 0
