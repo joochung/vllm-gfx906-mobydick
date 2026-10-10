@@ -565,27 +565,44 @@ def test_staging_hands_the_layer_the_buffer_forward_reads() -> None:
 def test_prepare_inputs_forwards_the_same_view_it_hands_the_model() -> None:
     """The producer leg, asserted on the wiring that exists.
 
-    ``prepare_inputs`` builds one local --
-    ``ple_query_start_loc[: num_reqs_padded + 1]`` -- puts it in ``model_inputs``
-    and must hand *that object* to the stager. Identity is the property, so it is
-    asserted structurally: the staged view goes into ``model_inputs`` under
-    ``query_start_loc`` and into the staging call under ``consumed_qsl``, from the
-    same name, with no second slice in between.
+    One local -- ``ple_query_start_loc[: num_reqs_padded + 1]`` -- goes into
+    ``model_inputs`` AND into the staging call as ``consumed_qsl``. Identity is the
+    property, so it is asserted structurally: same name, no second slice in between.
+
+    The wiring moved out of ``prepare_inputs`` into :meth:`_ple_step_inputs` when the
+    dispatch veto needed the staging decision before ``prepare_attn`` (that file is
+    the shared runner's, and the decision has to be askable on its own). The property
+    did not move with the prose: the same view still goes to both consumers. What is
+    NEW and worth pinning here is that there is exactly ONE staging call site per
+    step -- if ``prepare_inputs`` re-derived what the early hook already built, a
+    step could pay for the fill and the mirror repair twice, and the second repair
+    would be measured against a count the first one already fixed.
     """
-    src = inspect.getsource(model_state_module.Qwen4ExpModelState.prepare_inputs)
+    src = inspect.getsource(model_state_module.Qwen4ExpModelState._ple_step_inputs)
+    prep = inspect.getsource(model_state_module.Qwen4ExpModelState.prepare_inputs)
     refresh = inspect.getsource(
         model_state_module.Qwen4ExpModelState._refresh_ple_query_start_loc
     )
 
-    assert "query_start_loc=query_start_loc" in src, src
+    # Same name into both consumers, no re-slice between them. The kwargs form became
+    # a dict literal when the block moved here; what is being asserted is the identity
+    # of the value, not the punctuation that puts it in the dict.
+    assert '"query_start_loc": query_start_loc' in src, src
     assert "consumed_qsl=query_start_loc" in src, src
+    assert prep.count("_stage_host_ple_ids(") == 0, (
+        "prepare_inputs stages on its own as well as through _ple_step_inputs: the "
+        "dispatch veto's whole saving is that the step is prepared once, early"
+    )
+    assert src.count("_stage_host_ple_ids(") == 1, src
     # The slice used to sit in prepare_inputs; it now lives in the refresh method so
     # the whole-buffer write and the view handed forward cannot disagree. The property
     # is unchanged -- exactly one slice, handed to both consumers -- it is just asked
     # of two functions now.
-    assert "self.ple_query_start_loc[" not in src, (
-        "prepare_inputs slices the staged qsl again: the differential can then report "
-        "one view while the model reads another"
+    assert "self.ple_query_start_loc[" not in src and (
+        "self.ple_query_start_loc[" not in prep
+    ), (
+        "the staged qsl is sliced again outside the refresh method: the differential "
+        "can then report one view while the model reads another"
     )
     assert refresh.count("return dst[") == 1, (
         "the refresh method must hand forward exactly one view of the buffer it just "

@@ -1216,6 +1216,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self._host_stage_rows = -1
         return staged == rows
 
+    def forget_host_stage(self) -> None:
+        """Drop any staged flag left by a step whose op body never ran.
+
+        ``take_host_stage`` can only consume a flag by running, and under a captured
+        graph the op body does not run: a step that staged successfully therefore
+        leaves ``_host_stage_rows`` set indefinitely. That is harmless while every
+        later step also replays, and dangerous the moment one does not -- the
+        dispatch veto sends a refused step eager precisely because it must NOT
+        replay, and an eager op body that finds the previous step's flag, with the
+        previous step's row count (same batch shape, so it matches), skips its D2H
+        and reads rows that belong to a different step. This is the failure
+        :meth:`take_host_stage` names in its own docstring; the veto is the first
+        mechanism that can actually reach it, so the state clears the flag at the
+        top of every staging attempt and this is how.
+        """
+        self._host_stage_rows = -1
+
     def _alloc_gen_scratch(self) -> None:
         """Create the device mirror of ``_pinned_gen`` on the weights' device."""
         self._gen_device = torch.zeros(

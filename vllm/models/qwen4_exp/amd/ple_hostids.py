@@ -400,20 +400,56 @@ class HostIdsRefused(ValueError):
 class _PendingCommit:
     """One step's accepted tokens, waiting for its D2H to land.
 
-    Holds references rather than copies: copying ``sampled`` before its event
-    has completed is precisely the bug this class exists to avoid. ``slots`` and
-    ``num_sampled`` are copied at stage time because those come from persistent
-    buffers the runner overwrites on the next step, while ``sampled`` is a fresh
-    allocation per step made by ``async_copy_to_np``.
+    Holds references rather than copies, for **both** arrays the copy event
+    covers. ``sampled`` and ``num_sampled`` are the two outputs of one
+    ``AsyncOutput`` (``async_utils.py``: ``async_copy_to_np(sampler_output
+    .sampled_token_ids)`` and ``async_copy_to_np(num_sampled_tokens)``), so each
+    is a fresh host allocation per step whose CONTENTS are meaningless until
+    ``done`` reports the copy landed. Copying either at stage time is precisely
+    the bug this class exists to avoid.
+
+    The docstring used to claim the opposite about ``num_sampled`` -- that it
+    "comes from a persistent buffer the runner overwrites on the next step" --
+    and ``stage_step`` therefore copied it. That copy is the root cause of the
+    ``num_sampled [0, 4, 8] outside 0..4`` drops: ``[0, 4, 8]`` is not a count
+    vector, it is what the allocator had left in that host block (offsets from
+    the previous step's flattened copy), read microseconds after the D2H was
+    enqueued. Boot ``vllm.log.20261008-083018`` recorded 14,859 such drops
+    (9.9 % of commits) and boot ``2026-10-09 16:18`` recorded the same four at
+    startup, one per worker.
+
+    ``slots`` IS copied at stage time, and must stay that way: it is
+    ``input_batch.idx_mapping_np[:num_reqs]``, a view into a persistent pinned
+    buffer the runner rewrites during the NEXT step's input prep, which can happen
+    before this event lands.
+
+    ``void`` carries the rows :meth:`HostTokenHistory.invalidate` cancelled. It
+    can no longer zero the source array the way the old code did, because the
+    source is ``AsyncOutput``'s array and its copy may still be in flight: a zero
+    written now is overwritten when the copy lands, resurrecting exactly the
+    commit invalidation exists to prevent. The cancellation is remembered here and
+    applied by :meth:`counts`, after the copy has landed.
     """
 
-    __slots__ = ("done", "num_sampled", "sampled", "slots")
+    __slots__ = ("done", "num_sampled", "sampled", "slots", "void")
 
     def __init__(self, slots, sampled, num_sampled, done) -> None:  # noqa: ANN001
         self.slots = slots
         self.sampled = sampled
         self.num_sampled = num_sampled
         self.done = done
+        self.void = None  # np.ndarray | None, bool mask over rows
+
+    def counts(self):
+        """Read this step's accepted counts. CALL ONLY once ``done`` says landed.
+
+        Returns a private copy, so the caller can clamp or zero rows without
+        writing through to the array output processing is reading too.
+        """
+        ns = np.asarray(self.num_sampled).copy()
+        if self.void is not None:
+            ns[self.void] = 0
+        return ns
 
 
 class HostTokenHistory:
@@ -477,6 +513,12 @@ class HostTokenHistory:
         # that reports its own coverage.
         self.staged = 0
         self.dropped = 0
+        # A commit's accepted tokens did not reach the window, wherever the hole
+        # was detected: ``stage_step`` counts the shape/slot/queue failures it can
+        # see without reading the copy, and ``drain`` counts a row whose counts
+        # were out of range once the copy had actually landed. One counter because
+        # the reader's question is "is the mirror missing tokens", not "which
+        # function noticed"; ``last_drop`` says which check fired and when.
         # The two ways a commit goes missing, which boot #26 could not tell
         # apart because neither was ever surfaced: sampler rows trimmed to the
         # real batch, and queue overflows flushed instead of dropped. Both are
@@ -544,8 +586,10 @@ class HostTokenHistory:
         for entry in self._pending:
             hit = entry.slots == slot
             if hit.any():
-                entry.num_sampled = entry.num_sampled.copy()
-                entry.num_sampled[hit] = 0
+                # Remembered, not written: the source array's D2H may still be in
+                # flight, and a zero written into it now is overwritten when the
+                # copy lands. See ``_PendingCommit.void``.
+                entry.void = hit if entry.void is None else entry.void | hit
 
     def stage_step(
         self,
@@ -594,17 +638,31 @@ class HostTokenHistory:
         if sampled.shape[0] > n or num_sampled.shape[0] > n:
             # A view, so this reads no token values: the array's event has not
             # necessarily landed and staging must stay safe while it is in flight.
+            #
+            # Since task #56 this is DEFENSE IN DEPTH, not the load-bearing guard it
+            # used to be. The count range check ran HERE, over every row of
+            # ``num_sampled`` including the pad rows, so junk in an unused row vetoed
+            # the whole batch's commit and trimming was the only thing that saved it.
+            # The check now runs in ``drain``, whose loop is bounded by
+            # ``entry.slots.size`` -- pad rows are not consulted at all any more. What
+            # the trim guarantees instead is the invariant every consumer below
+            # assumes without restating it: row i belongs to slot i, and there are
+            # exactly ``len(slots)`` rows. A future drain that iterated
+            # ``sampled.shape[0]`` would otherwise start reading whatever the sampler
+            # left in the graph's unused rows -- which is junk, not zeros.
             sampled = sampled[:n]
             num_sampled = num_sampled[:n]
             self.sliced += 1
         if slots.size and (int(slots.min()) < 0 or int(slots.max()) >= self.num_slots):
             return self._drop(f"slot {slots.tolist()} outside 0..{self.num_slots - 1}")
-        if num_sampled.size and (
-            int(num_sampled.min()) < 0 or int(num_sampled.max()) > sampled.shape[1]
-        ):
-            return self._drop(
-                f"num_sampled {num_sampled.tolist()} outside 0..{sampled.shape[1]}"
-            )
+        # NO check on the VALUES of ``num_sampled`` here, deliberately, and this
+        # is the whole of task #56. The counts are the second output of the D2H
+        # this commit is waiting on, so a range check here reads whatever the
+        # allocator recycled into that block: it rejected healthy commits (the
+        # ``[0, 4, 8] outside 0..4`` drops) and would have passed a corrupt one
+        # whose garbage happened to look small. Every check that stays here is
+        # shape-only or slot-only, which is exactly the set that is legal to make
+        # before a copy has landed.
         if len(self._pending) >= self.MAX_PENDING:
             # Blocking, and the only blocking call in this class, for the reason
             # in the MAX_PENDING docstring: the alternative is a commit that is
@@ -614,7 +672,8 @@ class HostTokenHistory:
             if len(self._pending) >= self.MAX_PENDING:
                 return self._drop(f"pending full ({len(self._pending)})")
         self._pending.append(
-            _PendingCommit(slots.copy(), sampled, num_sampled.copy(), done)
+            # ``num_sampled`` by reference: see ``_PendingCommit``.
+            _PendingCommit(slots.copy(), sampled, num_sampled, done)
         )
         self.staged += 1
         return True
@@ -656,8 +715,26 @@ class HostTokenHistory:
                     break
 
             self._pending.pop(0)
+            # The counts are read HERE and nowhere earlier: same D2H as
+            # ``sampled``, same rule about when its contents exist.
+            counts = entry.counts()
+            hi = int(np.asarray(entry.sampled).shape[1])
             for i in range(int(entry.slots.size)):
-                n = int(entry.num_sampled[i])
+                n = int(counts[i])
+                if n < 0 or n > hi:
+                    # Post-landing this is a device-side anomaly rather than the
+                    # recycled-memory artifact it used to be -- the device's own
+                    # ``_post_update_kernel`` trusts these same counts. Commit
+                    # nothing for that row: a wrong-length append is the history
+                    # corruption the range check exists to prevent. Count the hole
+                    # so the next step's exact-length check asks the device to
+                    # repair it, exactly as a stage-time drop did.
+                    self.dropped += 1
+                    self.last_drop = (
+                        f"num_sampled {counts.tolist()} outside 0..{hi} "
+                        "(read after the copy landed)"
+                    )
+                    continue
                 if n:
                     self.commit(int(entry.slots[i]), entry.sampled[i, :n])
                     applied += 1

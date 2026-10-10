@@ -655,6 +655,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state, "stage_host_tokens", None
         )
 
+        # PLE dispatch veto: dispatch a step whose host PLE staging refused eager,
+        # instead of replaying a FULL graph that holds the PREVIOUS step's n-gram
+        # rows (measured on acceptance length: 1.98 stale vs 4.00 correct vs 3.31
+        # zeroed, and the generation tripwire cannot see it). The step itself lives
+        # in model_state.ple_veto_descriptor; whether it may run at all is a dispatch
+        # question, so it is decided here. Under data parallelism the graph mode is
+        # agreed collectively (cudagraph_utils.py:254-275), and a NONE chosen on one
+        # rank only would have the ranks replay different things in the same step --
+        # so dp_size == 1 is a precondition, and the veto stays off, in the log,
+        # rather than becoming a cross-rank protocol.
+        self._ple_veto = bool(
+            getattr(self.model_state, "arm_ple_dispatch_veto", None) is not None
+            and getattr(self.model_state, "PLE_HOST_VETO", False)
+            and self.dp_size == 1
+        )
+        if self._ple_veto:
+            self.model_state.arm_ple_dispatch_veto(True)
+            logger.info(
+                "PLE HOSTIDS: dispatch veto ARMED -- a step whose PLE rows cannot be "
+                "staged is dispatched cg_mode=NONE and computes them on the device "
+                "path. On the coverage line, stale_steps should stay near zero and "
+                "veto=<ledgered>/<applied> should be close: applied is the number of "
+                "downgrades that landed, ledgered also counts FULL-step refusals the "
+                "runner never asked about (capture and warmup). A gap much bigger "
+                "than that means refusals are arriving on steps the veto cannot see. "
+                "Declines (policy off, staging disabled, no draft source) are still "
+                "stale steps by design -- the veto does not act on those."
+            )
+        elif getattr(self.model_state, "PLE_HOST_VETO", False) and hasattr(
+            self.model_state, "arm_ple_dispatch_veto"
+        ):
+            logger.warning(
+                "PLE HOSTIDS: dispatch veto NOT armed (dp_size=%s): a refused FULL "
+                "step will replay the previous step's PLE rows. Making this safe "
+                "under data parallelism means moving the veto inside "
+                "dispatch_cg_and_sync_dp's agreement, not forcing it here.",
+                self.dp_size,
+            )
+
         self.decode_query_len = (
             self.num_speculative_steps
             + self.model_state.num_new_sampled_tokens_per_step
@@ -1868,6 +1907,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            # A step whose host PLE rows could not be staged must not replay a
+            # captured FULL graph, which would serve the PREVIOUS step's rows; the
+            # model state returns a NONE descriptor for those. Asked HERE, before
+            # prepare_attn, because the attention metadata it builds depends on the
+            # graph mode and cannot be rebuilt. Logic and reasoning live in
+            # model_state.ple_veto_descriptor; this file stays model-agnostic.
+            if self._ple_veto:
+                batch_desc = self.model_state.ple_veto_descriptor(
+                    batch_desc, input_batch, self.req_states
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -1982,7 +2031,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **self.model_state.prepare_inputs(
+                input_batch, self.req_states, cudagraph_mode=batch_desc.cg_mode
+            ),
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
@@ -2322,6 +2373,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        # FIRST, before anything that can block or destroy state. The model state's
+        # final PLE staging coverage line is the last thing a short boot says about
+        # what its host-ids arm did -- and both `synchronize` below (which hangs on a
+        # wedged GPU) and `del self.model_state` further down (which drops the
+        # counters) are what would otherwise keep it out of the log. This is reached
+        # on SIGINT and SIGTERM through ``worker_main``'s ``finally`` block
+        # (multiproc_executor.py), i.e. the ordinary restart path, and it must stay
+        # above `del self.model_state` for that reason.
+        model_state = getattr(self, "model_state", None)
+        if model_state is not None and hasattr(
+            model_state, "log_staging_coverage_at_shutdown"
+        ):
+            model_state.log_staging_coverage_at_shutdown()
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):

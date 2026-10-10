@@ -174,6 +174,80 @@ def test_accepted_values_agree_between_mode_and_worker():
 
 
 # --------------------------------------------------------------------------
+# the per-step graph mode reaches the code that makes staleness claims
+# --------------------------------------------------------------------------
+
+
+def test_the_runner_threads_this_step_graph_mode_into_model_state() -> None:
+    """A2 is worth nothing unless the argument actually arrives.
+
+    ``model_state`` now refuses to call a step stale unless it was told what graph
+    mode the step was dispatched in, and it falls back -- silently, and only when
+    nothing was threaded -- to the boot-global answer. A fallback that fires because
+    somebody dropped a keyword during a rebase looks exactly like a working system:
+    the numbers stay plausible and the refusals get over-reported. So the wiring is
+    asserted from both ends.
+
+    The call site is read out of the source rather than executed, in the style of
+    ``test_accepted_values_agree_between_mode_and_worker``: running it would mean
+    building a whole worker. What is *extracted* rather than string-matched is the
+    call, because a formatter is free to re-flow the argument list.
+    """
+    import inspect
+    import pathlib
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.models.qwen4_exp.amd import model_state as model_state_module
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    # Imported for their effect on the class graph, not their names: the subclass
+    # walk below only sees a state whose module has been imported.
+    from vllm.v1.worker.gpu.model_states import (  # noqa: F401
+        default,
+        encoder_decoder,
+        encoder_only,
+        interface,
+        mamba_hybrid,
+    )
+
+    src = pathlib.Path(inspect.getfile(model_runner_module)).read_text()
+    call = re.search(r"self\.model_state\.prepare_inputs\((.*?)\)", src, re.S)
+    assert call, (
+        "the runner no longer calls model_state.prepare_inputs in one place; if that "
+        "moved, the per-step graph mode has to be threaded there instead"
+    )
+    assert "cudagraph_mode=" in call.group(1), [
+        "the shared call site stopped passing the per-step graph mode, so every "
+        "staleness claim is falling back to the boot-global answer"
+    ]
+    assert "batch_desc" in call.group(1), call.group(1)
+
+    # And every state the runner can be handed must tolerate the keyword, because
+    # the runner calls ALL of them the same way -- one implementation that dropped
+    # it is a TypeError for whoever runs that model, not for us.
+    states = [interface.ModelState]
+    seen: set[type] = set()
+    while states:
+        cls = states.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        states.extend(cls.__subclasses__())
+        params = inspect.signature(cls.prepare_inputs).parameters
+        assert "cudagraph_mode" in params, [
+            f"{cls.__name__}.prepare_inputs cannot take the per-step graph mode the "
+            f"runner passes to every model state"
+        ]
+
+    # ``Qwen4ExpModelState`` is the one that acts on it, and the module that owns
+    # the enum is the one the runner's descriptor uses.
+    assert CUDAGraphMode.FULL.name == "FULL", "_ple_step_full compares this string"
+    assert "cudagraph_mode" in inspect.signature(
+        model_state_module.Qwen4ExpModelState.prepare_inputs
+    ).parameters
+
+
+# --------------------------------------------------------------------------
 # Staging off: the default must be the known-good path, unchanged
 # --------------------------------------------------------------------------
 
@@ -317,3 +391,135 @@ def test_gpu_staging_lands_before_wait_returns():
     staged, _, gen = handler.wait_host_draft_tokens()
     assert gen == 2
     assert staged[:3, :4].tolist() == (drafts * 100).cpu().tolist()
+
+
+def test_the_runner_asks_the_veto_before_it_builds_the_metadata() -> None:
+    """The ordering the dispatch veto depends on, asserted on the runner's source.
+
+    ``model_state.prepare_inputs`` runs at the END of ``execute_model`` -- after
+    ``model_state.prepare_attn`` -- so the staging decision is not available where it
+    used to be made, and ``prepare_attn`` is the thing that fixes the step's graph
+    mode: it picks request and token counts by mode, and it ends in
+    ``recoverssm.record_step``, so calling it twice records a step that never ran.
+    The veto therefore has to be asked between the input copy and that call.
+
+    Read as text rather than imported: ``vllm.v1.worker.gpu.model_runner`` pulls in the
+    whole worker stack and there is no engine here, and ``find_spec`` resolves the path
+    without executing the module. This is the only cheap way to pin a property that
+    lives in ORDER, and the property is the whole mechanism -- the same code asked one
+    line later is a step that already replayed.
+    """
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.find_spec("vllm.v1.worker.gpu.model_runner")
+    assert spec is not None and spec.origin, "the runner module moved"
+    src = pathlib.Path(spec.origin).read_text()
+
+    ask = src.find("ple_veto_descriptor(")
+    assert ask > 0, "the runner never asks the veto: refused steps replay stale rows"
+    attn = src.find("self.prepare_attn(input_batch)", ask)
+    state_attn = src.find("self.model_state.prepare_attn(", ask)
+    assert 0 < attn, src[ask : ask + 400]
+    assert 0 < state_attn
+    # Both metadata builders come after the question. ``prepare_attn`` on the runner
+    # is the block-table one; the model_state call is the mode-dependent one, and it
+    # is the second of the two, so ordering against both is what says "before the
+    # step is committed to a graph".
+    assert ask < attn < state_attn, (
+        "the veto is asked after the attention metadata exists, which is the ordering "
+        "it was written to avoid: the metadata already describes a replay"
+    )
+
+    # A downgrade chosen on one rank desyncs the mode the ranks agreed on, so the
+    # arm is conditional on there being one rank.
+    assert "self.dp_size == 1" in src, (
+        "the DP guard is gone: under data parallelism this is a cross-rank protocol "
+        "decision and a local downgrade is a desync, not an optimisation"
+    )
+    assert "arm_ple_dispatch_veto(True)" in src
+    assert "if self._ple_veto:" in src, "the per-step call is not gated on the arm"
+
+
+def test_worker_teardown_prints_the_final_coverage_line_before_it_can_be_lost() -> None:
+    """The FINAL PLE coverage line has one chance to fire and two ways to miss it.
+
+    ``GPUModelRunner.shutdown`` is the hook -- it is reached from the ``finally``
+    block of ``worker_main`` (multiproc_executor.py), which is how SIGINT and
+    SIGTERM both arrive at a TP worker, i.e. the operator's ordinary
+    ``kill -INT -$(pgid)`` restart. Two things in that same method would swallow
+    the line, and the ordering is the entire content of the test:
+
+    * the accelerator ``synchronize()`` that opens the method hangs on a wedged
+      GPU -- the state a boot that is about to be killed is often in. A coverage
+      line emitted after it is a line that prints exactly when it is least needed.
+    * the ``del self.model_state`` further down drops the object that HOLDS every
+      counter. Emitting after it is not a late line, it is no line.
+
+    Read off the PARSED syntax tree rather than by string search, and not for
+    style: the first version of this test string-matched ``del self.model_state``
+    in the head of the method and went red on the COMMENT above the call, which
+    mentions that statement by name. An ordering test that fires because someone
+    wrote a sentence about the ordering is a test people learn to ignore. Exercising
+    the real method instead would need a GPU, a model and a distributed group, and
+    what is under test is where a call sits.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from vllm.models.qwen4_exp.amd.model_state import Qwen4ExpModelState
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    src = pathlib.Path(inspect.getfile(model_runner_module)).read_text()
+    fn = [
+        node
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.FunctionDef) and node.name == "shutdown"
+    ]
+    assert len(fn) == 1, (
+        f"found {len(fn)} shutdown() methods in model_runner.py; this test has to"
+        " know which one owns the model state"
+    )
+    stmts = fn[0].body
+
+    def call_names(node):
+        out = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                f = sub.func
+                out.add(
+                    f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                )
+        return out
+
+    def first(pred):
+        hits = [i for i, s in enumerate(stmts) if pred(s)]
+        return hits[0] if hits else None
+
+    emit = first(lambda s: "log_staging_coverage_at_shutdown" in call_names(s))
+    assert emit is not None, "shutdown() never calls the FINAL coverage emitter"
+
+    # Both statements the ordering claim is about have to still be there, or the
+    # comparisons below are against nothing.
+    sync = first(lambda s: "synchronize" in call_names(s))
+    assert sync is not None, (
+        "shutdown() no longer synchronizes the accelerator: the blocking-call half"
+        " of this ordering claim is stale, re-read the method"
+    )
+    dropped = first(lambda s: any(isinstance(n, ast.Delete) for n in ast.walk(s)))
+    assert dropped is not None, (
+        "shutdown() no longer deletes anything: the dropped-state half of this"
+        " ordering claim is stale"
+    )
+
+    assert emit < sync, (
+        "the FINAL coverage line is emitted after the accelerator sync, which hangs"
+        " on a wedged GPU -- the state a killed boot is usually in"
+    )
+    assert emit < dropped, "the model state is dropped before its counters are printed"
+    # The producer side has to answer, or the call above is a no-op that passes
+    # every check in this file.
+    assert hasattr(
+        Qwen4ExpModelState, "log_staging_coverage_at_shutdown"
+    ), "the runner calls a method the model state does not have"

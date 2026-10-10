@@ -27,7 +27,10 @@ Every attribute the fake carries is one the production ``__init__`` sets.
 from __future__ import annotations
 
 import contextlib
+import logging
 import pathlib
+import re
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -35,6 +38,8 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.models.qwen4_exp.amd import model_state as model_state_module
 from vllm.models.qwen4_exp.amd import ple_hostids
 from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module
@@ -126,6 +131,11 @@ class StagingEmbedding:
             self._gen_device.copy_(self._pinned_gen)
         return accepted
     compare_host_ids = Qwen4ExpNGramEmbedding.compare_host_ids
+    # The dispatch veto's invalidation. Borrowed rather than restated because the
+    # whole point of the hazard test below is that the flag the VETO leaves behind is
+    # the one the real op would have consumed, so the clearing has to be the real
+    # clearing.
+    forget_host_stage = Qwen4ExpNGramEmbedding.forget_host_stage
     note_draft_provenance = Qwen4ExpNGramEmbedding.note_draft_provenance
     _id_dump = Qwen4ExpNGramEmbedding._id_dump
     disable_hostids = Qwen4ExpNGramEmbedding.disable_hostids
@@ -550,8 +560,17 @@ class FakeModelState:
     stage_host_tokens = model_state_module.Qwen4ExpModelState.stage_host_tokens
     disable_host_staging = model_state_module.Qwen4ExpModelState.disable_host_staging
     _note_host_refusal = model_state_module.Qwen4ExpModelState._note_host_refusal
-    _staged_graph_in_play = model_state_module.Qwen4ExpModelState._staged_graph_in_play
+    _full_graph_captured_this_boot = (
+        model_state_module.Qwen4ExpModelState._full_graph_captured_this_boot
+    )
+    _ple_step_full = model_state_module.Qwen4ExpModelState._ple_step_full
     _ple_host_coverage = model_state_module.Qwen4ExpModelState._ple_host_coverage
+    # The teardown emitter is borrowed like the rest: the stub is a stand-in self,
+    # and the FINAL coverage line has to be reachable through it or the suite
+    # cannot test what a worker prints on its way out.
+    log_staging_coverage_at_shutdown = (
+        model_state_module.Qwen4ExpModelState.log_staging_coverage_at_shutdown
+    )
     _ple_resync_mirror = model_state_module.Qwen4ExpModelState._ple_resync_mirror
     _ple_resync_mirror_inner = (
         model_state_module.Qwen4ExpModelState._ple_resync_mirror_inner
@@ -559,13 +578,81 @@ class FakeModelState:
     _note_resync_disagreement = (
         model_state_module.Qwen4ExpModelState._note_resync_disagreement
     )
+    # F1: the offset test is part of the resync path, so the stub has to carry it
+    # for the same reason it carries the resync itself.
+    _ple_offset_explains = model_state_module.Qwen4ExpModelState._ple_offset_explains
+    # The demand alarm runs inside the repair's own try/except, which turns any
+    # exception into a refused repair and records the exception text in
+    # ``resync_refused``. That is deliberate in production (a repair must never be
+    # able to break a boot) and it is exactly why the stub has to borrow the alarm
+    # rather than omit it: without it every repair in this file fails with
+    # ``AttributeError: no attribute '_ple_resync_demand_alarm'`` attributed to the
+    # repair, which is a confusing way to discover a missing borrow and was.
+    _ple_resync_demand_alarm = (
+        model_state_module.Qwen4ExpModelState._ple_resync_demand_alarm
+    )
+    # The veto path builds the step's model inputs for real, because that is the
+    # saving it exists to make (prepare_inputs must not redo the work), so the stub
+    # needs the refresh the producer hands to the stager. ``_prepare_ngram_context``
+    # is the one method deliberately NOT borrowed -- see its stub below.
+    _refresh_ple_query_start_loc = (
+        model_state_module.Qwen4ExpModelState._refresh_ple_query_start_loc
+    )
+    # Dispatch veto, borrowed for the same reason as the rest: the ledger split in
+    # ``_note_stale_step`` and the descriptor decision in ``ple_veto_descriptor`` are
+    # production behaviour the tests below assert on.
+    ple_veto_descriptor = model_state_module.Qwen4ExpModelState.ple_veto_descriptor
+    ple_prepare_step = model_state_module.Qwen4ExpModelState.ple_prepare_step
+    _ple_step_inputs = model_state_module.Qwen4ExpModelState._ple_step_inputs
+    ple_rows_refused = model_state_module.Qwen4ExpModelState.ple_rows_refused
+    _take_prepared_ple_inputs = (
+        model_state_module.Qwen4ExpModelState._take_prepared_ple_inputs
+    )
+    arm_ple_dispatch_veto = model_state_module.Qwen4ExpModelState.arm_ple_dispatch_veto
+    note_ple_veto_applied = model_state_module.Qwen4ExpModelState.note_ple_veto_applied
+    # Part of the staging path itself now, so it has to be borrowed for the same
+    # reason the staging method is: without it every test in this file fails inside
+    # ``_stage_host_ple_ids`` on a missing attribute.
+    _forget_host_stage_flags = (
+        model_state_module.Qwen4ExpModelState._forget_host_stage_flags
+    )
+    _note_stale_step = model_state_module.Qwen4ExpModelState._note_stale_step
+    # The disabled-arm heartbeat is part of the staging path (it runs inside the
+    # disabled branch of ``_stage_host_ple_ids``), so it is borrowed for the same
+    # reason ``_note_stale_step`` is: omitting it would make every post-disable test
+    # here die on an AttributeError instead of asserting anything.
+    _note_disabled_heartbeat = (
+        model_state_module.Qwen4ExpModelState._note_disabled_heartbeat
+    )
+    _policy_off_now = model_state_module.Qwen4ExpModelState._policy_off_now
     _ple_host_layer_steps = model_state_module.Qwen4ExpModelState._ple_host_layer_steps
     # The budgets are read off the real class rather than restated here, so a
-    # cap changed in production changes what these tests assert.
+    # cap changed in production changes what these tests assert. The two resync
+    # budgets are the exception and they are the exception on purpose: a cap
+    # MECHANISM cannot be tested against "uncapped", which is what both ship as now
+    # (per-slot 0, total 0 -- see test_repairs_are_uncapped_by_default for the
+    # measurements that removed them). Mechanism tests set a small budget on the
+    # instance; the shipped-value test is what pins them.
     PLE_RESYNC_PER_SLOT = model_state_module.Qwen4ExpModelState.PLE_RESYNC_PER_SLOT
     PLE_RESYNC_TOTAL = model_state_module.Qwen4ExpModelState.PLE_RESYNC_TOTAL
+    PLE_RESYNC_PER_CALL = model_state_module.Qwen4ExpModelState.PLE_RESYNC_PER_CALL
+    PLE_RESYNC_ALARM_RATE = model_state_module.Qwen4ExpModelState.PLE_RESYNC_ALARM_RATE
+    PLE_RESYNC_ALARM_EVERY = (
+        model_state_module.Qwen4ExpModelState.PLE_RESYNC_ALARM_EVERY
+    )
+    PLE_HOST_VETO = model_state_module.Qwen4ExpModelState.PLE_HOST_VETO
     PLE_DISAGREE_TOTAL = model_state_module.Qwen4ExpModelState.PLE_DISAGREE_TOTAL
     PLE_DISAGREE_PER_SLOT = model_state_module.Qwen4ExpModelState.PLE_DISAGREE_PER_SLOT
+    PLE_RESYNC_MAX_OFFSET = model_state_module.Qwen4ExpModelState.PLE_RESYNC_MAX_OFFSET
+    PLE_DISAGREE_STUCK_STEPS = (
+        model_state_module.Qwen4ExpModelState.PLE_DISAGREE_STUCK_STEPS
+    )
+    PLE_DOUBT_UNDER_FULL = model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL
+    # Option A, read off the real class for the same reason the budgets are: a test
+    # that restates the default keeps passing after the default changes.
+    PLE_HOST_STAGE_UNDER_FULL = (
+        model_state_module.Qwen4ExpModelState.PLE_HOST_STAGE_UNDER_FULL
+    )
 
     def __init__(self, slots: int = 8) -> None:
         self.uses_ngram_embedding = True
@@ -581,7 +668,10 @@ class FakeModelState:
         # stub borrows ``_note_host_refusal``, so it has to carry the state that
         # method reads -- which is the point of borrowing rather than copying.
         self._ple_host_captured = False
-        self._ple_host_captured_refusals = 0
+        self._ple_host_stale_steps = 0
+        self._ple_host_policy_off = 0
+        self._ple_policy_off_logged = False
+        self._ple_stale_counted_step = False
         self._last_draft_gen = -1
         self._ple_host_tokens = None
         # The real class builds this in __init__ and seeds it at add time, so the
@@ -595,6 +685,8 @@ class FakeModelState:
         # repair's correctness does not depend on it, only its ordering does, and
         # the resync tests assert that it was called.
         self._ple_resyncs = 0
+        self._ple_resyncs_alarm_at = 0
+        self._ple_resyncs_alarm_calls = 0
         self._ple_resync_disagree = 0
         self._ple_resync_refused: set[str] = set()
         self._ple_resync_slots: dict[int, int] = {}
@@ -605,9 +697,83 @@ class FakeModelState:
         self._ple_host_slot_req = {slot: _req_id(slot) for slot in range(slots)}
         self._ple_resync_disagree_slots: dict[int, int] = {}
         self._ple_resync_owner_skip = 0
+        # A1: mirror-ahead resyncs are their own condition now, not disagreements.
+        self._ple_resync_mirror_ahead = 0
+        # F1/F2 (the 2026-10-05 crashes): the offset-explained count, the repeat
+        # count, and the per-slot signature that turns a stuck slot into one event
+        # instead of a strike per step. NOTE for whoever adds state to the real
+        # class next: this stub hand-copies production attributes, so new state on
+        # ``Qwen4ExpModelState`` is invisible here until it is added, and the
+        # failure it produces is an ``AttributeError`` from deep inside
+        # ``_ple_host_coverage`` rather than anything that names the missing field.
+        self._ple_resync_mirror_offset = 0
+        self._ple_resync_disagree_repeat = 0
+        self._ple_disagree_sig: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+        self._ple_resync_disagree_stuck: dict[int, int] = {}
+        # A2: the per-step graph mode the runner threads in. ``None`` means "no
+        # descriptor", which makes ``_ple_step_full`` fall back to the boot-global
+        # flag -- so every pre-A2 test that sets ``_ple_host_captured`` keeps
+        # asserting what it asserted before. Per-step tests set this to "FULL".
+        self._ple_step_cg_mode = None
+        # Dispatch veto (2026-10-07). The real class sets these in __init__; the stub
+        # has to carry them too or ``_ple_host_coverage`` raises AttributeError from
+        # inside a log-format call, which is the worst possible place to discover a
+        # missing field. ``_ple_veto_armed`` is what ``_note_stale_step`` reads to
+        # decide which ledger a FULL refusal belongs in, and ``_ple_step_rows`` is
+        # this step's staging decision (True staged / False refused / None not
+        # attempted) -- the third state is what keeps "arm is off" from reading as
+        # "every step refused".
+        self._ple_veto_armed = False
+        self._ple_veto_steps = 0
+        self._ple_veto_applied = 0
+        # Choice #3 (2026-10-08): the post-disable route latch and its heartbeat
+        # marker. Borrowed behaviour reads both, so the stub has to carry both --
+        # ``disable_host_staging`` writes the first under the "eager" policy and
+        # ``_note_disabled_heartbeat`` compares against the second.
+        self._ple_disabled_eager = False
+        # The "zero" policy's latch (same day, chosen over eager after eager measured
+        # 3.1x). Borrowed behaviour reads it with getattr, but the stub carries it
+        # anyway: a stub that is missing an initial field cannot tell a test that the
+        # real class forgot to initialise it from one where the test forgot to set it.
+        self._ple_disabled_zero = False
+        self._ple_disabled_hb_at = 0
+        self._ple_step_rows: bool | None = None
+        self._ple_prepared = None
+        # The buffer :meth:`_refresh_ple_query_start_loc` writes into, which the veto
+        # path needs because it prepares the step's inputs the way production does.
+        # Width is the capture-padded width the real one is allocated at; the stub's
+        # batches are far smaller.
+        self.ple_query_start_loc = torch.zeros(16, dtype=torch.int32)
+        self.ngram_context_calls = 0
         self._ple_syncs = 0
         self._ple_resync_sync = self._count_sync
         self.slots = slots
+
+    def _prepare_ngram_context(self, input_batch, req_states):
+        """Sentinel, counted.
+
+        The only method in this file the stub does not borrow, and the only one whose
+        body could not change a result here: it fills a device tensor the tests never
+        read back, and borrowing it would drag in ``ngram_context``,
+        ``ngram_context_offsets`` and a GPU ``all_token_ids`` for assertions about
+        which STEPS staged. The counter is what the veto tests use, to show the early
+        hook did the preparation once rather than leaving it for ``prepare_inputs``.
+        """
+        self.ngram_context_calls += 1
+        return "ngram-context"
+
+    def begin_step(self, cg_mode=None) -> None:
+        """Stand in for the per-step state ``prepare_inputs`` sets.
+
+        Production calls ``prepare_inputs`` once per step: that is what records the
+        graph mode and clears the one-per-step stale latch. A test that drives a
+        refusal path directly skips it, and then two refusals on two different steps
+        is indistinguishable from two refusals on one step -- which is exactly the
+        distinction ``stale_steps=`` is supposed to make. So cross the boundary
+        explicitly rather than poking the private flag.
+        """
+        self._ple_step_cg_mode = cg_mode
+        self._ple_stale_counted_step = False
 
     def _count_sync(self) -> None:
         self._ple_syncs += 1
@@ -759,6 +925,12 @@ def _batch_and_states(num_reqs: int = 2, q: int = 3, *, uva: bool = True):
     )
     input_batch = SimpleNamespace(
         num_reqs=num_reqs,
+        # The two padding fields the veto path needs: ``prepare_inputs`` builds the
+        # step's PLE inputs through the real refresh, which writes the whole buffer
+        # and hands forward a ``[:num_reqs_after_padding + 1]`` view. These batches
+        # are not padded, so padded == real.
+        num_reqs_after_padding=num_reqs,
+        num_tokens=num_reqs * q,
         idx_mapping_np=idx_mapping,
         num_scheduled_tokens=scheduled,
         # The runner's own device arrays, padded to capacity. The differential
@@ -981,6 +1153,50 @@ def test_mode_one_refuses_a_draft_column_the_device_does_not_have(hostids_env) -
     assert emb._host_stage_refusals == 1
 
 
+def test_mode_one_refuses_a_question_it_cannot_ask(hostids_env) -> None:
+    """``None`` is answered like ``False``. The rule the docstring singles out.
+
+    ``_inputs_agree`` answers three ways: True (the two sides describe the same
+    tokens), False (they do not), and None (the question could not be asked --
+    inputs missing, device tensors incomplete, or reading them raised). For a
+    COMPARISON None and False both mean "no verdict", which is why the difference
+    went unnoticed while this was a differential-only gate. For STAGING they are not
+    interchangeable: False is a step the data condemns, and None is a step the
+    harness cannot see -- a lost buffer, a tensor that will not copy back. That is
+    exactly the step you must not vouch for, and refusing costs one blocking D2H.
+
+    This test is the only thing that pins it. The red control
+    ``unaskable-means-stage`` -- rewriting ``is True`` as ``is not False`` in
+    ``stage_inputs_agree`` -- measured STILL-GREEN on 2026-10-09: every other test
+    here reaches the gate holding a real verdict, so none of them notices what the
+    gate does when there is none.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    # The host half is never read on these three routes -- each returns before the
+    # comparison -- so its contents do not matter. Lengths match the fake batch.
+    host = (np.zeros(4, dtype=np.int64), np.zeros(2, dtype=np.int64), None)
+
+    # The stager had no runner arrays to hand over.
+    assert emb.stage_inputs_agree(host, None) is False
+    # A triple arrived but its tensors did not.
+    assert emb.stage_inputs_agree(host, (None, None, None)) is False
+
+    class Unreadable:
+        """A device tensor that refuses to be copied back."""
+
+        def detach(self):
+            raise RuntimeError("device tensor is gone")
+
+    assert emb.stage_inputs_agree(host, (Unreadable(), Unreadable(), None)) is False
+
+    # Three unaskable questions, three refusals, all on the staging counter: a step
+    # the serving path declined is reported as declined, not as an unjudged
+    # comparison. See test_a_staging_refusal_is_worded_as_a_refusal_to_stage.
+    assert emb._host_stage_refusals == 3
+    assert emb._host_input_skips == 0
+
+
 def test_a_staging_refusal_is_worded_as_a_refusal_to_stage(
     hostids_env, caplog
 ) -> None:
@@ -1185,16 +1401,70 @@ def test_a_refusal_under_a_captured_graph_denies_the_device_path(
     st._ple_host_gen_layers = [emb]
 
     with caplog.at_level("WARNING"):
+        st.begin_step("FULL")
         st._note_host_refusal("history-pending")
+        st.begin_step("FULL")
         st._note_host_refusal("history-pending")
 
-    assert st._ple_host_captured_refusals == 2
+    assert st._ple_host_stale_steps == 2
     msgs = [
         r.getMessage() for r in caplog.records if "captured graph" in r.getMessage()
     ]
     assert len(msgs) == 1, "first, then every 32nd -- not one per step"
     assert "NO device path" in msgs[0]
     assert "previous step's embedding rows" in msgs[0]
+
+    # Two different refusals inside ONE step are one stale step. The question the
+    # counter answers is "how many steps served stale PLE", and counting per refusal
+    # made it mean "how many things were unhappy": a step that tripped three checks
+    # reported three.
+    st.begin_step("FULL")
+    st._note_host_refusal("history-pending")
+    st._note_host_refusal("not-pure-decode")
+    assert st._ple_host_stale_steps == 3, "a step counted itself twice"
+
+
+def test_a_piecewise_step_after_a_capture_is_not_a_stale_replay(
+    hostids_env, caplog
+) -> None:
+    """Boot #28's 51 ``not-pure-decode`` refusals were read as 51 stale steps.
+
+    They were almost certainly not. The box runs ``FULL_AND_PIECEWISE`` (the v1
+    default), where a mixed batch dispatches to PIECEWISE and the device PLE path
+    still runs -- a refusal there costs an optimisation and changes no output. The
+    instrument that was supposed to tell those apart was
+    ``_staged_graph_in_play``, which returns True for every step after the first
+    capture, PIECEWISE included, and so could only ever answer "yes, stale".
+
+    This is the per-step version of the question, and it is the one the runner can
+    answer exactly: ``batch_desc.cg_mode`` is decided ~170 lines before staging.
+    """
+    emb = StagingEmbedding()
+    emb._staged_branch_captured = True
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_gen_layers = [emb]
+
+    # A PIECEWISE step in a boot where a FULL graph exists. The old flag says
+    # "stale"; the descriptor says otherwise, and the descriptor wins.
+    st._ple_step_cg_mode = CUDAGraphMode.PIECEWISE.name
+    with caplog.at_level("WARNING"):
+        st._note_host_refusal("not-pure-decode")
+    assert st._ple_host_stale_steps == 0, [
+        "a PIECEWISE refusal was counted as a stale FULL replay -- boot #28's error"
+    ]
+    assert st._ple_host_refusals["not-pure-decode"] == 1, "the refusal vanished instead"
+
+    # The same refusal, one step later, on a step that really does replay.
+    st._ple_step_cg_mode = CUDAGraphMode.FULL.name
+    st._note_host_refusal("not-pure-decode")
+    assert st._ple_host_stale_steps == 1, "the real cliff stopped being counted"
+    stale = [
+        r.getMessage()
+        for r in caplog.records
+        if "cg_mode=FULL" in r.getMessage() and "NO device path" in r.getMessage()
+    ]
+    assert len(stale) == 1, "the stale claim must name the mode it is true in"
 
 
 def test_disable_reports_the_coverage_it_is_leaving(hostids_env, caplog) -> None:
@@ -1593,13 +1863,121 @@ def test_the_check_runs_once_per_registered_layer(hostids_env) -> None:
     assert all(layer.samples == 1 for layer in hostids_env["layers"])
 
 
-def test_disabling_keeps_the_tripwire_armed_after_capture(hostids_env, caplog) -> None:
-    """Disabling the host path must not disarm the instrument that proves it broke.
+def test_a_doubt_after_capture_stops_the_boot_instead_of_serving(
+    hostids_env, caplog, monkeypatch
+) -> None:
+    """The stop-boot mechanism, which is no longer the default -- see below.
 
-    Once a graph captured the staged branch, a disabled host path *is* the
-    frozen-embedding state; and the disable message must not claim a device path
-    that a replay cannot reach.
+    Boot #28 reached this exact state by a different route -- the slice-clamp false
+    positive disabled the knob at 03:49:06 -- and then served 8,141 steps that
+    replayed one frozen set of PLE rows. It answered a smoke test whose PLE was
+    hard-zeroed perfectly, which is what makes the state worth dying on rather than
+    serving. So the mechanism raises BEFORE emptying the layer list: a boot that
+    stops should stop with its state intact for the post-mortem.
+
+    It ships as opt-in now (``PLE_DOUBT_UNDER_FULL`` defaults to ``"eager"``, which
+    routes these steps through the dispatch veto instead), because the state turned out
+    to be reachable through real mirror corruption and not only checker false alarms,
+    and three boots in a row died of the setting on 2026-10-05. So this test opts in: it
+    pins that choosing stop-boot works, not that it is chosen.
+    ``test_the_shipped_doubt_policy_is_eager`` pins the other half.
     """
+    monkeypatch.setattr(FakeModelState, "PLE_DOUBT_UNDER_FULL", "stop-boot")
+    layer = WatchedLayer()
+    hostids_env["layers"] = [layer]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+    st._stage_host_ple_ids(input_batch, req_states)
+
+    layer._staged_branch_captured = True
+    with pytest.raises(model_state_module.PLEHostDoubtUnderFullGraph) as exc:
+        st.disable_host_staging("test reason")
+
+    msg = str(exc.value)
+    assert "test reason" in msg, "the reason has to survive into the crash"
+    assert "no device path" in msg.lower()
+    assert "8141" in msg, "the boot that proved this needs to be named out loud"
+    assert "PLE_DOUBT_UNDER_FULL" in msg, "the escape hatch must be named"
+    assert st._ple_host_layers, "raising must not empty the layer list on the way out"
+    assert st._ple_host_gen_layers == [layer]
+
+
+def test_a_repeated_disagreement_under_capture_escalates_past_the_repair_handler(
+    hostids_env, monkeypatch
+) -> None:
+    """The dedicated exception type exists for exactly one reason.
+
+    ``_ple_resync_mirror`` wraps the whole repair in ``except Exception`` -- rightly,
+    because a repair that throws would turn a coverage bug into a crash on a step
+    already handed to the device. But the disagreement budget is decided INSIDE that
+    handler, and once a FULL graph is in play the budget's decision is "stop the
+    boot". A stop-the-boot decision a broad handler can swallow is not a
+    stop-the-boot decision, so it has a type of its own and a re-raise in front of
+    the handler.
+
+    Deleting that re-raise is control 6 of ``scripts/red-controls.sh``, and this is
+    the test it turns red: without it the exception lands in ``_ple_resync_refused``
+    as a string, the boot keeps serving, and the only symptom is stale PLE.
+
+    Opted into ``stop-boot``: that is no longer the shipped default, and this test is
+    about whether the raise survives the broad handler, not about who asks for it.
+    """
+    monkeypatch.setattr(FakeModelState, "PLE_DOUBT_UNDER_FULL", "stop-boot")
+    layer = WatchedLayer()
+    layer._staged_branch_captured = True
+    st = FakeModelState()
+    # Populated by hand: this test enters through the repair, not through a staged
+    # step, and ``disable_host_staging`` returns early when there are no layers.
+    st._ple_host_layers = [layer]
+    st._ple_host_gen_layers = [layer]
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    hist = st._ple_host_history
+    for attempt in range(2):
+        # A different step each time, which is what the loop describes: in production
+        # these are two consecutive decode steps, and the per-call sync bound keys on
+        # ``_ple_host_calls`` for exactly that reason. Without the bump the second
+        # iteration is refused by the bound and the escalation this test exists for
+        # never happens.
+        st._ple_host_calls = attempt + 1
+        # A commit the mirror never saw, and a token in the cell the cross-check
+        # reads that the mirror has never held. Two of them, because the budget is
+        # per-slot and the first one is "the repair"; the second is the pattern.
+        req_states.num_computed_tokens_np[0] += 1
+        req_states.all_token_ids.gpu[0, int(hist.length[0]) - 1] = (
+            4161103993993705554 % (2**31)
+        ) + attempt
+        ctx = (
+            pytest.raises(model_state_module.PLEHostDoubtUnderFullGraph)
+            if attempt == 1
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            st._ple_resync_mirror(req_states, input_batch, f"test force {attempt}")
+        if attempt == 0:
+            assert st._ple_resync_disagree == 1, "the first force was not a disagreement"
+            assert st._ple_host_layers, "the first one disabled the knob"
+
+    assert st._ple_resync_disagree == 2
+    assert st._ple_host_layers, "the escalation emptied the layer list on the way out"
+
+
+def test_degrade_policy_keeps_the_tripwire_armed_after_capture(
+    hostids_env, caplog, monkeypatch
+) -> None:
+    """The old behaviour, verbatim, under the policy that asks for it.
+
+    Disabling the host path must not disarm the instrument that proves it broke,
+    and the disable message must not claim a device path that a replay cannot
+    reach. Both of those are still true when the operator chooses ``"degrade"``;
+    this test is what makes that choice a supported one rather than a bit-rotted
+    fallback nobody has run since the default changed.
+    """
+    monkeypatch.setattr(FakeModelState, "PLE_DOUBT_UNDER_FULL", "degrade")
+    # Patched on the fake, not the real class: ``FakeModelState`` copies the policy
+    # constant at class-creation time, so patching production would leave this test
+    # running the default and asserting a behaviour it never asked for.
     layer = WatchedLayer()
     hostids_env["layers"] = [layer]
     st = FakeModelState()
@@ -1662,6 +2040,21 @@ def _commit(counts=(1, 1), done=False):
         np.array(counts, dtype=np.int32),
         FakeCopyEvent(done),
     )
+
+
+def _lost_counts():
+    """A commit the history must refuse, without reading an unlanded value.
+
+    Every test that needed "the epilogue lost a commit" used to write
+    ``np.array([9, 1])`` here -- a count out of range for a 4-column row. Task
+    #56 made that a LEGITIMATE commit at stage time, because before the copy
+    lands those numbers are whatever the allocator recycled, not this step's
+    counts (that check now runs in ``drain``). A counts vector one row shorter
+    than the batch is still refused at stage: shape is the only thing a
+    pre-landing check is allowed to look at, which is the rule #56 exists to
+    enforce.
+    """
+    return np.array([1], dtype=np.int32)  # 1 count for the 2 slots of _commit()
 
 
 def test_epilogue_commit_is_free_when_the_knob_is_off(hostids_env) -> None:
@@ -1763,7 +2156,7 @@ def test_a_lost_commit_is_repaired_not_poisoning(hostids_env) -> None:
     slots, rows, counts, event = _commit(done=True)
     # A commit claiming more accepted tokens than the row holds.
     assert (
-        st.stage_host_tokens(slots, rows, np.array([9, 1], dtype=np.int32), event)
+        st.stage_host_tokens(slots, rows, _lost_counts(), event)
         is False
     )
     assert "stage-tokens-rejected" in st._ple_host_refusals
@@ -1789,10 +2182,12 @@ def test_a_lost_commit_is_repaired_not_poisoning(hostids_env) -> None:
         assert hist.length[slot] == req_states.num_computed_tokens_np[slot] + 1
         assert int(hist.window[slot, -1]) == int(tokens[slot, hist.length[slot] - 1])
 
-    # The budget is per request and finite. A third loss is a systematic problem,
-    # and paying another device sync per step for it turns a coverage bug into a
-    # latency bug that produces entirely plausible text.
-    for step in range(FakeModelState.PLE_RESYNC_PER_SLOT - 1):
+    # The budget is per request and finite -- when it is finite. It is not by
+    # default any more (see PLE_RESYNC_PER_SLOT), so this test asks for the old cap
+    # explicitly: what is under test is that a finite cap latches the slot, which is
+    # exactly the behaviour that cost boot vllm.log.20261006-223026 96 % stale steps.
+    st.PLE_RESYNC_PER_SLOT = 2
+    for step in range(st.PLE_RESYNC_PER_SLOT - 1):
         # A fresh draft block each step, or the staleness check refuses before the
         # build and the loop measures the wrong thing.
         drafts.bump_generation(10 + step)
@@ -1804,7 +2199,7 @@ def test_a_lost_commit_is_repaired_not_poisoning(hostids_env) -> None:
             computed=req_states.num_computed_tokens_np,
         )
         st._stage_host_ple_ids(input_batch, req_states)
-    assert st._ple_resyncs == FakeModelState.PLE_RESYNC_PER_SLOT
+    assert st._ple_resyncs == st.PLE_RESYNC_PER_SLOT
     drafts.bump_generation(99)
     req_states.num_computed_tokens_np[[0, 3]] += 1
     _advance_device_ids(
@@ -1815,8 +2210,188 @@ def test_a_lost_commit_is_repaired_not_poisoning(hostids_env) -> None:
     )
     st._stage_host_ple_ids(input_batch, req_states)
     assert st._ple_host_refusals.get("history-length") == 1
-    assert st._ple_resyncs == FakeModelState.PLE_RESYNC_PER_SLOT, "budget exceeded"
+    assert st._ple_resyncs == st.PLE_RESYNC_PER_SLOT, "budget exceeded"
     assert "per-slot cap" in st._ple_resync_refused
+
+
+def test_repairs_are_uncapped_by_default(hostids_env) -> None:
+    """A slot that needs a repair every step keeps getting one, and keeps staging.
+
+    This is the change of 2026-10-07, and it is a measurement, not a preference.
+    ``PLE_RESYNC_PER_SLOT`` was 2 on the belief that a repair costs a device sync and
+    a sync costs milliseconds. Boot ``vllm.log.20261006-223026`` measured 256 repairs:
+    p50 0.08 ms, max 0.23 ms, against a 42.5 ms step -- and measured the demand at
+    2 497 ``history-length`` refusals per worker against 9 918 steps, because under
+    MTP an unaccepted draft leaves the mirror one behind routinely. A per-slot budget
+    of 2 therefore latched every slot of a request within its first three steps and
+    the request then replayed stale PLE rows for its remaining ~200: acceptance
+    length 1.98 there, 3.31 with the rows zeroed (boot #37), 4.00 with them correct
+    (boot #36). The cap was not converting a coverage bug into a latency bug. It was
+    the coverage bug, and it was never the latency bug either.
+
+    The total went the same way one boot later, and the way it went is the lesson.
+    2000 was sized from that 25 % demand figure -- and the figure was censored: it
+    came from a boot whose demand was suppressed by the per-slot cap that was being
+    measured. Boot ``vllm.log.20261007-070900``, with nothing capped, needed 2 000
+    paid repairs plus 3 441 steps refused for want of one, 5 441 of 8 667 decode
+    steps: 63 %, not 25 %. The allowance was exhausted in twenty minutes of light
+    probe traffic, and the request that ran afterwards took 768 stale steps over 766
+    chunks -- every step of it, at 58.69 tok/s and acceptance 2.61. A budget that
+    runs out does not stop anything; it converts a coverage bug into a quality bug
+    and moves the evidence from one refusal string to another.
+
+    What still bounds a step is the per-call sync bound, which this loop also
+    exercises from the other side: one sync per step, thirty steps, thirty syncs.
+    That is the bound that actually carries the risk -- 0.12 ms x one per step, so
+    the worst case is 0.19 % of a 42.5 ms step whatever the demand turns out to be.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    assert st.PLE_RESYNC_PER_SLOT == 0, "the shipped default is no longer uncapped"
+    assert st.PLE_RESYNC_TOTAL == 0, (
+        "a total backstop is back. It has now cost a boot twice: 64 latched every "
+        "slot of a request inside three steps, and the 2000 that replaced it was "
+        "spent in twenty minutes because the 25 % demand it was sized on had been "
+        "censored by the 64. Both degraded to stale rows, which is the silent "
+        "failure a backstop is supposed to prevent. The per-call bound is the one "
+        "that prices the risk; the demand rate is alarmed, not capped -- see "
+        "PLE_RESYNC_ALARM_RATE."
+    )
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, tokens = _batch_and_states()
+
+    slots, rows, counts, event = _commit(done=True)
+    assert (
+        st.stage_host_tokens(slots, rows, _lost_counts(), event)
+        is False
+    )
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resyncs == 1
+
+    for step in range(29):
+        drafts.bump_generation(10 + step)
+        req_states.num_computed_tokens_np[[0, 3]] += 1
+        _advance_device_ids(
+            input_batch,
+            st,
+            row=req_states.all_token_ids.gpu.numpy(),
+            computed=req_states.num_computed_tokens_np,
+        )
+        st._stage_host_ple_ids(input_batch, req_states)
+
+    # Thirty steps, thirty repairs, thirty syncs, and not one refused step.
+    assert st._ple_resyncs == 30, st._ple_resync_refused
+    assert st._ple_syncs == 30, "one sync per repair is the bound, not fewer"
+    assert st._ple_host_steps == 30, "a step that was not staged"
+    assert st._ple_host_refusals.get("history-length") is None, "a step went stale"
+    assert "per-slot cap" not in st._ple_resync_refused, "the latch is back"
+    assert "step cap" not in st._ple_resync_refused, "the per-call bound latched"
+
+
+def test_the_per_step_bound_allows_exactly_one_sync_and_then_releases(
+    hostids_env,
+) -> None:
+    """One repair sync per step, and the next step is not charged for it.
+
+    The bound is what makes an uncapped repair safe: 0.08 ms when the host is ahead
+    of the device, 13.2 ms when it is not (``synchronize()`` with one matmul in
+    flight, same probe). It is counted on ``_ple_host_calls`` rather than
+    ``_ple_host_steps`` because the latter only advances when a step *stages* --
+    keying the bound on it would treat a run of refused steps as one step, which is
+    the same class of mistake as the per-slot latch: a counter that does not move
+    when the thing it counts happens.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    slots, rows, counts, event = _commit(done=True)
+    st.stage_host_tokens(slots, rows, _lost_counts(), event)
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
+
+    st._ple_host_calls = 7
+    assert st._ple_resync_mirror(req_states, input_batch, "test") is True
+    assert st._ple_syncs == 1
+    # Same call, second attempt: refused, and no second sync was paid for. This is
+    # checked before the slots are even read, which is the point -- the bound is on
+    # the sync, not on whether this step happens to still look repairable.
+    assert st._ple_resync_mirror(req_states, input_batch, "test") is False
+    assert "step cap" in st._ple_resync_refused
+    assert st._ple_syncs == 1, "the bound let a second sync through"
+    # The next step is a different call, and a fresh lag in it is repairable again:
+    # the bound releases, it does not latch. A bound that latched would be the
+    # per-slot bug wearing a new name.
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(input_batch, st)
+    st._ple_host_calls = 8
+    assert st._ple_resync_mirror(req_states, input_batch, "test") is True
+    assert st._ple_syncs == 2
+
+
+def test_repairs_stop_at_the_total_backstop_even_with_no_slot_cap(hostids_env) -> None:
+    """The backstop is a backstop: it bites when the loop has genuinely run away.
+
+    Uncapping per slot must not mean "no bound at all" -- the total is what makes
+    hitting a systematic problem a logged event rather than a silent degradation,
+    which is how boot vllm.log.20261006-223026 ended (64 of 64 spent, then nothing
+    repairable for the rest of the boot and no line saying so).
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.PLE_RESYNC_TOTAL = 2
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    slots, rows, counts, event = _commit(done=True)
+    st.stage_host_tokens(slots, rows, _lost_counts(), event)
+    for step in range(4):
+        drafts.bump_generation(10 + step)
+        req_states.num_computed_tokens_np[[0, 3]] += 1
+        _advance_device_ids(
+            input_batch,
+            st,
+            row=req_states.all_token_ids.gpu.numpy(),
+            computed=req_states.num_computed_tokens_np,
+        )
+        st._ple_host_calls = step + 1
+        st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resyncs == 2, "the total backstop did not hold"
+    assert "total cap" in st._ple_resync_refused
+
+
+def test_resync_cap_env_parsing(monkeypatch) -> None:
+    """A knob that gates device syncs fails to the shipped value, not to zero.
+
+    ``0`` means uncapped here, so a typo clamped or parsed to 0 would silently
+    remove a cap somebody meant to keep -- and the whole point of the env override
+    is that it is reachable from a shell, where typos happen.
+    """
+    cap = model_state_module._ple_resync_cap
+    monkeypatch.delenv("VLLM_GFX906_PLE_RESYNC_PER_SLOT", raising=False)
+    assert cap("VLLM_GFX906_PLE_RESYNC_PER_SLOT", 0) == 0
+    monkeypatch.setenv("VLLM_GFX906_PLE_RESYNC_PER_SLOT", "12")
+    assert cap("VLLM_GFX906_PLE_RESYNC_PER_SLOT", 0) == 12
+    monkeypatch.setenv("VLLM_GFX906_PLE_RESYNC_PER_SLOT", "0")
+    assert cap("VLLM_GFX906_PLE_RESYNC_PER_SLOT", 7) == 0, "explicit 0 must survive"
+    monkeypatch.setenv("VLLM_GFX906_PLE_RESYNC_PER_SLOT", "-1")
+    assert cap("VLLM_GFX906_PLE_RESYNC_PER_SLOT", 7) == 7, "negative fell through"
+    monkeypatch.setenv("VLLM_GFX906_PLE_RESYNC_PER_SLOT", "twelve")
+    assert cap("VLLM_GFX906_PLE_RESYNC_PER_SLOT", 7) == 7, "a typo fell through"
 
 
 def test_resync_refuses_to_serve_when_the_row_disagrees_with_the_mirror(
@@ -1847,6 +2422,60 @@ def test_resync_refuses_to_serve_when_the_row_disagrees_with_the_mirror(
     assert st._ple_resync_disagree == 1
     assert st._ple_host_steps == 0, "ids built from a row that contradicts the mirror"
     assert st._ple_host_refusals.get("history-length") == 1
+
+
+def test_a_mirror_ahead_of_the_device_adopts_instead_of_disagreeing(
+    hostids_env,
+) -> None:
+    """The slice-clamp defect that killed boots #27 and #28, pinned to its one shape.
+
+    ``row`` is ``want`` cells long. When the mirror claims MORE cells than the
+    device has committed -- ``old_len > want``, which is what a rolled-back
+    speculative commit looks like -- the old code asked for
+    ``row[old_len - overlap : old_len]``, and numpy answers a slice that starts
+    past the end of an array with the EMPTY array. Comparing that against
+    ``overlap`` mirrored cells is False by construction, so *every* resync of this
+    shape was recorded as a disagreement with the device's own token row. Boot #28
+    reached ``PLE_DISAGREE_TOTAL`` that way and turned the knob off at 03:49:06 --
+    which under a captured graph is precisely the state that serves frozen PLE
+    rows, 8,141 of them. Boot #27's kill at 02:30:55 was read as two requests
+    sharing a slot; this is the other candidate for the same line.
+
+    There is nothing to compare in this shape, because the two sides describe
+    different positions: the mirror's last ``overlap`` cells are device positions
+    ``old_len - overlap .. old_len - 1`` and the row's are ``0 .. want - 1``. So the
+    repair adopts the row and counts the event on its own ledger -- a boot that does
+    this constantly is asking about commit ordering, which is not the question a
+    disagreement answers.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    hist = st._ple_host_history
+    # The device is one commit BEHIND the mirror. Nothing about the token row has to
+    # change for the shape to exist, which is exactly why the old code fell into it
+    # so often: the mismatch is in the counters, not in the data.
+    req_states.num_computed_tokens_np[[0, 3]] -= 1
+
+    # Called directly, not through ``_stage_host_ple_ids``. In mode 1 the input gate
+    # refuses a counters-only mismatch as ``stage-inputs-disagree`` before the
+    # history check runs, so an end-to-end fixture here would assert on the gate and
+    # never reach the cross-check. The clamp lives in the repair, and boot #28 is
+    # the evidence that a real boot reaches it.
+    before = int(hist.length[0])
+    repaired = st._ple_resync_mirror(req_states, input_batch, "test mirror-ahead")
+
+    assert repaired is True, "the caller was told not to retry after a clean adopt"
+    assert int(hist.length[0]) == before - 1, "the ahead mirror was not adopted"
+    assert st._ple_resync_mirror_ahead == 2, "both slots are ahead, so both count"
+    assert st._ple_resync_disagree == 0, [
+        "a mirror ahead of the device is not a device that disagrees. This is the "
+        "assertion whose absence was boot #28's cause of death."
+    ]
+    assert st._ple_resyncs == 1, "one sync per repair, not one per slot"
 
 
 def test_the_cross_check_only_compares_the_request_that_owns_the_slot(
@@ -1938,6 +2567,11 @@ def test_a_disagreement_with_the_owner_refuses_the_step_not_the_boot(
     # The same slot again. The mirror was deliberately not re-seeded after a
     # disagreement, so it still lags and the next step asks the same question --
     # which is the point: two on one request means the two sides will not agree.
+    # A *different* bad cell, which is what "the two sides are not going to agree"
+    # actually looks like. Re-reporting the SAME cell is a stuck slot, and that is
+    # measured in steps instead -- see
+    # ``test_the_same_comparison_repeated_does_not_take_the_knob_off``.
+    req_states.all_token_ids.gpu[0, old_len - 1] = 1234567890
     drafts.bump_generation(7)
     req_states.num_computed_tokens_np[[0, 3]] += 1
     _advance_device_ids(
@@ -1951,6 +2585,7 @@ def test_a_disagreement_with_the_owner_refuses_the_step_not_the_boot(
     assert st._ple_resync_disagree == 2
     assert st._ple_host_layers == [], "a repeating disagreement kept the knob on"
     assert st._ple_resync_disagree_slots[0] == FakeModelState.PLE_DISAGREE_PER_SLOT
+    assert st._ple_resync_disagree_repeat == 0, "a different cell is not a repeat"
 
 
 def test_staged_steps_stops_when_staging_is_disabled(hostids_env) -> None:
@@ -2064,7 +2699,11 @@ def test_refusal_detail_says_which_side_of_the_count_is_wrong(
     input_batch, req_states, _tokens = _batch_and_states()
     req_states.num_computed_tokens_np[[0, 3]] += 1
     _advance_device_ids(input_batch, st)
-    # No repair possible: the budget is gone, so the refusal reaches the log.
+    # No repair possible: the budget is gone, so the refusal reaches the log. The
+    # cap has to be asked for -- the shipped default is uncapped (see
+    # PLE_RESYNC_PER_SLOT), so restating the class value here would restate 0 and
+    # let the repair run instead of refusing.
+    st.PLE_RESYNC_PER_SLOT = 2
     st._ple_resync_slots.update({0: st.PLE_RESYNC_PER_SLOT, 3: st.PLE_RESYNC_PER_SLOT})
     with caplog.at_level(logging.INFO):
         st._stage_host_ple_ids(input_batch, req_states)
@@ -2900,6 +3539,24 @@ def test_the_worker_hands_the_device_window_over_at_staging_time(monkeypatch) ->
         ngram_context=window_buf,
         _note_host_refusal=lambda reason: None,
         disable_host_staging=lambda why: None,
+        # Option A's policy read, for the stub that borrows the real methods. Mode
+        # 2 never runs under a FULL graph (the differential arm keeps the blocking
+        # D2H, which is un-capturable), so the step answers not-FULL and the policy
+        # cannot fire; it only has to be present for the attribute lookup.
+        PLE_HOST_STAGE_UNDER_FULL=(
+            model_state_module.Qwen4ExpModelState.PLE_HOST_STAGE_UNDER_FULL
+        ),
+        _ple_step_cg_mode=None,
+        _ple_step_full=lambda: False,
+    )
+    # A SimpleNamespace does not run the descriptor protocol, so a plain function put
+    # in it arrives without ``self``; bind it to the namespace after construction.
+    # Borrowed rather than stubbed: it walks ``_ple_host_layers`` and calls
+    # ``forget_host_stage`` only where a layer has one, so against this recorder it is
+    # a no-op, and if the producer ever needs more of ``self`` than this carries, the
+    # AttributeError is the honest answer.
+    self_._forget_host_stage_flags = lambda: (
+        model_state_module.Qwen4ExpModelState._forget_host_stage_flags(self_)
     )
     monkeypatch.setattr(ph, "hostids_mode", lambda: 2)
     monkeypatch.setattr(
@@ -3047,3 +3704,1949 @@ def test_staging_hands_the_dump_the_layer_s_own_workspace(hostids_env) -> None:
         len(emb._host_check_inputs) > 3
         and emb._host_check_inputs[3] is emb.padded_buffer
     ), "the dump was not handed the workspace the compute writes into"
+
+
+# ---------------------------------------------------------------------------
+# The 2026-10-05 crashes: boots #29 and #30 both died inside the resync, on a
+# cross-check that compared two things sitting at different absolute positions and
+# then charged the guaranteed mismatch to the host's ability to read its own memory.
+# The log line was ``positions [97209, 15525] != committed-1 [97206, 15525]`` -- the
+# device exactly ``num_speculative_tokens`` ahead of the mirror -- and the same
+# string reappeared on all four strikes, one slot, four consecutive steps. Four was
+# ``PLE_DISAGREE_TOTAL``, so the disagreement budget became a timer,
+# ``disable_host_staging`` ran, ``PLE_DOUBT_UNDER_FULL`` was ``"stop-boot"``, and a
+# ``PLEHostDoubtUnderFullGraph`` raised through a TP worker.
+# ---------------------------------------------------------------------------
+
+
+def test_a_window_three_cells_behind_the_device_is_a_lag_not_a_disagreement(
+    hostids_env,
+) -> None:
+    """The crash shape, pinned: real tokens, wrong offset, zero strikes.
+
+    The mirror's length claims the window's last cells sit at ``old_len - overlap ..
+    old_len - 1``. A dropped commit leaves that claim false by exactly the number of
+    tokens the device has moved on, and the window then matches the device's own row
+    once the comparison is moved. That is the coverage bug ``mirror(dropped=)``
+    already counts, and the repair (adopt the row) is the right answer to it. It is
+    not a host that cannot vouch for its reads.
+
+    Called directly rather than through ``_stage_host_ple_ids`` for the same reason
+    the mirror-ahead test is: in mode 1 the input gate refuses a counters-only
+    mismatch before the history check runs, so an end-to-end fixture here would
+    assert on the gate. The comparison lives in the repair, and boots #29 and #30 are
+    the evidence that a real boot reaches it.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_layers = [emb]
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, tokens = _batch_and_states()
+
+    hist = st._ple_host_history
+    # Distinct, non-repeating cells, so the only shift that can explain a window is
+    # the one this test puts there.
+    for cell in range(12):
+        tokens[0, cell] = 101 + cell
+    req_states.all_token_ids.gpu.copy_(torch.from_numpy(tokens))
+
+    # The mirror holds six committed cells; the device says the last committed
+    # position is 8, i.e. three further on than the mirror's length implies.
+    hist.seed(0, np.arange(101, 107, dtype=np.int64))
+    # ... and its newest cells are the row's cells 0..2, three behind the cells
+    # 3..5 its length claims. Real tokens of this request, at the wrong offset.
+    hist.window[0, hist.width - 3 :] = [101, 102, 103]
+    req_states.num_computed_tokens_np[0] = 8
+
+    repaired = st._ple_resync_mirror(req_states, input_batch, "test lag-by-three")
+
+    assert repaired is True, "a lag is repairable; the caller was told not to retry"
+    assert int(hist.length[0]) == 9, "the row was not adopted (want = positions + 1)"
+    assert st._ple_resync_mirror_offset == 1, [
+        "the shift that explains the window was not counted on its own ledger"
+    ]
+    assert st._ple_resync_disagree == 0, [
+        "a window that lags by num_speculative_tokens was charged as a disagreement "
+        "with the device's own token row. That is the line that stopped boots #29 "
+        "and #30, and the two crashes cost the operator two restarts."
+    ]
+    assert st._ple_resync_disagree_slots.get(0) is None
+    assert emb._hostids_disabled is False
+    assert st._ple_host_layers == [emb], "a lag took the knob off the whole boot"
+
+
+def test_the_offset_test_refuses_to_explain_a_value_that_is_not_a_token(
+    hostids_env,
+) -> None:
+    """Boot #14's corruption must still stop the boot.
+
+    ``host=4161103993993705554`` where a token id belongs matches nothing at any
+    offset, so the A3 stop-boot still fires on the thing it was written for. F1
+    narrows the disagreement budget; it does not disarm it.
+    """
+    st = FakeModelState()
+    row = np.arange(101, 107, dtype=np.int64)
+    mirrored = np.array([4161103993993705554 % (2**31), 102, 103], dtype=np.int64)
+
+    assert st._ple_offset_explains(mirrored, row, 6) is None
+
+
+def test_the_offset_test_does_not_read_past_the_committed_cells(
+    hostids_env,
+) -> None:
+    """A shift is only an explanation if the cells it points at are committed.
+
+    The same window is explainable when the row is long enough to contain it and
+    unexplainable when it is not: an explanation that could reach into the
+    uncommitted tail of the row would excuse anything.
+    """
+    st = FakeModelState()
+    cells = np.arange(101, 115, dtype=np.int64)
+    mirrored = np.array([106, 107, 108], dtype=np.int64)
+
+    # Cells 5..7 of the row: two cells past the end of a six-cell row, so the only
+    # legal shifts point backwards, and none of them matches.
+    assert st._ple_offset_explains(mirrored, cells[:6], 6) is None
+    # Hand the same window a row that actually holds those cells and it explains.
+    assert st._ple_offset_explains(mirrored, cells[:8], 6) == 2
+
+
+def test_the_same_comparison_repeated_does_not_take_the_knob_off(
+    hostids_env,
+) -> None:
+    """A stuck slot is one event, not a strike per step.
+
+    Both crashes reached ``PLE_DISAGREE_TOTAL`` on one slot's identical comparison
+    re-reported four steps running: about a tenth of a second of decode. Repeats
+    still refuse the step -- under a captured graph that costs the same coverage a
+    disable would -- but they do not accumulate into a boot-level decision.
+
+    Direct calls, because this is the accounting in ``_note_resync_disagreement``;
+    driving it end to end would exercise the same comparison the test above pins.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_layers = [emb]
+    mirrored = np.array([7, 11, 13], dtype=np.int64)
+    row_cells = np.array([7, 11, 19], dtype=np.int64)
+
+    for _ in range(8):
+        st._note_resync_disagreement(0, mirrored, row_cells, 3)
+
+    assert st._ple_resync_disagree == 1, "the same comparison was counted as new"
+    assert st._ple_resync_disagree_repeat == 7
+    assert st._ple_resync_disagree_stuck[0] == 8
+    assert st._ple_resync_disagree_slots[0] == 1
+    assert emb._hostids_disabled is False
+    assert st._ple_host_layers == [emb], [
+        "eight steps of one stuck slot disabled the boot: this is the accounting "
+        "that killed #29 and #30, which reached the budget at four"
+    ]
+
+
+def test_one_stuck_slot_is_bounded_in_steps_not_strikes(hostids_env) -> None:
+    """Persistence still counts, on a step scale where it means something.
+
+    A slot that refuses the same comparison for ``PLE_DISAGREE_STUCK_STEPS`` steps is
+    a mirror that will never agree, and under a captured graph every one of those
+    steps replays stale PLE rows. That is a boot-level fact and has to be able to
+    stop the boot -- otherwise the availability fix has quietly bought availability
+    of wrong answers, which is the trade boot #28 already made and E1 exists to undo.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_layers = [emb]
+    mirrored = np.array([7, 11, 13], dtype=np.int64)
+    row_cells = np.array([7, 11, 19], dtype=np.int64)
+
+    for _ in range(FakeModelState.PLE_DISAGREE_STUCK_STEPS - 1):
+        st._note_resync_disagreement(0, mirrored, row_cells, 3)
+    assert st._ple_host_layers == [emb], "the budget fired early"
+
+    st._note_resync_disagreement(0, mirrored, row_cells, 3)
+    assert st._ple_host_layers == [], "a permanently stuck mirror kept the knob on"
+    assert st._ple_resync_disagree_stuck[0] == FakeModelState.PLE_DISAGREE_STUCK_STEPS
+    assert st._ple_resync_disagree == 1, "the stuck budget is not a strike budget"
+
+
+def test_the_decline_line_names_the_graph_mode_it_is_refusing(
+    hostids_env, caplog
+) -> None:
+    """No more "The step goes to the device path" on a step that has none.
+
+    All four declines logged in boot #29 were on ``cg_mode=FULL`` steps, where the
+    op body does not run at replay and there is nothing to fall back to. The sentence
+    described a captured graph's frozen PLE as handled.
+    """
+    import logging
+
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    mirrored = np.array([7, 11, 13], dtype=np.int64)
+    row_cells = np.array([7, 11, 19], dtype=np.int64)
+
+    full = FakeModelState()
+    full._ple_host_layers = [emb]
+    # The enum here and the string below on purpose: ``prepare_inputs`` stores
+    # ``cudagraph_mode.name``, but a caller that stored the enum instead must not
+    # silently get the "there is a device path" sentence on a captured graph.
+    full._ple_step_cg_mode = CUDAGraphMode.FULL
+    with caplog.at_level(logging.WARNING):
+        full._note_resync_disagreement(0, mirrored, row_cells, 3)
+    assert "NO device path" in caplog.text
+    assert "The step goes to the device path." not in caplog.text
+    assert "cg_mode=FULL" in caplog.text
+
+    piecewise = FakeModelState()
+    piecewise._ple_host_layers = [emb]
+    piecewise._ple_step_cg_mode = "PIECEWISE"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        piecewise._note_resync_disagreement(0, mirrored, row_cells, 3)
+    assert "The step goes to the device path." in caplog.text
+    assert "NO device path" not in caplog.text
+
+
+def test_the_shipped_doubt_policy_is_zero() -> None:
+    """``stop-boot``, ``degrade`` and ``eager`` are all opt-in now, and each reason is measured.
+
+    I shipped A3 with ``"stop-boot"`` as the default on the reasoning that a boot which
+    stops is recoverable and a wrong answer is not. The reasoning had a hole in it:
+    under a captured FULL graph the refused steps replay stale rows **under both
+    settings**, because there was no fallback either way. So the constant never chose
+    between correct and wrong; it chose between correct-but-down and up-but-stale.
+
+    That is a reasonable trade while disagreements are checker false alarms. It stopped
+    being one when they turned out to be real corruption in the mirror's committed
+    content -- boot #32, ``mirrored [1, 21474836484, 866]``, where 21474836484 is
+    ``(5 << 32) + 4`` -- and the setting took the box down on three consecutive
+    attempts. A correctness policy that guarantees an outage is not a correctness
+    policy; it is an outage.
+
+    ``eager`` replaced it on 2026-10-08 morning, on the theory that a post-disable step
+    should compute its own rows on the device instead of replaying someone else's. That
+    theory was right and unaffordable: the veto moves the WHOLE forward out of the
+    graph, and on this launch-bound box that is ~3.1x per step (measured the same day,
+    boot ``vllm.log.20261008-083018``), not the +15 % E1 Phase 0 had quoted for the
+    gather alone. At tokens/s = acceptance / step_cost, eager serves fewer tokens than
+    the stale replay it replaced at any acceptance the drafter can reach -- break-even
+    is 6.2, the ceiling is 4.0.
+
+    ``zero`` is the policy that survives: never downgrade, and make the graph replay
+    rows this worker zeroed once at the trip, so the absence of a PLE contribution is
+    the model's documented degradation path instead of another request's rows. Same
+    shape as the option-A boot that has served all day; the only change is when the
+    rows get zeroed.
+
+    Pinned as a test because a default is exactly the kind of thing that gets
+    "restored" by someone reading the docstring that used to justify it.
+    """
+    assert (
+        model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL == "zero"
+    ), (
+        "the default regressed: a post-disable FULL step would replay the previous "
+        "step's pinned rows (degrade) or leave the graph (eager, 3.1x)"
+    )
+    # Precedence, in the same assertion group: the decline sits ABOVE this check, so an
+    # option-A boot never reaches the zero-at-trip path and never goes fully eager.
+    assert model_state_module.Qwen4ExpModelState.PLE_HOST_STAGE_UNDER_FULL == "off"
+    # And the other settings still exist and still work; they are exercised by
+    # test_a_doubt_after_capture_stops_the_boot_instead_of_serving (stop-boot) and
+    # test_a_degrade_disable_still_replays_after_a_disable (the old default).
+    assert model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL != "stop-boot"
+
+
+def test_a_declined_resync_on_a_full_step_is_counted_as_a_stale_step(
+    hostids_env,
+) -> None:
+    """The decline route used to be missing from the staleness ledger entirely.
+
+    Boot #32 declined three FULL steps and ``stale`` never appeared in its coverage
+    line, because only the refusal path incremented the counter. Every one of those
+    declines replayed the previous step's PLE rows -- the exact thing the counter
+    exists to decide the shippability of -- and the ledger said nothing.
+
+    Counted once per step, like the refusal route: three slots declining on one step
+    is one stale step.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    mirrored = np.array([7, 11, 13], dtype=np.int64)
+    row_cells = np.array([7, 11, 19], dtype=np.int64)
+
+    full = FakeModelState()
+    full._ple_host_layers = [emb]
+    full.begin_step(CUDAGraphMode.FULL)
+    full._note_resync_disagreement(0, mirrored, row_cells, 3)
+    assert full._ple_host_stale_steps == 1, "a declined FULL step served stale and said nothing"
+
+    # Two more slots decline on the same step: still one stale step.
+    full._note_resync_disagreement(1, mirrored, row_cells, 3)
+    full._note_resync_disagreement(2, mirrored, row_cells, 3)
+    assert full._ple_host_stale_steps == 1, "one step counted three times"
+
+    # The next step is PIECEWISE, where the device path really does exist.
+    full.begin_step(CUDAGraphMode.PIECEWISE)
+    full._note_resync_disagreement(3, mirrored, np.array([1, 2, 3], dtype=np.int64), 3)
+    assert full._ple_host_stale_steps == 1, "a piecewise step is not a stale replay"
+
+    # And the counter is on the coverage line, or it is not an instrument.
+    assert "stale_steps=1" in full._ple_host_coverage()
+
+
+# ---------------------------------------------------------------------------
+# Option A -- Qwen4ExpModelState.PLE_HOST_STAGE_UNDER_FULL (2026-10-05)
+#
+# Boot #36 measured the alternative: 20 staged steps out of 756 (2.6 %), and a
+# single-stream request with no co-tenant refused ~190 of its ~197 steps, because
+# a refusal skips staging while staging is the only thing that advances the mirror.
+# The policy below declines rather than attempts, on FULL-graph steps only. What
+# these tests hold: declining must not look like refusing (different counters, and
+# the refusal path logs), must not reach the tripwire the policy invalidates, must
+# not touch non-FULL steps, and must be reversible by one class attribute.
+# ---------------------------------------------------------------------------
+
+
+def _armed_state(hostids_env):
+    """Arm registered, draft source wired, one pure-decode batch ready to stage."""
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+    return st, emb, input_batch, req_states
+
+
+def test_host_staging_off_under_full_is_the_shipped_default() -> None:
+    """The default is the finding, so a silent revert to "stage" must be visible.
+
+    Asserted on the class attribute rather than on behaviour because the failure
+    mode this guards is a merge that restores the old line: the behaviour tests
+    below monkeypatch the attribute and would keep passing either way.
+    """
+    assert (
+        model_state_module.Qwen4ExpModelState.PLE_HOST_STAGE_UNDER_FULL == "off"
+    ), "option A regressed: FULL steps would attempt staging again"
+
+
+def test_policy_off_declines_a_full_step_rather_than_refusing_it(hostids_env) -> None:
+    """The distinction the whole policy rests on, as two numbers.
+
+    A refusal means "we tried and lost" and comes with a log line and a strike
+    budget. A decline is a decision, so it must land in its own counter, must not
+    consume a refusal reason, and must still count the step as stale -- the served
+    PLE rows are not this step's rows either way, and understating that is the one
+    error this policy is not allowed to make.
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    assert st._ple_host_policy_off == 1
+    assert st._ple_host_refusals == {}, f"decline logged as refusal: {st._ple_host_refusals}"
+    assert st._ple_host_steps == 0, "nothing was staged"
+    assert emb.lookup_calls == 0, "the layer was never handed rows"
+    assert st._ple_host_stale_steps == 1, "a declined step served stale and said nothing"
+
+
+def test_policy_off_never_reaches_the_check_host_gen_tripwire(hostids_env) -> None:
+    """The tripwire's premise is "we tried to keep the handoff fresh".
+
+    Under this policy every FULL step is stale by design, so a tripwire that
+    raises on a stale handoff would end the boot on step one. The decline has to
+    sit above it, not below it -- which is the one thing a behavioural test can
+    actually prove about the ordering inside ``_stage_host_ple_ids``.
+    """
+    class Doubtful(StagingEmbedding):
+        def check_host_gen(self):
+            raise model_state_module.PLEHostDoubtUnderFullGraph(
+                "the captured graph holds rows this step did not stage"
+            )
+
+    emb = Doubtful()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _ = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+    assert st._ple_host_policy_off == 1
+
+    # Red control: with staging back on, the same layer on the same step raises.
+    monkey = FakeModelState()
+    monkey.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    monkey.set_host_draft_source(_drafts())
+    with pytest.raises(model_state_module.PLEHostDoubtUnderFullGraph):
+        monkey._stage_host_ple_ids(
+            input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+        )
+
+
+def test_policy_off_leaves_a_non_full_step_entirely_alone(hostids_env) -> None:
+    """Prefill, mixed, and piecewise steps keep the behaviour they had before.
+
+    A piecewise step has a real device path, so nothing about the argument for
+    option A applies to it; and a GRAPHMODE=piecewise boot must stay a working
+    reference for what the arm does when it works.
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+
+    st._stage_host_ple_ids(
+        input_batch, req_states, cudagraph_mode=CUDAGraphMode.PIECEWISE
+    )
+
+    assert st._ple_host_policy_off == 0
+    assert st._ple_host_refusals == {}, f"refused: {st._ple_host_refusals}"
+    assert st._ple_host_steps == 1
+    assert emb.lookup_calls == 1
+
+
+def test_policy_off_stands_the_mirror_commit_down_too(hostids_env) -> None:
+    """Committing while declined is bookkeeping for a reader that does not exist.
+
+    ``HostTokenHistory.stage_step`` is what produced boot #34's
+    ``stage-tokens-rejected -- num_sampled [0, 4, 8] outside 0..4`` lines. With the
+    consumer gone those refusals are noise on a path that also costs a copy-event
+    wait, so the epilogue stands down with the builder.
+    """
+    st, _emb, _input_batch, _req_states = _armed_state(hostids_env)
+    st._ple_step_cg_mode = CUDAGraphMode.FULL.name
+
+    assert st.stage_host_tokens(*_commit(done=True)) is False
+    assert st._ple_host_history.pending == 0, "a commit was queued anyway"
+    assert st._ple_host_refusals == {}
+
+    # And on a piecewise step it still commits, or this is a different policy.
+    st._ple_step_cg_mode = CUDAGraphMode.PIECEWISE.name
+    assert st.stage_host_tokens(*_commit(done=True)) is True
+
+
+def test_policy_on_is_the_only_difference_between_the_two_behaviours(
+    hostids_env,
+) -> None:
+    """One class attribute is the whole change.
+
+    Same layer, same batch, same step: "stage" stages, "off" declines. Without
+    this pair the policy tests would still pass if some unrelated edit had broken
+    staging outright, which is the failure the 2.6 % measurement nearly hid.
+    """
+    st_on, emb_on, ib, rs = _armed_state(hostids_env)
+    st_on.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st_on._stage_host_ple_ids(ib, rs, cudagraph_mode=CUDAGraphMode.FULL)
+    assert st_on._ple_host_steps == 1, "the red control no longer stages"
+
+    st_off, emb_off, ib2, rs2 = _armed_state(hostids_env)
+    st_off._stage_host_ple_ids(ib2, rs2, cudagraph_mode=CUDAGraphMode.FULL)
+    assert st_off._ple_host_steps == 0
+    assert emb_on.lookup_calls == 1 and emb_off.lookup_calls == 0
+
+
+def test_an_unrecognised_policy_value_means_stage(hostids_env) -> None:
+    """A typo in the environment must restore the old behaviour, never disable more.
+
+    ``VLLM_GFX906_PLE_HOST_STAGE_UNDER_FULL=FALSE`` or ``diabled`` from a shell
+    history is far more likely than the correct string, and the dangerous reading
+    of either is "off".
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "FALSE"
+
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    assert st._ple_host_steps == 1, "a typo silently disabled the arm"
+    assert st._ple_host_policy_off == 0
+    assert emb.lookup_calls == 1
+
+
+def test_a_capture_time_step_is_staged_even_with_the_policy_off(
+    hostids_env, monkeypatch
+) -> None:
+    """The policy must not reach into a capture, or the boot dies at startup.
+
+    This is the inverse of what a reasonable reading of "decline under FULL"
+    suggests, and it is the one place where getting option A wrong is not a bad
+    number but a server that never comes up. The staged branch is the only branch of
+    the PLE op a stream capture can hold -- the device path reads three device
+    arrays synchronously, which is ``hipErrorStreamCaptureUnsupported``. So capture
+    steps stage, and ``ple_layer`` zeroes the rows it staged ("host memset on pinned
+    memory: not a graph node"), which is what makes the replayed contribution exactly
+    zero rather than whatever the capture dummy happened to hold.
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    assert (
+        emb.lookup_calls == 1
+    ), "capture declined: the graph would capture the device path and abort with "
+    "hipErrorStreamCaptureUnsupported"
+    assert st._ple_host_policy_off == 0, "a capture step is not a served step"
+    assert st._ple_host_refusals == {}
+
+
+def test_the_decline_says_once_that_declined_is_not_absent(
+    hostids_env, caplog
+) -> None:
+    """The boot #35 mistake, pointed at from the other side.
+
+    A log with no PLE HOSTIDS lines is ambiguous: it means either "the knob was
+    never set" or "the arm is here and declining". Boot #35 was read as the second
+    when it was the first. One line per boot, naming which it is, costs nothing and
+    removes the reading that cost a measurement.
+    """
+    st, _emb, input_batch, req_states = _armed_state(hostids_env)
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(10):
+            st.begin_step(CUDAGraphMode.FULL)
+            st._stage_host_ple_ids(
+                input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+            )
+
+    lines = [r for r in caplog.records if "declined under FULL" in r.getMessage()]
+    assert len(lines) == 1, f"logged {len(lines)} times, expected once per boot"
+    assert "NOT absent" in lines[0].getMessage()
+    assert st._ple_host_policy_off == 10
+
+
+def test_policy_off_appears_on_the_coverage_line(hostids_env) -> None:
+    """An instrument that is not on the periodic line is not an instrument."""
+    st, _emb, input_batch, req_states = _armed_state(hostids_env)
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    line = st._ple_host_coverage()
+    assert "policy_off=1" in line, line
+    assert "stale_steps=1" in line, line
+
+
+def _resync_scenario(hostids_env):
+    """The lost-commit state that forces a mirror repair, from the test above.
+
+    Shared by the S-instrument tests: the repair is the only code in this module
+    that runs a device sync, so it is the only path the timer can be tested on.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+    slots, rows, _counts, event = _commit(done=True)
+    # A commit claiming more accepted tokens than the row holds: rejected, and the
+    # device advances anyway, leaving the mirror one cell short. That shortfall is
+    # what makes the next step repair, and the repair is what syncs.
+    assert (
+        st.stage_host_tokens(slots, rows, _lost_counts(), event)
+        is False
+    )
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+    return st, input_batch, req_states
+
+
+def test_the_resync_instrument_reports_the_sync_it_actually_paid(hostids_env) -> None:
+    """``S_sync_ms`` must be the duration of the real sync, not a plausible number.
+
+    The whole correctness-vs-staleness decision is priced against S: break-even
+    against a 42.5 ms decode step is S <= ~23 ms at the ~9 % steady refusal rate
+    and S <= ~5.7 ms at the ~37 % latched rate. S has never been measured, because
+    nothing outside the engine process can reach it (the engine holds 99 % of
+    VRAM, a second HIP context will not fit, and on Vega two resident contexts
+    time-slice the GPU). So the timer lives inside the repair path -- and a timer
+    that silently reported ``n=0`` for a whole boot would be worse than no timer,
+    because it would read as "the path never ran" rather than "the instrument is
+    dead". Hence: make the sync sleep a known 3 ms and require the reported
+    number to account for it.
+    """
+    st, input_batch, req_states = _resync_scenario(hostids_env)
+    # Fields the production __init__ sets; this fake predates the instrument.
+    st._ple_resync_sync_ms = []
+    st._ple_resync_read_ms = []
+    st._ple_resync_timing = True
+
+    slept_ms = 3.0
+    real_sync = st._ple_resync_sync
+
+    def slow_sync():
+        real_sync()
+        time.sleep(slept_ms / 1000.0)
+
+    st._ple_resync_sync = slow_sync
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resyncs == 1, "the repair did not run, so there is nothing to read"
+
+    line = st._ple_host_coverage()
+    m = re.search(r"S_sync_ms\(n=(\d+) p50=([\d.]+) p90=([\d.]+) max=([\d.]+)\)", line)
+    assert m, f"no S_sync_ms on the coverage line: {line}"
+    n, p50 = int(m.group(1)), float(m.group(2))
+    assert n == 1, f"one repair must yield one sync sample, got n={n}: {line}"
+    # The sleep is a floor, not a target: an instrument that timed the wrong
+    # interval -- the whole repair, or the numpy compare -- would report a larger
+    # number and still pass, so the ceiling is what makes this a real check that
+    # it timed THE SYNC. Scheduler granularity and the timer stub's own bookkeeping
+    # are what make the true value exceed the sleep; 3x is far below any of those
+    # adding up, and a real device sync on this box costs 0 ms when the device is
+    # idle, which is the number this instrument exists to find out.
+    assert slept_ms * 0.7 <= p50 <= slept_ms * 3.0, (
+        f"S_sync_ms reported p50={p50} ms for a sync that slept {slept_ms} ms -- "
+        f"it is not timing the sync"
+    )
+    rm = re.search(r"S_read_ms\(n=(\d+) p50=([\d.]+)", line)
+    assert rm, f"no S_read_ms on the coverage line: {line}"
+    # Two slots (0 and 3) are short by the same lost commit, so the repair reads
+    # two rows and each read is sampled on its own: an early return on a
+    # disagreement must still leave the sample for the slot that paid for it.
+    assert int(rm.group(1)) == 2, f"one sample per repaired slot, got: {line}"
+
+    mix = re.search(r"refusal_mix=(\{[^}]*\})", line)
+    assert mix, f"no refusal_mix on the coverage line: {line}"
+    assert "stage-tokens-rejected" in mix.group(1), (
+        f"the lost commit that caused the repair must appear in the reason mix: "
+        f"{mix.group(1)}"
+    )
+
+
+def test_the_instrument_reports_nothing_when_it_is_disabled(hostids_env) -> None:
+    """With the knob off the coverage line must say so, not invent a number.
+
+    ``VLLM_GFX906_PLE_RESYNC_TIMING=0`` is the way to stop sampling without
+    editing the file a serving boot runs from. The red control is the number
+    itself: if the flag were ignored and the timer always ran, this reports the
+    same populated line the knob is supposed to suppress and fails.
+    """
+    st, input_batch, req_states = _resync_scenario(hostids_env)
+    st._ple_resync_sync_ms = []
+    st._ple_resync_read_ms = []
+    st._ple_resync_timing = False
+
+    real_sync = st._ple_resync_sync
+
+    def slow_sync():
+        real_sync()
+        time.sleep(0.003)
+
+    st._ple_resync_sync = slow_sync
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert st._ple_resyncs == 1, "the repair must still run with the timer off"
+    line = st._ple_host_coverage()
+    assert "S_sync_ms(n=0)" in line, line
+    assert "S_read_ms(n=0)" in line, line
+
+
+# ---------------------------------------------------------------------------
+# the dispatch veto
+# ---------------------------------------------------------------------------
+
+
+def _desc(cg_mode: CUDAGraphMode) -> BatchExecutionDescriptor:
+    """A descriptor of the shape the runner would hand this batch.
+
+    The real frozen dataclass rather than a namespace, because the veto produces a
+    new descriptor with :func:`dataclasses.replace` and a namespace would let a
+    mutation of the original pass as a downgrade.
+    """
+    return BatchExecutionDescriptor(
+        cg_mode=cg_mode, num_tokens=ROWS, num_reqs=2, max_query_len=3
+    )
+
+
+def test_a_refused_full_step_with_the_veto_armed_is_not_a_stale_step(
+    hostids_env,
+) -> None:
+    """The ledger has to know which steps the runner intends to rescue.
+
+    A FULL refusal used to have exactly one meaning: this step replayed the previous
+    step's n-gram rows. The veto changes that -- the step is dispatched eager and the
+    device path computes its rows -- so the same refusal now belongs in a different
+    count, and a test that only checked "refusal under FULL increments stale" would
+    keep passing while the ledger lied about the fix.
+
+    Both halves are asserted: the step must leave ``stale_steps`` alone, and it must
+    still appear in the per-reason counts, because "why did this step leave the fast
+    path" is a question people ask of this log with the veto on exactly as often as
+    with it off.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_gen_layers = [emb]
+    st.arm_ple_dispatch_veto(True)
+
+    st.begin_step("FULL")
+    st._note_host_refusal("history-length")
+
+    assert st._ple_host_stale_steps == 0, (
+        "a step the runner said it would run eager was still counted as a stale "
+        "replay -- the coverage line would then report the defect the veto closed"
+    )
+    assert st._ple_veto_steps == 1, "the veto caught nothing"
+    assert st._ple_host_refusals["history-length"] == 1, "the reason vanished"
+
+    # And unarming puts the old meaning back, exactly. This is the A/B the knob
+    # exists for: ``VLLM_GFX906_PLE_HOST_VETO=off`` must reproduce the boot whose
+    # acceptance length was 1.98, ledger and all.
+    st2 = FakeModelState()
+    st2._ple_host_gen_layers = [emb]
+    st2.begin_step("FULL")
+    st2._note_host_refusal("history-length")
+    assert st2._ple_host_stale_steps == 1
+    assert st2._ple_veto_steps == 0
+
+
+def test_the_veto_log_says_eager_and_never_claims_a_stale_replay(
+    hostids_env, caplog
+) -> None:
+    """The sentence printed on a refusal has to describe the boot it is in.
+
+    The un-vetoed wording is the shipping-gate sentinel for FULL + HOSTIDS: "there is
+    NO device path ... the graph replays the previous step's embedding rows". With the
+    veto armed that sentence is false, and a log that asserts a false thing about the
+    one defect a mechanism exists to prevent is worse than no log, because it is the
+    thing a reader trusts without re-deriving it.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_gen_layers = [emb]
+    st.arm_ple_dispatch_veto(True)
+
+    with caplog.at_level("WARNING"):
+        st.begin_step("FULL")
+        st._note_host_refusal("history-length")
+
+    msgs = [r.getMessage() for r in caplog.records if "cg_mode=FULL" in r.getMessage()]
+    assert len(msgs) == 1, msgs
+    assert "EAGER" in msgs[0], msgs[0]
+    assert "NO device path" not in msgs[0], msgs[0]
+    assert "ran on stale PLE" not in msgs[0], msgs[0]
+
+
+def test_a_refused_step_is_downgraded_and_a_staged_one_is_left_alone(
+    hostids_env,
+) -> None:
+    """The veto's whole output: the same descriptor, or the same one with NONE.
+
+    Two properties that are easy to get wrong in opposite directions. A staged step
+    must come back as the identical object -- returning a copy of a FULL descriptor
+    would be invisible here and would silently defeat graph replay bookkeeping
+    elsewhere. And a refused step must come back NONE *without mutating the input*,
+    which is why the test builds the descriptor from the real frozen dataclass:
+    ``batch_desc`` is the runner's object and other code holds it.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    # The only arm on which a FULL step stages at all. With the shipped default
+    # ("off") the policy declines the step before the producer runs, which is a
+    # declined case, not a staged one -- and it is asserted as one below.
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.arm_ple_dispatch_veto(True)
+    st._ple_host_layers = [emb]
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    full = _desc(CUDAGraphMode.FULL)
+    out = st.ple_veto_descriptor(full, input_batch, req_states)
+    assert out is full, "a staged step did not get its graph back"
+    assert out.cg_mode == CUDAGraphMode.FULL
+    assert st._ple_veto_applied == 0
+    assert st._ple_host_steps == 1
+    # The work happened EARLY, once, and is sitting in the cache that
+    # ``prepare_inputs`` reads. Without this the veto would be free of double cost
+    # only by accident: the step is prepared here and again there, which means the
+    # mirror repair runs twice and the second one is measured against a count the
+    # first already fixed.
+    assert st.ngram_context_calls == 1, "the early hook did not prepare the step"
+    cached = st._ple_prepared
+    assert cached is not None and cached[0] is input_batch, (
+        "the cache is not keyed on this batch, so prepare_inputs will redo the fill"
+    )
+    cached_qsl = cached[1]["query_start_loc"]
+    assert cached_qsl.data_ptr() == st.ple_query_start_loc.data_ptr(), (
+        "the cached fragment does not carry the buffer the model reads, so the "
+        "differential and the forward would describe different slices"
+    )
+
+    # Now a step that cannot stage: the layer stops taking steps, which is a refusal
+    # the producer cannot argue with.
+    emb.disable_hostids("test: the layer stopped taking steps")
+    drafts_ref = st._host_drafts
+    drafts_ref.bump_generation(11)
+    refused = _desc(CUDAGraphMode.FULL)
+    out = st.ple_veto_descriptor(refused, input_batch, req_states)
+    assert out.cg_mode == CUDAGraphMode.NONE, "a refused step kept its FULL graph"
+    assert refused.cg_mode == CUDAGraphMode.FULL, (
+        "the runner's descriptor was mutated instead of replaced"
+    )
+    assert st._ple_veto_applied == 1
+    assert st._ple_veto_steps == 1, "declined and applied must be countable apart"
+
+
+def test_an_arm_that_declined_never_vetoes(hostids_env) -> None:
+    """The three-state is the safety property, not a detail of the return type.
+
+    ``None`` means "this arm is not trying to stage": the knob is off, the policy
+    declined the step, or staging has been disabled for the boot. Each of those reads
+    as a refusal to anything that tests ``is not True``, and each of them would then
+    downgrade EVERY step of the boot to eager -- a cliff roughly the height of the one
+    the veto is fixing, reached by the code that was supposed to make steps cheaper.
+    So ``None`` returns the descriptor untouched, and this test is the reason.
+    """
+    # Knob off entirely.
+    hostids_env["mode"] = 0
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.arm_ple_dispatch_veto(True)
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    desc = _desc(CUDAGraphMode.FULL)
+    assert st.ple_veto_descriptor(desc, input_batch, req_states) is desc
+    assert st._ple_veto_applied == 0, "an arm that was never on downgraded a step"
+    assert st._ple_step_rows is None
+
+    # The policy declined, which is the case that ships: ``PLE_HOST_STAGE_UNDER_FULL``
+    # defaults to "off", so on a FULL boot today every step is declined before the
+    # producer runs. A veto that treated that as a refusal would run the whole boot
+    # eager -- and it would look like a correctness win in the acceptance numbers,
+    # which is the most convincing way to be wrong.
+    hostids_env["mode"] = 1
+    st2 = FakeModelState()
+    st2.arm_ple_dispatch_veto(True)
+    st2._ple_host_layers = [emb]
+    st2.set_host_draft_source(_drafts())
+    assert st2.PLE_HOST_STAGE_UNDER_FULL == "off", "the shipped default moved"
+    desc = _desc(CUDAGraphMode.FULL)
+    assert st2.ple_veto_descriptor(desc, input_batch, req_states) is desc
+    assert st2._ple_step_rows is None
+    assert st2._ple_veto_applied == 0
+
+    # Staging disabled mid-boot: also not a step worth vetoing, because nothing will
+    # ever stage again and eager-on-refusal would be eager-forever.
+    st.disable_host_staging("test: the arm is off for the rest of the boot")
+    desc = _desc(CUDAGraphMode.FULL)
+    assert st.ple_veto_descriptor(desc, input_batch, req_states) is desc
+    assert st._ple_veto_applied == 0
+
+
+def test_only_full_descriptors_are_ever_downgraded(hostids_env) -> None:
+    """PIECEWISE and NONE already run the op body, so there is nothing to rescue.
+
+    This is also why the residual the veto costs anything on is small. Boot
+    ``vllm.log.20261007-070900`` refused 3 585 steps across four workers, but 117 of
+    them were ``not-pure-decode`` (PIECEWISE) and 2 were ``no-drafts`` (NONE), where
+    the device path ran anyway: the genuinely stale residual was 0.2 % of steps on one
+    worker and 3.2 % on the worst. A veto that also downgraded those would be paying
+    to fix a step that was never broken.
+    """
+    hostids_env["mode"] = 0  # makes every step "not attempted", so nothing to stage
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.arm_ple_dispatch_veto(True)
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    for mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE):
+        desc = _desc(mode)
+        assert st.ple_veto_descriptor(desc, input_batch, req_states) is desc
+    assert st._ple_veto_applied == 0
+
+    # Decoupled from the policy. Mode 0 makes every step "not attempted", which the
+    # policy declines before it ever looks at the descriptor -- so the loop above
+    # cannot tell "only FULL is ever downgraded" from "nothing is ever downgraded".
+    # Make the step a genuine pure decode at FULL with nothing staged, and the policy
+    # commits to a refusal; the only thing left between that and a downgrade is the
+    # descriptor's own mode. A captured PIECEWISE graph has its own stale PLE rows
+    # that no veto helps, and downgrading one would contradict the mode the attention
+    # metadata was already built for.
+    hostids_env["mode"] = 2
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st._ple_host_layers = [emb]
+    st._ple_step_cg_mode = CUDAGraphMode.FULL
+    emb.disable_hostids("test: the layer stopped taking steps")
+    st._host_drafts.bump_generation(11)
+
+    # Positive first, so the negatives below mean something: this configuration has
+    # to actually be a refusal, or "nothing was downgraded" would be true for the
+    # wrong reason.
+    out = st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states)
+    assert out.cg_mode == CUDAGraphMode.NONE, "the setup stopped being a refusal case"
+    assert st._ple_veto_steps == 1
+
+    for mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE):
+        desc = _desc(mode)
+        assert st.ple_veto_descriptor(desc, input_batch, req_states) is desc
+    assert st._ple_veto_steps == 1, (
+        "the downgrade keys on the step's mode rather than the descriptor's: a "
+        "non-FULL graph was asked to run eagerly"
+    )
+    assert st._ple_host_stale_steps == 0
+
+
+def test_a_stage_that_was_replayed_cannot_leave_its_flag_for_an_eager_step(
+    hostids_env,
+) -> None:
+    """The one hazard the veto introduces, and the invalidation that closes it.
+
+    ``take_host_stage`` hands back staged rows when the row count matches, and under a
+    captured graph nothing ever calls it: the op body does not run at replay. So a
+    step that stages leaves ``_host_stage_rows`` set, indefinitely, and it matches the
+    row count of any later step with the same batch shape -- which is every decode
+    step of the request.
+
+    While every later step also replays, that is harmless. The veto is the first
+    mechanism that sends a step eager *because* it must not replay, and an eager op
+    body that finds the previous step's flag skips its D2H and reads rows from a
+    different step -- the exact failure ``take_host_stage``'s docstring warns about,
+    arriving through a route that did not exist when it was written.
+
+    The clearing runs at the top of every staging attempt, above the early returns,
+    because the transition that matters is staging working and then being disabled:
+    the steps after that run eager, and a clear an early return can skip is not an
+    invalidation. That second case is what the second half of this test drives.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.arm_ple_dispatch_veto(True)
+    st._ple_host_layers = [emb]
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert emb._host_stage_rows == ROWS, "the stage did not arm the skip"
+
+    # A replay: the op body never runs, so the flag survives the step. The NEXT step
+    # attempts staging and must invalidate the orphan before it can be consumed.
+    st._host_drafts.bump_generation(11)
+    emb.disable_hostids("test: the layer stopped taking steps")
+    st._stage_host_ple_ids(input_batch, req_states)
+    assert emb._host_stage_rows == -1, (
+        "a refused step left the previous step's staged flag for an eager op body, "
+        "which will read rows from a step it does not belong to"
+    )
+
+    # And the same invalidation happens on a step that returns before it ever looks at
+    # the draft source, because that is the transition that disables staging mid-boot.
+    emb2 = StagingEmbedding()
+    hostids_env["layers"] = [emb2]
+    st2 = FakeModelState()
+    st2._ple_host_layers = [emb2]
+    st2.set_host_draft_source(_drafts())
+    st2._stage_host_ple_ids(input_batch, req_states)
+    assert emb2._host_stage_rows == ROWS
+    st2.disable_host_staging("test: the arm is off from here")
+    st2._stage_host_ple_ids(input_batch, req_states)
+    assert emb2._host_stage_rows == -1, (
+        "a step that returns at the disabled check kept a stale flag: every step "
+        "after a disable runs eager"
+    )
+
+
+def test_the_veto_counters_are_reported_as_a_self_check(hostids_env) -> None:
+    """``veto=<declined>/<applied>`` must be comparable, or the pair proves nothing.
+
+    An armed runner whose downgrade never lands would report hundreds of steps that
+    were "handled" and served stale rows anyway. Nothing else in the line would move:
+    stale stays zero because the refusal charged the veto ledger, so the coverage line
+    is the only place the two can be put side by side and disagreed with.
+    """
+    st = FakeModelState()
+    st.arm_ple_dispatch_veto(True)
+    st.begin_step("FULL")
+    st._note_host_refusal("history-length")
+    st.note_ple_veto_applied()
+    line = st._ple_host_coverage()
+    assert "veto=1/1" in line, line
+    assert "stale_steps=0" in line, line
+
+
+def test_the_demand_alarm_announces_a_rate_and_says_nothing_below_it(
+    caplog,
+) -> None:
+    """What replaced the total cap, and why it is not a cap in disguise.
+
+    The 2 000-repair backstop was sized on a 25 % demand figure that had been censored
+    by the 64-repair cap being measured at the same time; the real figure, from a boot
+    with nothing capped, was 63 %, and spending the allowance converted a coverage bug
+    into a quality bug at 58.69 tok/s and acceptance 2.61. So the bound that survives
+    is per-call (one sync per step, 0.12 ms, 0.19 % of a step at any demand) and what
+    the demand RATE gets is an announcement.
+
+    Three things are worth pinning: it stays quiet below the rate, it stays quiet
+    between checkpoints (a per-step warning on a path that runs 25 times a second is a
+    way of not reading the log), and it does not change any behaviour -- repairs
+    continue, because the rate is a pointer at the count check, not a budget.
+    """
+    st = FakeModelState()
+    st.PLE_RESYNC_ALARM_EVERY = 8
+    st.PLE_RESYNC_ALARM_RATE = 0.25
+
+    with caplog.at_level("WARNING"):
+        # Below the checkpoint: silent.
+        st._ple_resyncs, st._ple_host_calls = 4, 8
+        st._ple_resync_demand_alarm()
+        # At the checkpoint but under the rate (8/100 = 8 %): silent. This call
+        # closes the window, so the markers move up to here -- counters are
+        # monotone in a real worker and the test has to stay monotone or it is
+        # testing a boot that cannot happen.
+        st._ple_resyncs, st._ple_host_calls = 8, 100
+        st._ple_resync_demand_alarm()
+        assert caplog.records == [], "the alarm fired on a normal boot"
+
+        # Next window over the rate (8 repairs in 12 calls = 67 %, the measured
+        # shape): one line, naming the number and what to do about it.
+        st._ple_resyncs, st._ple_host_calls = 16, 112
+        st._ple_resync_demand_alarm()
+    hits = [r.getMessage() for r in caplog.records if "mirror repairs" in r.getMessage()]
+    assert len(hits) == 1, caplog.records
+    assert "67 %" in hits[0], hits[0]
+    assert "count check" in hits[0], hits[0]
+
+    # Off the checkpoint: one more repair is not a full window, so nothing is
+    # printed even at the same rate. This is the "not per step" half of the
+    # contract.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        st._ple_resyncs, st._ple_host_calls = 17, 113
+        st._ple_resync_demand_alarm()
+    assert [r for r in caplog.records if "mirror repairs" in r.getMessage()] == []
+
+
+def test_the_demand_alarm_wakes_for_a_burst_inside_a_quiet_boot(
+    caplog,
+) -> None:
+    """The window IS the unit, and this is the case the shipped instrument slept through.
+
+    On boot ``vllm.log.20261007-204346`` a decode run needed 712 mirror repairs across
+    1 024 staging calls -- 69 % of steps -- while the same boot's life-to-date ratio
+    sat at 1 503/11 264 = 13 %. The alarm compares a count against a life-to-date
+    denominator, so it read 13 %, decided the boot was normal, and printed nothing about
+    a window in which two thirds of all steps paid a sync. A long quiet boot dilutes a
+    burst inside it forever, which is the failure mode of every ratio instrument that
+    averages over the wrong interval: the quieter the history, the more certainly it
+    stays silent.
+
+    So the test drives exactly that shape -- a quiet life, then a burst -- and requires
+    the line. It also requires the cumulative figure to be NAMED in the line, because a
+    reader who does not know the two numbers disagree will reconcile them wrongly.
+    """
+    st = FakeModelState()
+    st.PLE_RESYNC_ALARM_EVERY = 8
+    st.PLE_RESYNC_ALARM_RATE = 0.25
+
+    with caplog.at_level("WARNING"):
+        # A quiet life: 40 repairs in 4 000 staging calls (1 %). Window closes,
+        # silent, and the markers land here -- which is what makes the next window
+        # the burst rather than the whole boot.
+        st._ple_resyncs, st._ple_host_calls = 40, 4000
+        st._ple_resync_demand_alarm()
+        assert caplog.records == [], "the alarm fired on the quiet part of the boot"
+
+        # The burst, in the same proportions the boot measured: 712 repairs over
+        # 1 024 calls.
+        st._ple_resyncs, st._ple_host_calls = 752, 5024
+        st._ple_resync_demand_alarm()
+    hits = [r.getMessage() for r in caplog.records if "mirror repairs" in r.getMessage()]
+    assert len(hits) == 1, "a 69 % window stayed silent, as the shipped one did"
+    assert "69 %" in hits[0], hits[0]
+    # The window is the unit, but the line has to admit what the boot looks like
+    # overall, or the two figures get read as each other.
+    assert "15 %" in hits[0], hits[0]
+
+
+def test_a_dropped_mirror_commit_is_not_a_step_fate_event(hostids_env, caplog) -> None:
+    """An epilogue drop belongs to the mirror, not to the ledger of step fates.
+
+    ``stage_host_tokens`` runs after the step has been dispatched and run, and the
+    dispatch veto has already returned its descriptor, so nothing it reports can be a
+    step the veto caught -- or a step that replayed. Before the flag, its failures were
+    noted while ``_ple_step_cg_mode`` still read ``FULL`` from this step's own producer
+    call, and ``_note_stale_step``'s FULL test booked them to the veto ledger. That is
+    how boot ``vllm.log.20261007-204346`` reached ``veto=12/1`` with the veto having
+    fired once, at 20:53:39, and never again: eight epilogue drops in a window in which
+    the producer refused nothing. A reader of that field would conclude the safety net
+    was busy while the thing it was built for never happened.
+
+    The event is still worth a count and a line -- a dropped commit makes the mirror
+    short by that step, and the next step pays a repair -- but the sentence has to
+    describe the mirror, and neither ledger may move.
+    """
+    hostids_env["mode"] = 2
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.arm_ple_dispatch_veto(True)
+    st._ple_host_layers = [emb]
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    # A step that staged: FULL, veto asked, decision True, so the step mode this
+    # worker reports really is FULL and a refusal noted afterwards would previously
+    # have satisfied the FULL test in ``_note_stale_step``.
+    desc = st.ple_veto_descriptor(
+        _desc(CUDAGraphMode.FULL), input_batch, req_states
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL, "the step did not stage"
+    assert st._ple_step_full()
+    stale, vetoed = st._ple_host_stale_steps, st._ple_veto_steps
+
+    # Now the epilogue for that step, with a sampler row the history cannot accept.
+    slots, rows, _counts, event = _commit()
+    with caplog.at_level("WARNING"):
+        assert (
+            st.stage_host_tokens(
+                slots, rows, _lost_counts(), event
+            )
+            is False
+        )
+
+    assert st._ple_host_refusals.get("stage-tokens-rejected") == 1, "not counted"
+    assert st._ple_host_stale_steps == stale, "an epilogue drop charged the stale ledger"
+    assert st._ple_veto_steps == vetoed, "an epilogue drop charged the veto ledger"
+
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "mirror commit dropped" in r.getMessage()
+    ]
+    assert len(lines) == 1, caplog.records
+    assert "neither ledger is charged" in lines[0], lines[0]
+    # Both of these are claims about THIS step's PLE, and neither is true of a drop.
+    assert "EAGER" not in lines[0], lines[0]
+    assert "stale PLE" not in lines[0], lines[0]
+
+
+def test_the_early_hook_hands_its_work_to_prepare_inputs(hostids_env) -> None:
+    """The cache is a handoff, not a side effect: it is consumed exactly once.
+
+    ``prepare_inputs`` must be able to tell three cases apart -- prepared for this
+    batch, prepared for a different one, and nothing prepared -- and must clear the
+    cache in all three. The dangerous one is the miss that leaves the cache set: the
+    next step would find a fragment two steps old, skip its staging, and report a
+    staged step that never happened. The identity test is what separates "same step"
+    from "same shape", and the reference the cache holds is strong so ``is`` cannot
+    alias onto a recycled address.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.arm_ple_dispatch_veto(True)
+    st._ple_host_layers = [emb]
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    assert st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states)
+    fragment = st._take_prepared_ple_inputs(input_batch)
+    assert fragment is not None, "the handoff was lost between the hook and the model"
+    assert fragment["ngram_context"] == "ngram-context"
+    assert st._take_prepared_ple_inputs(input_batch) is None, (
+        "the fragment survived its own step: the next prepare_inputs would reuse it"
+    )
+
+    # A second step, and a different batch object: nothing may be handed over, and
+    # the attempt must not leave anything behind for the step after that.
+    st._host_drafts.bump_generation(12)
+    st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states)
+    other, _req, _tok = _batch_and_states()
+    assert st._take_prepared_ple_inputs(other) is None
+    assert st._ple_prepared is None
+    assert st._take_prepared_ple_inputs(input_batch) is None
+
+
+def test_a_repair_is_what_checks_the_demand_rate(hostids_env, caplog) -> None:
+    """The alarm has to be wired to the thing it measures.
+
+    Asserting only that the method computes the right verdict would leave it as
+    correct dead code: the number this boot is missing is exactly the one nobody
+    counted, because the log line that would have shown it printed once per kind and
+    the budget that would have stopped it printed nothing. So a real repair, driven
+    the way a lost commit drives one, has to be what emits the line.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.PLE_RESYNC_ALARM_EVERY = 1
+    st.PLE_RESYNC_ALARM_RATE = 0.0
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    # A commit that claims more accepted tokens than the row holds: the mirror is
+    # behind by one, which is the repair's ordinary trigger.
+    slots, rows, counts, event = _commit(done=True)
+    assert (
+        st.stage_host_tokens(slots, rows, _lost_counts(), event)
+        is False
+    )
+    req_states.num_computed_tokens_np[[0, 3]] += 1
+    _advance_device_ids(
+        input_batch,
+        st,
+        row=req_states.all_token_ids.gpu.numpy(),
+        computed=req_states.num_computed_tokens_np,
+    )
+
+    with caplog.at_level("WARNING"):
+        st._stage_host_ple_ids(input_batch, req_states)
+
+    assert st._ple_resyncs == 1, "the setup stopped being a repair case"
+    hits = [r.getMessage() for r in caplog.records if "mirror repairs" in r.getMessage()]
+    assert len(hits) == 1, (
+        "the repair ran and nothing looked at the demand rate -- the alarm is dead "
+        "code, which is what a control that deletes only the call site finds"
+    )
+
+
+def test_the_first_refusal_line_describes_the_veto_it_is_in(hostids_env, caplog) -> None:
+    """The per-reason sentence, not just the cadence one.
+
+    Boot ``vllm.log.20261007-204346`` printed, on an armed boot:
+
+        first refusal (history-length) on a step dispatching cg_mode=FULL ... no
+        device path exists for this step, so the captured graph replays the previous
+        PLE rows. ... Coverage: staged_steps=1 stale_steps=0 veto=2/1 ...
+
+    which contradicts itself sixty characters later: the same line asserts a replay
+    and reports a ledger with nothing in it. The cadence WARNING below it was made
+    arm-aware and this line -- the one that prints FIRST, and the only refusal line
+    some boots ever emit -- was not. A test that read only the WARNING would have
+    caught the first case and missed this one, so it reads both.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_gen_layers = [emb]
+    st.arm_ple_dispatch_veto(True)
+
+    with caplog.at_level("INFO"):
+        st.begin_step("FULL")
+        st._note_host_refusal("history-length", "positions [14] != committed-1 [6]")
+
+    first = [
+        r.getMessage()
+        for r in caplog.records
+        if "first refusal" in r.getMessage()
+    ]
+    assert len(first) == 1, first
+    assert "EAGER" in first[0], first[0]
+    assert "replays the previous PLE rows" not in first[0], first[0]
+
+    # A DECLINE is not a refusal: the producer returns None, the veto leaves the
+    # descriptor at FULL, and the step really does replay. Saying "EAGER" here would
+    # be the same lie in the opposite direction.
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        st.begin_step("FULL")
+        st._note_host_refusal("no-draft-source", refused=False)
+    first = [r.getMessage() for r in caplog.records if "first refusal" in r.getMessage()]
+    assert len(first) == 1, first
+    assert "replays the previous PLE rows" in first[0], first[0]
+    assert "EAGER" not in first[0], first[0]
+
+    # The cadence line too, and for a different reason than the first one: it picks
+    # its count from whichever ledger the step landed in, so reading the veto ledger
+    # on a decline evaluates ``0 == 1 or 0 % 32 == 0`` and prints NOTHING about a
+    # step that replayed. Silence on a stale step is the failure the whole ledger
+    # exists to prevent, so "a line exists, and it says stale" is the assertion.
+    cad = [
+        r.getMessage()
+        for r in caplog.records
+        if "PLE HOSTIDS: refusal (" in r.getMessage()
+    ]
+    assert len(cad) == 1, cad
+    assert "NO device path" in cad[0] and "stale PLE" in cad[0], cad[0]
+    assert "EAGER" not in cad[0], cad[0]
+    assert "stale=1 " in cad[0], cad[0]
+
+
+def test_a_declined_step_is_stale_even_with_the_veto_armed(hostids_env) -> None:
+    """The ledger rule the veto must not be allowed to soften.
+
+    ``PLE_HOST_STAGE_UNDER_FULL=off`` declines EVERY FULL step before the producer
+    runs. The veto is armed independently of that knob, so with the armed branch
+    written as ``if self._ple_veto_armed:`` a boot that replays zeroed rows on every
+    single FULL step reports ``stale_steps=0 veto=N/0`` -- clean-looking, on the arm
+    whose whole measurement is how many steps are stale. That is the direction a
+    ledger must never be wrong in, so only real refusals (the producer's ``False``,
+    the one thing the veto acts on) may be charged to it, and a step whose fate is
+    not known is charged as stale.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st._ple_host_layers = [emb]
+    st._ple_host_gen_layers = [emb]
+    st.arm_ple_dispatch_veto(True)
+    st.set_host_draft_source(_drafts())
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    # The real route, not the helper: policy off, veto armed, a FULL step.
+    st.PLE_HOST_STAGE_UNDER_FULL = "off"
+    st.begin_step("FULL")
+    assert st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states) \
+        .cg_mode == CUDAGraphMode.FULL, "a declined step must keep its graph"
+    assert st._ple_host_policy_off == 1
+    assert st._ple_veto_steps == 0, "a decline is not a veto"
+    assert st._ple_host_stale_steps == 1, (
+        "the step replayed and the ledger says otherwise -- this is the reading that "
+        "makes an off-arm boot look clean"
+    )
+
+    # And the other half: a real refusal, armed, belongs to the veto ledger instead.
+    st2 = FakeModelState()
+    st2._ple_host_gen_layers = [emb]
+    st2.arm_ple_dispatch_veto(True)
+    st2.begin_step("FULL")
+    st2._note_host_refusal("history-length")
+    assert st2._ple_veto_steps == 1
+    assert st2._ple_host_stale_steps == 0
+
+
+# ---------------------------------------------------------------------------
+# Choice #3 (2026-10-08): after a mid-boot disable on a boot whose graph already
+# holds the staged branch, a FULL step runs EAGER instead of replaying.
+#
+# Boot ``vllm.log.20261007-204346`` is why this exists. It tripped its disagreement
+# budget at 23:01:56 on ``mirrored [248068, 198, 35740] vs row [248068, 198, 760]``,
+# disabled itself, and then served 14,574 more steps that replayed one frozen set of
+# pinned rows -- with the veto never firing (the arm reported "not trying", and the
+# veto abstains on that by design) and with no heartbeat either (``staged_steps``
+# stopped advancing, and the heartbeat is keyed to it). Three counters said nothing
+# was happening while the engine answered every request with last step's PLE.
+# ---------------------------------------------------------------------------
+
+
+def _captured_then_disabled(hostids_env, *, policy: str = "eager"):
+    """A boot that staged, captured the staged branch, and then tripped.
+
+    ``_ple_host_captured`` is the sticky boot-global flag, which is what
+    :meth:`_full_graph_captured_this_boot` reads first; setting it directly is the
+    existing idiom in this file for "a FULL graph holds the staged branch" and
+    avoids dragging in the generation tripwire, which is not what these tests are
+    about.
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.PLE_DOUBT_UNDER_FULL = policy
+    st.arm_ple_dispatch_veto(True)
+    drafts = st._host_drafts
+    st._stage_host_ple_ids(
+        input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+    )
+    assert st._ple_host_steps == 1, "the setup did not stage a step first"
+    st._ple_host_captured = True
+    st.disable_host_staging("test: the mirror disagreed")
+    assert st._ple_host_layers == []
+    return st, emb, drafts, input_batch, req_states
+
+
+def test_a_post_disable_full_step_is_reported_refused_not_as_not_trying(
+    hostids_env,
+) -> None:
+    """The tri-state answer is the whole mechanism, so it is tested on its own.
+
+    ``ple_prepare_step`` returns ``False`` for "attempted and lost" and ``None`` for
+    "not trying", and :meth:`ple_veto_descriptor` treats them differently on purpose:
+    only ``False`` downgrades. Before 2026-10-08 a disabled arm always answered
+    ``None``, which is the right answer for a boot that captured the *zeroed* dummy
+    branch and the worst possible one for a boot that captured the staged branch.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(hostids_env)
+
+    drafts.bump_generation(11)
+    decision = st.ple_prepare_step(
+        input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+    )
+
+    assert decision is False, (
+        "a post-disable FULL step answered None, so the veto abstains and the step "
+        "replays the previous step's pinned rows -- the 204346 failure"
+    )
+    assert st._ple_host_refusals.get("staging-disabled-eager") == 1, (
+        st._ple_host_refusals
+    )
+    assert "staging-disabled" not in st._ple_host_refusals, (
+        "the eager route reused the old reason, so the two fates are unreadable apart"
+    )
+
+
+def test_the_veto_downgrades_every_step_after_a_captured_disable(
+    hostids_env,
+) -> None:
+    """The output that matters: a descriptor with NONE, every step, forever.
+
+    Asserted over three steps rather than one because the latch is the thing under
+    test, and a latch that works on the first step and resets is exactly as dangerous
+    as one that never sets.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(hostids_env)
+
+    for step in range(3):
+        drafts.bump_generation(20 + step)
+        desc = _desc(CUDAGraphMode.FULL)
+        out = st.ple_veto_descriptor(desc, input_batch, req_states)
+        assert out.cg_mode == CUDAGraphMode.NONE, (
+            f"step {step}: a post-disable FULL step kept its graph"
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL, "the runner's descriptor mutated"
+
+    assert st._ple_veto_applied == 3, st._ple_veto_applied
+    assert st._ple_veto_steps == 3, "the ledger and the downgrades must both count"
+    assert st._ple_host_stale_steps == 0, (
+        "an eager step is not a stale step: the op body computes this step's rows"
+    )
+
+
+def test_the_eager_disable_charges_the_veto_ledger_and_says_so(hostids_env) -> None:
+    """Which counter moves is how a reader tells the two policies apart.
+
+    Under ``eager`` the refusals belong to the veto ledger and ``stale_steps`` must
+    stay flat; under ``degrade`` they belong to the stale ledger. A boot where both
+    move is a boot whose veto is not running, and the coverage line is the only place
+    that is checkable from a log.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(hostids_env)
+
+    drafts.bump_generation(31)
+    st.ple_prepare_step(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    assert st._ple_veto_steps == 1, st._ple_veto_steps
+    assert st._ple_host_stale_steps == 0
+    coverage = st._ple_host_coverage()
+    assert "disabled=yes" in coverage
+    assert "post_disable=eager" in coverage, coverage
+
+
+def test_a_degrade_disable_still_replays_after_a_disable(
+    hostids_env, caplog
+) -> None:
+    """The old default, kept honest and kept selectable.
+
+    ``degrade`` is what a boot whose graph captured the zeroed dummy branch wants,
+    and what an A/B against the new default needs. It must behave exactly as it did
+    before: answer ``None``, charge the stale ledger, leave the veto alone, and print
+    the sentence that says the rows keep replaying.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(
+        hostids_env, policy="degrade"
+    )
+
+    assert st._ple_disabled_eager is False, "degrade set the eager latch"
+    drafts.bump_generation(41)
+    with caplog.at_level("WARNING"):
+        decision = st.ple_prepare_step(
+            input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+        )
+
+    assert decision is None
+    assert st._ple_host_refusals.get("staging-disabled") == 1
+    assert st._ple_host_stale_steps == 1, "a replayed step is stale and must be named"
+    assert st._ple_veto_steps == 0, "the veto does not act on a decline"
+    assert "keep replaying" in caplog.text
+
+    # The other route has to be distinguishable in the same log field.
+    assert "post_disable=replay" in st._ple_host_coverage()
+
+
+def test_the_policy_off_decline_outranks_the_eager_disable(hostids_env) -> None:
+    """An option-A boot must not go fully eager because of this latch.
+
+    The decline sits ABOVE the disabled check in :meth:`_stage_host_ple_ids`, and the
+    ordering is load-bearing rather than incidental: on a ``PLE_HOST_STAGE_UNDER_FULL
+    = off`` boot the FULL graph captured the *zeroed* dummy branch (capture-time steps
+    still stage, which is the only way a capture can succeed at all), so those steps
+    were never serving this step's rows and sending every one of them eager would cost
+    the boot 15 % to buy nothing.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "off"
+    assert st._ple_disabled_eager is True, "the latch is what is being outranked"
+
+    drafts.bump_generation(51)
+    decision = st.ple_prepare_step(
+        input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+    )
+
+    assert decision is None, "an option-A step was reported refused: the whole boot " \
+        "would run eager to buy nothing"
+    desc = _desc(CUDAGraphMode.FULL)
+    assert st.ple_veto_descriptor(desc, input_batch, req_states) is desc, (
+        "the veto downgraded a declined step"
+    )
+    assert st._ple_veto_applied == 0
+
+
+def test_the_heartbeat_survives_staging_being_disabled(
+    hostids_env, caplog
+) -> None:
+    """Absence of the heartbeat is not "no traffic" -- it can be "the arm is dead".
+
+    204346 ran 14,574 steps after its disable with no heartbeat line at all, because
+    the cadence keys on ``_ple_host_steps`` and that counter stops with the arm. This
+    keys a second heartbeat to staging *calls*, which keep advancing while the engine
+    serves, and names the route the steps are taking so the line is actionable.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(hostids_env)
+
+    # Land exactly on the 1024-call boundary the live heartbeat uses.
+    st._ple_host_calls = 1023
+    drafts.bump_generation(61)
+    with caplog.at_level("WARNING"):
+        st._stage_host_ple_ids(
+            input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+        )
+    drafts.bump_generation(62)
+    st._stage_host_ple_ids(
+        input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+    )
+
+    beats = [
+        r.getMessage()
+        for r in caplog.records
+        if "STAGING DISABLED" in r.getMessage()
+    ]
+    assert len(beats) == 1, f"expected one heartbeat on the boundary, got {beats}"
+    assert "EAGER on the device path" in beats[0], beats[0]
+    assert "staged_steps=1" in beats[0], "the line must still carry the coverage"
+
+    # The replaying route says what it is doing too -- a silent heartbeat would be
+    # the same blind spot with a new key.
+    st2, _e2, d2, ib2, rs2 = _captured_then_disabled(hostids_env, policy="degrade")
+    st2._ple_host_calls = 1023
+    d2.bump_generation(61)
+    with caplog.at_level("WARNING"):
+        st2._stage_host_ple_ids(ib2, rs2, cudagraph_mode=CUDAGraphMode.FULL)
+    assert any(
+        "STAGING DISABLED" in r.getMessage()
+        and "replaying the last staged rows" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if "STAGING DISABLED" in r.getMessage()]
+
+
+def test_the_disable_log_prices_the_route_it_chose(hostids_env, caplog) -> None:
+    """A policy that takes 15 % of every step has to say so as it takes it.
+
+    The message is the only place a reader learns that this boot is now on the device
+    path for the rest of its life, and the two counters they should expect from here
+    (``stale_steps`` flat, ``veto=`` rising) are stated in the same sentence. Without
+    that sentence the change is a silent performance regression attributed to nothing.
+    """
+    st, _emb, _ib, _rs = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.PLE_DOUBT_UNDER_FULL = "eager"
+    st._stage_host_ple_ids(_ib, _rs, cudagraph_mode=CUDAGraphMode.FULL)
+    st._ple_host_captured = True
+
+    with caplog.at_level("WARNING"):
+        st.disable_host_staging("test: disagreement budget spent")
+
+    line = [
+        r.getMessage()
+        for r in caplog.records
+        if "host staging disabled" in r.getMessage()
+    ]
+    assert len(line) == 1, line
+    assert "EAGER" in line[0] and "stale_steps must stop rising" in line[0], line[0]
+    assert "keep replaying" not in line[0], (
+        "the eager route printed the degrade sentence -- the two are opposite claims"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The "zero" policy (2026-10-08): what a tripped arm serves after it trips.
+#
+# ``eager`` was measured the same day it shipped and lost. E1 Phase 0 priced the
+# device gather at +15 % and this policy spent the boot with that number in a
+# docstring; the real cost is the whole step run without a graph, because the veto
+# downgrades ``FULL`` to ``NONE`` and on this launch-bound box that is ~3.1x per step
+# (probe-single-stream.py, boot vllm.log.20261008-083018: 1.89s vs 0.61s/step). At
+# tokens/s = acceptance / step_cost, eager serves ~0.8 tokens/s against stale's 1.98
+# and zeroed's 2.58 -- it loses to the thing it replaced at any acceptance the drafter
+# can reach (break-even 6.2, ceiling 4.0). ``zero`` never downgrades: the graph still
+# replays, and what it replays is rows this worker zeroed once at the trip.
+# ---------------------------------------------------------------------------
+
+
+def test_a_trip_under_zero_zeroes_the_rows_it_leaves_behind(hostids_env, caplog) -> None:
+    """The one effect the zero policy has on the buffers, asserted on the buffers.
+
+    Filling the pinned rows after staging and before the trip stands in for "the graph
+    holds real rows": whatever was there when the arm died is what every later step
+    would otherwise replay forever.
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.PLE_DOUBT_UNDER_FULL = "zero"
+    st.arm_ple_dispatch_veto(True)
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+    assert st._ple_host_steps == 1, "the setup did not stage a step first"
+    st._ple_host_captured = True
+
+    emb._pinned_output += 1.0
+    gen_before = int(emb._pinned_gen[0])
+
+    with caplog.at_level("WARNING"):
+        st.disable_host_staging("test: slot/owner misalignment")
+
+    assert torch.all(emb._pinned_output == 0), (
+        "the trip left rows behind: every later FULL step replays them and the boot "
+        "claims a PLE contribution it never computed"
+    )
+    assert int(emb._pinned_gen[0]) == gen_before, (
+        "generation was zeroed too, which would make the tripwire report a mismatch "
+        "on a boot that is behaving exactly as designed"
+    )
+    assert st._ple_disabled_zero is True
+    assert st._ple_disabled_eager is False, "zero must not also set the eager latch"
+    assert st._ple_host_layers == []
+    assert "ZEROS" in caplog.text, caplog.text
+
+
+def test_a_zero_disable_step_is_stale_and_keeps_its_graph(hostids_env) -> None:
+    """The trade the policy makes, as four numbers.
+
+    The step keeps its graph (that is the point: no 3.1x), is counted stale (the rows
+    are not this step's rows), refuses under its own reason, and never enters the veto
+    ledger. If ``veto`` ever moves on a ``post_disable=zero`` boot, the zeroing is not
+    wired and the boot is running eager by accident.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(
+        hostids_env, policy="zero"
+    )
+
+    drafts.bump_generation(11)
+    desc = _desc(CUDAGraphMode.FULL)
+    out = st.ple_veto_descriptor(desc, input_batch, req_states)
+
+    assert out.cg_mode == CUDAGraphMode.FULL, (
+        "a zeroed step went eager: that is the 3.1x this policy exists to avoid"
+    )
+    assert st._ple_veto_steps == 0 and st._ple_veto_applied == 0, (
+        "the veto acted on a route that is not supposed to use it"
+    )
+    assert st._ple_host_stale_steps == 1, (
+        "zero rows are still not this step's rows; calling them stale is the honest "
+        "reading and the option-A boot already pays that cost"
+    )
+    assert st._ple_host_refusals.get("staging-disabled-zero") == 1, st._ple_host_refusals
+    assert "staging-disabled-eager" not in st._ple_host_refusals
+    assert "staging-disabled" not in st._ple_host_refusals, (
+        "the zero route reused the degrade reason, so the two are unreadable apart"
+    )
+    coverage = st._ple_host_coverage()
+    assert "disabled=yes" in coverage and "post_disable=zero" in coverage, coverage
+
+
+def test_the_zero_route_heartbeat_says_zeros_not_replay(hostids_env, caplog) -> None:
+    """A reader must be able to tell the three dead-arm routes apart from one log line.
+
+    The heartbeat is keyed to ``_ple_host_calls`` because ``_ple_host_steps`` stops
+    advancing when the arm dies. The wording is the part under test: "replaying the
+    last staged rows" is a claim about stale data, "ZEROS" is a claim about no data.
+    """
+    st, _emb, drafts, input_batch, req_states = _captured_then_disabled(
+        hostids_env, policy="zero"
+    )
+
+    st._ple_host_calls = 1023
+    with caplog.at_level("WARNING"):
+        st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    msgs = [
+        r.getMessage() for r in caplog.records if "STAGING DISABLED" in r.getMessage()
+    ]
+    assert len(msgs) == 1, msgs
+    assert "ZEROED" in msgs[0] and "post_disable=zero" in msgs[0], msgs[0]
+    assert "replaying" not in msgs[0] and "eager" not in msgs[0]
+
+
+def test_a_declined_boot_heartbeats_even_though_it_never_had_an_arm(
+    hostids_env, caplog
+) -> None:
+    """The gap that made boot ``210206`` look silent: policy-off prints no heartbeat.
+
+    The live heartbeat is keyed to staged steps and the decline route stages none, so
+    an option-A boot said nothing about its own serving state after startup. A decline
+    is still a route, and a route a reader cannot see is a route they will misread as
+    "no traffic".
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "off"
+    st.PLE_DOUBT_UNDER_FULL = model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL
+    emb._pinned_output += 1.0
+    st._ple_host_calls = 1023
+
+    with caplog.at_level("WARNING"):
+        st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+        st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if "DECLINED BY POLICY" in r.getMessage()
+    ]
+    assert len(msgs) == 1, msgs
+    assert "post_disable=" in msgs[0], msgs[0]
+
+    # The precedence control, in the test that exercises the same route: a decline is
+    # not a disable, so nothing is zeroed, no latch is set, and no refusal is charged.
+    assert st._ple_disabled_zero is False
+    assert st._ple_host_refusals == {}, st._ple_host_refusals
+    assert torch.any(emb._pinned_output != 0), (
+        "the policy-off branch zeroed rows it never staged"
+    )
+    # Two, because the test makes two declined calls (one on the heartbeat boundary, one
+    # off it to show the cadence does not repeat). Each declined step is its own stale
+    # step; the counter is per step, not per printed line.
+    assert st._ple_host_stale_steps == 2, "a declined step is still served stale rows"
+
+
+# ---------------------------------------------------------------------------
+# Task #58: the coverage heartbeat must be reachable by a boot that never reaches
+# 1024. This is the audit trail that task #53 lacked: the PLE-at-decode A/B had to
+# be reported as a lean, not a measurement, because the "staged" leg's log showed
+# ``staged_steps=1`` sixteen seconds before its probe and nothing afterwards -- not
+# because the arm was idle, but because the heartbeat's own cadence exceeded the
+# boot's entire traffic. A cadence a boot cannot reach reports nothing, and nothing
+# is not the same claim as zero.
+
+
+def test_the_ramp_carries_the_cadence_below_its_own_interval() -> None:
+    """The predicate, on its own numbers, including the ones that must stay quiet.
+
+    Steady-state behaviour is asserted unchanged (1024, 2048, 3072 print; 2000 does
+    not) so this cannot quietly turn into a per-step log, which is the failure mode a
+    "print more" change always has.
+    """
+    due = model_state_module._ple_heartbeat_due
+    for n in (1, 16, 128, 512, 1024, 2048, 3072):
+        assert due(n), f"{n} should print"
+    for n in (0, 2, 15, 17, 127, 129, 511, 513, 1023, 2000, 1025):
+        assert not due(n), f"{n} should stay quiet"
+
+
+def test_the_first_staged_step_prints_its_own_denominator(hostids_env, caplog) -> None:
+    """One staged step has to be visible in the log without serving for a minute.
+
+    The property the A/B needed: the earliest line in a boot's log that proves the
+    arm stages, and the coverage counters attached to it. Before the ramp the first
+    coverage line arrived at 1024 staged steps, so a boot could stage every step of
+    a probe and print nothing that said so.
+    """
+    st, _emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.PLE_DOUBT_UNDER_FULL = (
+        model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL
+    )
+
+    with caplog.at_level("INFO"):
+        st._stage_host_ple_ids(
+            input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+        )
+
+    assert st._ple_host_steps == 1, "the setup did not stage a step"
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "decode step(s) so far" in r.getMessage()
+    ]
+    assert len(lines) == 1, f"expected the first-step coverage line, got {lines}"
+    assert "staged_steps=1" in lines[0], lines[0]
+
+
+def test_a_declined_boot_reports_within_its_first_step_not_its_thousandth(
+    hostids_env, caplog
+) -> None:
+    """The same gap on the route that never stages: option A, from step one.
+
+    Boot ``vllm.log.20261008-210206`` printed its startup snapshots at 21:08:55 and
+    then nothing for the rest of the evening, because ``policy_off`` steps advance
+    ``_ple_host_calls`` and the decline heartbeat only spoke at multiples of 1024 --
+    which a lightly-loaded boot reaches in minutes and a short boot never. "Declined,
+    arm healthy" was indistinguishable from "engine stopped".
+    """
+    st, emb, input_batch, req_states = _armed_state(hostids_env)
+    st.PLE_HOST_STAGE_UNDER_FULL = "off"
+    st.PLE_DOUBT_UNDER_FULL = (
+        model_state_module.Qwen4ExpModelState.PLE_DOUBT_UNDER_FULL
+    )
+    emb._pinned_output += 1.0
+    st._ple_host_calls = 0
+
+    with caplog.at_level("WARNING"):
+        st._stage_host_ple_ids(
+            input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL
+        )
+
+    msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if "DECLINED BY POLICY" in r.getMessage()
+    ]
+    assert len(msgs) == 1, f"one call must already report, got {msgs}"
+    assert "staged_steps=0" in msgs[0], msgs[0]
+    assert st._ple_disabled_zero is False, "a decline is not a disable"
+
+
+def test_a_drain_time_drop_is_not_a_step_fate_event_either(hostids_env, caplog) -> None:
+    """Task #56's moved check has to stay as loud as the check it replaced.
+
+    The count-range check used to run in the epilogue (``stage_host_tokens``). It
+    now runs inside ``HostTokenHistory.drain``, which the PRODUCER calls at the top
+    of the next step -- a different caller, with a different step in flight, and
+    nothing in the epilogue path left that detects the anomaly at all.
+
+    Two things are easy to get wrong in that move, and this pins both:
+
+    * Tempting to charge it to a ledger, because the producer's refusal happens
+      before dispatch. It is still a MIRROR event: the step whose commit it
+      rejected has already been dispatched and will run with correct rows, so
+      neither the stale ledger nor the veto ledger may move.
+    * Tempting to let it go uncounted and unlogged, since ``drain`` only returns
+      an applied-count. That would make the hole SILENT -- the per-reason cadence
+      line is the only thing that makes a mirror hole visible in a serving log,
+      and it would go quiet exactly when the check started running somewhere
+      nobody logs from. Boot #26's 67 drops per worker were invisible for exactly
+      this reason.
+    """
+    emb = StagingEmbedding()
+    hostids_env["layers"] = [emb]
+    st = FakeModelState()
+    st.PLE_HOST_STAGE_UNDER_FULL = "stage"
+    st.arm_ple_dispatch_veto(True)
+    st._ple_host_layers = [emb]
+    drafts = _drafts()
+    st.set_host_draft_source(drafts)
+    input_batch, req_states, _tokens = _batch_and_states()
+
+    # A step that staged, and an epilogue handing over a commit whose accepted
+    # count is out of range for its row -- which is NOTICE now, not a violation.
+    st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states)
+    stale, vetoed = st._ple_host_stale_steps, st._ple_veto_steps
+    slots, rows, _counts, event = _commit(done=True)
+    assert (
+        st.stage_host_tokens(slots, rows, np.array([9, 1], np.int32), event) is True
+    ), "out-of-range counts are not a stage-time violation any more"
+    assert st._ple_host_history.dropped == 0, "detected too early"
+
+    # The NEXT step's producer drains the queue. That is where the row is rejected.
+    # The draft block has to be fresh or the staleness check refuses first and the
+    # loop measures the wrong thing (same reason as the resync tests above).
+    drafts.bump_generation(2)
+    with caplog.at_level("WARNING"):
+        st.ple_veto_descriptor(_desc(CUDAGraphMode.FULL), input_batch, req_states)
+
+    assert st._ple_host_history.dropped == 1, "the moved check detected nothing"
+    assert "read after the copy landed" in st._ple_host_history.last_drop, (
+        st._ple_host_history.last_drop
+    )
+    assert st._ple_host_refusals.get("mirror-drop-at-drain") == 1, "uncounted"
+    assert st._ple_host_stale_steps == stale, "a mirror hole charged the stale ledger"
+    assert st._ple_veto_steps == vetoed, "a mirror hole charged the veto ledger"
+
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "mirror commit dropped" in r.getMessage()
+    ]
+    assert len(lines) == 1, caplog.records
+    assert "neither ledger is charged" in lines[0], lines[0]
+    assert "mirror-drop-at-drain" in lines[0], lines[0]
+
+
+def test_the_final_coverage_line_reports_a_boot_that_never_staged(
+    hostids_env, caplog
+) -> None:
+    """A short boot's LAST counters have to reach the log, or they never existed.
+
+    The serving heartbeat is a cadence, and task #58's lesson is that a cadence is
+    part of its claim: below 1024 staged steps a boot prints no denominator at all,
+    so "staged every step" and "boot too short to report" are the same silence. The
+    measured case was a ~300-step boot whose last coverage line was the ramp at 128
+    -- 172 steps unaccounted, and the final ``refusal_mix`` / ``dropped`` existed
+    only inside a process that was about to exit.
+
+    Two properties are pinned, both about the line being USABLE as a measurement:
+
+    * it prints at ``staged_steps=0``. An option-A boot (policy ``off``) never
+      stages, so the serving heartbeat never fires there; this line is the only
+      way such a boot shows its own refusal mix, and the same line is what tells a
+      reader that a quiet boot was idle rather than dead.
+    * it prints ONCE. ``Worker.shutdown()`` is reachable twice in one process --
+      the executor's RPC path (``WorkerWrapper.shutdown``) and ``worker_main``'s
+      ``finally`` block -- and a doubled FINAL line in a boot log is a second data
+      point that no measurement backs.
+    """
+    st = FakeModelState()
+    with caplog.at_level("INFO"):
+        st.log_staging_coverage_at_shutdown("worker-shutdown")
+        st.log_staging_coverage_at_shutdown("worker-shutdown")
+
+    final = [
+        r.getMessage() for r in caplog.records if "FINAL coverage" in r.getMessage()
+    ]
+    assert len(final) == 1, final
+    assert "worker-shutdown" in final[0], final[0]
+    assert "staged_steps=0" in final[0], final[0]
+    # The fields a reader needs to close a boot out. This is the same builder the
+    # heartbeat uses, so a field that disappears here disappears from the log
+    # entirely -- scripts/ple-window-state.py routes on post_disable in particular.
+    for field in (
+        "stale_steps=",
+        "veto=",
+        "policy_off=",
+        "refused=",
+        "post_disable=",
+        "mirror(",
+        "resync=",
+        "disagree=",
+        "refusal_mix=",
+    ):
+        assert field in final[0], f"{field} missing from {final[0]}"
+
+
+def test_the_final_coverage_line_cannot_break_worker_teardown(
+    hostids_env, caplog
+) -> None:
+    """A log line must never be the reason a worker skips releasing its GPU.
+
+    The caller is ``GPUModelRunner.shutdown``, reached from the ``finally`` block of
+    ``worker_main``, and everything after it in that chain frees GPU resources and
+    tears down the distributed process group. The coverage builder reads live
+    objects -- layer registries, draft sources, copy events -- and a worker reaches
+    teardown precisely when things have gone wrong, so "should not raise" is not a
+    hypothetical here: it is the failure mode that would turn a clean restart into a
+    hung one. The counter is dropped and reported instead.
+    """
+    st = FakeModelState()
+
+    def boom():
+        raise RuntimeError("coverage builder touched a torn-down registry")
+
+    st._ple_host_coverage = boom
+    with caplog.at_level("INFO"):
+        st.log_staging_coverage_at_shutdown()  # must not raise
+
+    warns = [
+        r.getMessage()
+        for r in caplog.records
+        if "could not print the final coverage" in r.getMessage()
+    ]
+    assert len(warns) == 1, warns
+    assert "RuntimeError" in warns[0], warns[0]

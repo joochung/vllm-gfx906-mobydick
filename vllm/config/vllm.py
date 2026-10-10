@@ -344,7 +344,7 @@ def ple_hostids_mtp_conflict(
     what a *refused* step does under a captured graph: piecewise is safe by
     construction (the op falls through to the device path), FULL is not (the op body
     does not run at replay, so the step ships the previous step's rows). That is what
-    ``Qwen4ExpModelState._ple_host_captured_refusals`` exists to count, and it is a
+    ``Qwen4ExpModelState._ple_host_stale_steps`` exists to count, and it is a
     measured cliff rather than a hypothetical one.
 
     So ``VLLM_GFX906_ALLOW_HOSTIDS_MTP=1`` now opens both modes, which is not the

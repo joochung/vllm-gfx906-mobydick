@@ -292,8 +292,15 @@ def test_drop_detail_names_the_check_that_fired():
     history = HostTokenHistory(SLOTS, W)
     assert _stage(history, [9], [[1]], [1]) is False
     assert "slot" in history.last_drop
-    assert _stage(history, [0], [[1, 2, 3]], [5]) is False
+    # Out-of-range counts are a DRAIN-time check now (task #56). At stage time the
+    # array still holds whatever the allocator recycled, so judging it there
+    # rejected healthy commits -- the ``num_sampled [0, 4, 8] outside 0..4``
+    # drops. The detail says where the check ran.
+    assert _stage(history, [0], [[1, 2, 3]], [5]) is True
+    assert history.drain() == 0
     assert "num_sampled" in history.last_drop
+    assert "landed" in history.last_drop
+    assert history.dropped == 2
     assert _stage(history, [0], [[1]], [1]) is True
     assert history.last_drop == "", "a success left a stale explanation"
 
@@ -305,8 +312,6 @@ def test_stage_rejects_inconsistent_shapes():
         ([9], [[1]], [1], "slot outside the table"),
         ([-1], [[1]], [1], "padding slot"),
         ([0, 1], [[1]], [1], "counts disagree with slots"),
-        ([0], [[1, 2, 3]], [5], "more accepted than the row holds"),
-        ([0], [[1, 2, 3]], [-1], "negative count"),
     ]
     for slots, rows, counts, _why in cases:
         before = history.dropped
@@ -325,3 +330,141 @@ def test_stage_rejects_inconsistent_shapes():
     )
     assert history.dropped == len(cases) + 1
     assert history.staged == 0
+
+    # The two out-of-range-count cases used to be in the list above. They are
+    # STAGED now -- nothing may judge those values before the copy lands -- and
+    # rejected when drain reads them. The mirror image, counts that only LOOK
+    # wrong before landing, is test_num_sampled_is_read_after_the_copy_lands.
+    for bad, why in ((5, "more accepted than the row holds"), (-1, "negative count")):
+        assert _stage(history, [0], [[1, 2, 3]], [bad]) is True, why
+    assert history.staged == 2
+    assert history.drain() == 0, "an out-of-range row must commit nothing"
+    assert history.dropped == len(cases) + 3
+
+
+def test_num_sampled_is_read_after_the_copy_lands():
+    """THE task #56 regression: the counts are the second output of the same D2H.
+
+    ``AsyncOutput`` (``async_utils.py``) copies ``sampled_token_ids`` AND
+    ``num_sampled_tokens`` to fresh host arrays on the copy stream, then records
+    one event. Both are garbage until that event fires. ``stage_step`` used to
+    ``num_sampled.copy()`` anyway, on the docstring's mistaken belief that the
+    counts came from a persistent buffer like ``idx_mapping_np`` does.
+
+    The field signature this reproduces, verbatim from two boots:
+
+      * ``vllm.log.20261008-083018`` -- 14,859 drops (9.9 % of commits),
+        ``num_sampled [0, 4, 8] outside 0..4``
+      * ``vllm.log.20261009-161850`` -- the same four lines at startup, one per
+        worker
+
+    ``[0, 4, 8]`` is not a count vector for a 1+3-draft batch (the cap is 4). It
+    is what the allocator had left in that host block -- offsets into the
+    previous step's flattened copy -- read microseconds after the D2H was
+    enqueued. Against the pre-#56 code this fails twice over: the stage is
+    rejected on recycled junk, and even an accepted commit drains the PREVIOUS
+    step's counts.
+    """
+    history = HostTokenHistory(SLOTS, W)
+    for slot, token in ((0, 1), (1, 2), (2, 3)):
+        history.seed(slot, [token])
+
+    # 3 requests, 1 + 3 draft slots: exactly the shape that produced
+    # "outside 0..4" in the field.
+    counts = np.array([0, 4, 8], np.int32)
+    sampled = np.zeros((3, 4), np.int32)
+    sampled[0, 0], sampled[1, 0], sampled[1, 1], sampled[2, 0] = 7, 8, 9, 10
+    event = FakeEvent(False)  # D2H enqueued, not landed
+
+    assert (
+        history.stage_step(np.array([0, 1, 2], np.int32), sampled, counts, event)
+        is True
+    ), "staging must not judge counts it cannot legitimately read yet"
+    assert history.dropped == 0, "the pre-landing guard rejected a healthy commit"
+    assert history.drain() == 0, "nothing may be applied before the event lands"
+
+    counts[:] = [1, 2, 1]  # the copy lands with this step's real counts
+    event.complete()
+
+    assert history.drain() == 3
+    assert history.window[0].tolist() == [0, 1, 7]
+    assert history.window[1].tolist() == [2, 8, 9]
+    assert history.window[2].tolist() == [0, 3, 10]
+    assert history.dropped == 0, "landed counts of 1..4 are not an anomaly"
+
+
+def test_invalidate_voids_an_unlanded_commit_without_writing_to_the_source():
+    """A slot freed while its copy is in flight must not come back to life.
+
+    The tempting one-line version of task #56 -- hold ``num_sampled`` by
+    reference and let ``invalidate`` keep zeroing it -- is wrong twice: the
+    zero goes into ``AsyncOutput``'s own array, which output processing reads
+    too, and the in-flight D2H overwrites the zero when it lands, resurrecting
+    the exact commit invalidation exists to cancel. ``slot`` reuse is what makes
+    that a wrong-answer bug rather than a stale one: the tokens land in the
+    window of whoever gets the slot next.
+
+    Red against that tempting fix, green against ``_PendingCommit.void``.
+    """
+    history = HostTokenHistory(SLOTS, W)
+    history.seed(0, [1])
+    counts = np.array([0], np.int32)
+    sampled = np.array([[5, 0, 0]], np.int32)
+    event = FakeEvent(False)
+    assert history.stage_step(np.array([0], np.int32), sampled, counts, event)
+
+    history.invalidate(0)  # request removed; the slot is free to be reused
+    counts[:] = [1]  # the D2H lands -- this is what the copy actually does
+    event.complete()
+
+    assert history.drain() == 0, "an invalidated commit was applied"
+    assert history.length[0] == 0
+    assert history.window[0].tolist() == [0, 0, 0]
+    assert counts.tolist() == [1], (
+        "invalidate wrote through to the AsyncOutput array output processing "
+        "also reads"
+    )
+
+
+def test_padded_rows_with_out_of_range_counts_still_stage():
+    """THE task #57 gap: what the row-slice guarantees, pinned directly.
+
+    ``_stage(..., pad=N)`` fills padded rows with count 0, which is in range, so
+    task #55's ``trim-removed`` red control stayed GREEN -- the suite could not
+    see the removal of the guard the slice exists to make unreachable. A real
+    padded graph descriptor does not carry zeros in its unused rows; it carries
+    whatever the sampler left there, which is the out-of-range junk the count
+    check rejects.
+
+    The assertion is about the QUEUE, not about the outcome, and that is the
+    finding worth writing down. Removing the slice does not change a single value
+    this history commits, because ``drain`` iterates ``entry.slots.size`` and the
+    pad rows are therefore never read: after task #56 moved the range check into
+    ``drain``, the slice stopped being the thing that saves the commit and became
+    defense in depth for the row-i-belongs-to-slot-i invariant. A behavioural test
+    cannot pin it any more -- so this pins the shape the queue is handed, which is
+    the claim the slice actually makes, and the red control
+    ``trim-removed-T57-closure`` goes RED on it.
+    """
+    history = HostTokenHistory(SLOTS, W)
+    history.seed(0, [1])
+    counts = np.array([1, 9, 7], np.int32)  # rows 1 and 2 belong to no request
+    sampled = np.array([[6, 0, 0], [0, 0, 0], [0, 0, 0]], np.int32)
+
+    assert (
+        history.stage_step(
+            np.array([0], np.int32), sampled, counts, FakeEvent(True)
+        )
+        is True
+    ), "a padded row's garbage must not veto the real batch's commit"
+    assert history.sliced == 1
+    # The trim itself: one row per slot, and the counts that go with those rows.
+    # Without the slice these are 3 and [1, 9, 7], and the next assertion is the
+    # only thing standing between a padded descriptor and a future consumer that
+    # reads all of them.
+    assert history._pending[0].sampled.shape[0] == 1, "the queue kept the pad rows"
+    assert history._pending[0].counts().tolist() == [1], "the queue kept pad counts"
+    assert history.dropped == 0
+    assert history.drain() == 1
+    assert history.window[0].tolist() == [0, 1, 6]
+    assert history.length[0] == 2
